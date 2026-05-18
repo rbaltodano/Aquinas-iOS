@@ -218,7 +218,7 @@ private struct DockedInsightTreeCard: View {
         }
         .padding(32)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(red: 251 / 255, green: 244 / 255, blue: 231 / 255))
+        .background(AquinasTheme.Colors.canvasSecondary)
         .clipShape(RoundedRectangle(cornerRadius: 48, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 48, style: .continuous)
@@ -284,7 +284,7 @@ private struct DockedNodeTreeCard: View {
         }
         .padding(32)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(red: 251 / 255, green: 244 / 255, blue: 231 / 255))
+        .background(AquinasTheme.Colors.canvasSecondary)
         .clipShape(RoundedRectangle(cornerRadius: 48, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 48, style: .continuous)

@@ -28,6 +28,7 @@ struct InsightTreeCanvasView: View {
     @State private var pinchStartScale: CGFloat?
     @State private var pinchStartOffset: CGSize?
     @State private var preFocusCamera: InsightTreeCameraSnapshot?
+    @State private var rippleTrigger: RippleTrigger? = nil
     @GestureState private var dragOffset: CGSize = .zero
 
     private var activeScale: CGFloat {
@@ -49,7 +50,12 @@ struct InsightTreeCanvasView: View {
 
             ZStack {
                 AquinasTheme.Colors.canvas.ignoresSafeArea()
-                AnimatedDotGridBackground().ignoresSafeArea()
+                AnimatedDotGridBackground(
+                    settledOffset: offset,
+                    settledScale:  activeScale,
+                    dragOffset:    dragOffset,
+                    ripple:        rippleTrigger
+                ).ignoresSafeArea()
 
                 graphEdges(camera: camera, size: size)
                 insightConnectors(camera: camera, size: size, labelOpacity: labelOpacity)
@@ -329,6 +335,10 @@ struct InsightTreeCanvasView: View {
             .contentShape(Rectangle())
             .onTapGesture {
                 guard canAcceptTap else { return }
+                rippleTrigger = RippleTrigger(
+                    worldOrigin: node.position,
+                    startTime: Date().timeIntervalSinceReferenceDate
+                )
                 focusInsight(at: node.position, in: size)
                 onNodeTapped(node)
             }
@@ -383,6 +393,10 @@ struct InsightTreeCanvasView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             guard canAcceptTap else { return }
+            rippleTrigger = RippleTrigger(
+                worldOrigin: worldPosition,
+                startTime: Date().timeIntervalSinceReferenceDate
+            )
             focusInsight(at: worldPosition, in: size)
             onInsightTapped(insight)
         }
