@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Aquinas uses the camera so you can attach photos to your questions.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Aquinas uses your photo library so you can attach images to your questions.</string>
+	<key>UIAppFonts</key>
+	<array>
+		<string>LibreBaskerville-Bold.ttf</string>
+		<string>LibreBaskerville-BoldItalic.ttf</string>
+		<string>LibreBaskerville-Italic.ttf</string>
+		<string>LibreBaskerville-Regular.ttf</string>
+		<string>Figtree-Bold.ttf</string>
+		<string>Figtree-SemiBold.ttf</string>
+		<string>Figtree-Regular.ttf</string>
+		<string>Figtree-ExtraBold.ttf</string>
+	</array>
+</dict>
+</plist>
