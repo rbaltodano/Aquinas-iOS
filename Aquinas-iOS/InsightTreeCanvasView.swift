@@ -49,6 +49,7 @@ struct InsightTreeCanvasView: View {
 
             ZStack {
                 AquinasTheme.Colors.canvas.ignoresSafeArea()
+                AnimatedDotGridBackground().ignoresSafeArea()
 
                 graphEdges(camera: camera, size: size)
                 insightConnectors(camera: camera, size: size, labelOpacity: labelOpacity)
