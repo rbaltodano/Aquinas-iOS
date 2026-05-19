@@ -20,6 +20,7 @@ struct ActiveInquiryView: View {
     @Binding var sideMenuCurrentTitle: String
     @Binding var requestedConversationID: UUID?
     @Binding var newConversationRequest: Int
+    @Binding var requestedForkConcept: ConceptDefinition?
     @Binding var colorSchemeOverride: ColorScheme?
     @Binding var isAtBottom: Bool
     @Binding var showFilePicker: Bool
@@ -39,6 +40,9 @@ struct ActiveInquiryView: View {
     @State private var isZoomedOut: Bool = false
     @State private var canvasScale: CGFloat = 1.0
     @State private var canvasZoomOffset: CGSize = .zero
+    @State private var canvasPanStartOffset: CGSize? = nil
+    @State private var canvasPinchStartScale: CGFloat? = nil
+    @State private var canvasPinchStartOffset: CGSize? = nil
     @State private var focusedBranchID: UUID? = nil
     @State private var isViewingEntireCanvas: Bool = false
     @State private var viewportSize: CGSize = .zero
@@ -58,7 +62,6 @@ struct ActiveInquiryView: View {
     @State private var hasRestoredPersistedConversations: Bool = false
     @State private var handledNewConversationRequest: Int = 0
     @State private var pendingFocusBranchID: UUID? = nil
-
     // Horizontal pull amount while the user drags a branch toward Canvas mode.
     @State private var pullOffset: CGFloat = 0
 
@@ -116,6 +119,15 @@ struct ActiveInquiryView: View {
 
         self.requestedConversationID = nil
         switchToConversation(conversation)
+    }
+
+    /// Number of saved insights not yet seen on the Insight Tree.
+    /// Reactive: recomputes whenever collectedDefinitions changes.
+    private var newInsightsCount: Int {
+        guard let strings = UserDefaults.standard.stringArray(forKey: "AquinasSeenInsightIDs"),
+              !strings.isEmpty else { return 0 }
+        let seenIDs = Set(strings.compactMap { UUID(uuidString: $0) })
+        return collectedDefinitions.filter { !seenIDs.contains($0.id) }.count
     }
 
     private func handleNewConversationRequestIfNeeded() {
@@ -391,6 +403,77 @@ struct ActiveInquiryView: View {
         return CGSize(width: horizontalInset, height: 40)
     }
 
+    private func clampedCanvasScale(_ proposedScale: CGFloat, in size: CGSize) -> CGFloat {
+        let minimumScale = min(0.12, fitCanvasScale(for: size))
+        return min(1.0, max(minimumScale, proposedScale))
+    }
+
+    private func canvasOffsetKeeping(
+        _ anchor: CGPoint,
+        fixedFrom initialOffset: CGSize,
+        initialScale: CGFloat,
+        nextScale: CGFloat
+    ) -> CGSize {
+        let worldX = (anchor.x - initialOffset.width) / initialScale
+        let worldY = (anchor.y - initialOffset.height) / initialScale
+
+        return CGSize(
+            width: anchor.x - worldX * nextScale,
+            height: anchor.y - worldY * nextScale
+        )
+    }
+
+    private func seamlessCanvasPanGesture() -> some Gesture {
+        DragGesture(minimumDistance: 2)
+            .onChanged { value in
+                guard isZoomedOut else { return }
+                if canvasPanStartOffset == nil {
+                    canvasPanStartOffset = canvasZoomOffset
+                }
+
+                let startOffset = canvasPanStartOffset ?? canvasZoomOffset
+                canvasZoomOffset = CGSize(
+                    width: startOffset.width + value.translation.width,
+                    height: startOffset.height + value.translation.height
+                )
+            }
+            .onEnded { _ in
+                canvasPanStartOffset = nil
+            }
+    }
+
+    private func seamlessCanvasZoomGesture(in size: CGSize) -> some Gesture {
+        MagnifyGesture(minimumScaleDelta: 0.01)
+            .onChanged { value in
+                guard isZoomedOut else { return }
+                if canvasPinchStartScale == nil {
+                    canvasPinchStartScale = canvasScale
+                    canvasPinchStartOffset = canvasZoomOffset
+                }
+
+                let initialScale = canvasPinchStartScale ?? canvasScale
+                let initialOffset = canvasPinchStartOffset ?? canvasZoomOffset
+                let nextScale = clampedCanvasScale(initialScale * pow(value.magnification, 0.72), in: size)
+                let anchor = CGPoint(x: value.startAnchor.x * size.width, y: value.startAnchor.y * size.height)
+
+                canvasScale = nextScale
+                canvasZoomOffset = canvasOffsetKeeping(anchor, fixedFrom: initialOffset, initialScale: initialScale, nextScale: nextScale)
+            }
+            .onEnded { value in
+                guard isZoomedOut else { return }
+                let initialScale = canvasPinchStartScale ?? canvasScale
+                let initialOffset = canvasPinchStartOffset ?? canvasZoomOffset
+                let nextScale = clampedCanvasScale(initialScale * pow(value.magnification, 0.72), in: size)
+                let anchor = CGPoint(x: value.startAnchor.x * size.width, y: value.startAnchor.y * size.height)
+
+                canvasScale = nextScale
+                canvasZoomOffset = canvasOffsetKeeping(anchor, fixedFrom: initialOffset, initialScale: initialScale, nextScale: nextScale)
+                canvasPinchStartScale = nil
+                canvasPinchStartOffset = nil
+                isViewingEntireCanvas = nextScale <= fitCanvasScale(for: size) + 0.01
+            }
+    }
+
     /// Branch connectors follow the exact parent response card they forked from.
     private func updateChildren(of parentID: UUID, responseIndex: Int, to yOffset: CGFloat) {
         let anchor = BranchResponseAnchor(branchID: parentID, responseIndex: responseIndex)
@@ -600,67 +683,51 @@ struct ActiveInquiryView: View {
 	            VStack(spacing: 0) {
 	                GeometryReader { canvasGeo in
 	                    ScrollViewReader { proxy in
-	                        Group {
-                            if isZoomedOut {
-                                ConversationCanvasCameraView(
-                                    branches: $activeBranches,
-                                    scale: $canvasScale,
-                                    offset: $canvasZoomOffset,
-                                    isViewingEntireCanvas: $isViewingEntireCanvas,
-                                    measuredCanvasHeight: $unscaledCanvasHeight,
-                                    size: canvasGeo.size,
-                                    branchSpacing: canvasBranchSpacing,
-                                    overviewBranchSpacing: overviewBranchSpacing,
-                                    areResponsesCollapsed: areResponsesCollapsed,
-                                    focusedBranchID: focusedBranchID,
-                                    makeFullBranch: { branch, size in
-                                        branchLaneView(for: branch, canvasSize: size, proxy: proxy)
-                                    },
-                                    onFocusBranch: { branch in
-                                        focusBranch(branch, anchor: branchAnchor(for: branch), proxy: proxy)
-                                    }
-                                )
-                            } else {
-	                                ScrollView(.vertical, showsIndicators: false) {
-	                                    VStack(alignment: .leading, spacing: 0) {
-	                                        HStack(alignment: .top, spacing: branchSpacing) {
-	                                            ForEach($activeBranches) { $branch in
-	                                                branchLaneView(for: $branch, canvasSize: canvasGeo.size, proxy: proxy)
-	                                            }
-	                                        }
-	                                        .offset(x: branchModeOffset(canvasWidth: canvasGeo.size.width))
-	                                        .background(
-	                                            GeometryReader { hstackGeo in
-	                                                Color.clear
-	                                                    .onAppear {
-	                                                        unscaledCanvasHeight = hstackGeo.size.height
-	                                                    }
-	                                                    .onChange(of: hstackGeo.size.height) { oldValue, newValue in
-	                                                        unscaledCanvasHeight = newValue
-	                                                    }
-	                                            }
-	                                        )
-	                                        .padding(.bottom, 40)
-	
-	                                        Color.clear
-	                                            .frame(width: 1, height: 1)
-	                                            .id(bottomAnchorID)
-	                                            .background(
-	                                                GeometryReader { bottomGeo in
-	                                                    Color.clear
-	                                                        .onAppear {
-	                                                            isAtBottom = bottomGeo.frame(in: .named("GlobalCanvas")).maxY <= canvasGeo.size.height + 32
-	                                                        }
-	                                                        .onChange(of: bottomGeo.frame(in: .named("GlobalCanvas")).maxY) { oldValue, newValue in
-	                                                            isAtBottom = newValue <= canvasGeo.size.height + 32
-	                                                        }
-	                                                }
-	                                            )
+	                        ScrollView(.vertical, showsIndicators: false) {
+	                            VStack(alignment: .leading, spacing: 0) {
+	                                HStack(alignment: .top, spacing: isZoomedOut ? canvasBranchSpacing : branchSpacing) {
+	                                    ForEach($activeBranches) { $branch in
+	                                        branchLaneView(for: $branch, canvasSize: canvasGeo.size, proxy: proxy)
 	                                    }
 	                                }
-	                                .coordinateSpace(name: "GlobalCanvas")
+	                                .scaleEffect(isZoomedOut ? canvasScale : 1, anchor: .topLeading)
+	                                .offset(
+	                                    x: isZoomedOut ? canvasZoomOffset.width : branchModeOffset(canvasWidth: canvasGeo.size.width),
+	                                    y: isZoomedOut ? canvasZoomOffset.height : 0
+	                                )
+	                                .background(
+	                                    GeometryReader { hstackGeo in
+	                                        Color.clear
+	                                            .onAppear {
+	                                                unscaledCanvasHeight = hstackGeo.size.height
+	                                            }
+	                                            .onChange(of: hstackGeo.size.height) { oldValue, newValue in
+	                                                unscaledCanvasHeight = newValue
+	                                            }
+	                                    }
+	                                )
+	                                .padding(.bottom, 40)
+	
+	                                Color.clear
+	                                    .frame(width: 1, height: 1)
+	                                    .id(bottomAnchorID)
+	                                    .background(
+	                                        GeometryReader { bottomGeo in
+	                                            Color.clear
+	                                                .onAppear {
+	                                                    isAtBottom = bottomGeo.frame(in: .named("GlobalCanvas")).maxY <= canvasGeo.size.height + 32
+	                                                }
+	                                                .onChange(of: bottomGeo.frame(in: .named("GlobalCanvas")).maxY) { oldValue, newValue in
+	                                                    isAtBottom = newValue <= canvasGeo.size.height + 32
+	                                                }
+	                                        }
+	                                    )
 	                            }
 	                        }
+	                        .coordinateSpace(name: "GlobalCanvas")
+	                        .scrollDisabled(isZoomedOut)
+	                        .simultaneousGesture(seamlessCanvasPanGesture())
+	                        .simultaneousGesture(seamlessCanvasZoomGesture(in: canvasGeo.size))
 	                        .onAppear {
 	                            viewportSize = canvasGeo.size
 	                        }
@@ -797,6 +864,7 @@ struct ActiveInquiryView: View {
                 onRenameConversation: { _ in },
                 onPinConversation: pinConversation,
                 onDeleteConversation: deleteConversation,
+                newInsightsCount: newInsightsCount,
                 onOpenInsights: {
                     withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
                         isSideMenuOpen = false
@@ -846,6 +914,11 @@ struct ActiveInquiryView: View {
         }
         .onChange(of: newConversationRequest) { oldValue, newValue in
             handleNewConversationRequestIfNeeded()
+        }
+        .onChange(of: requestedForkConcept) { _, concept in
+            guard let concept else { return }
+            forkInsightIntoNewBranch(concept)
+            requestedForkConcept = nil
         }
         .sheet(isPresented: $isInsightLibraryOpen) {
             InsightLibraryPopup(
@@ -1297,6 +1370,7 @@ struct BranchLaneView: View {
             uploadedFiles: $uploadedFiles,
             showsPendingUploads: showsPendingUploads,
             isZoomedOut: isZoomedOut,
+            canvasScale: canvasScale,
             connectorLength: connectorLength,
             quotedConcept: quotedConcept,
             areResponsesCollapsed: areResponsesCollapsed,
@@ -1349,6 +1423,7 @@ struct ChatThreadColumn: View {
     @Binding var uploadedFiles: [UploadedFile]
     let showsPendingUploads: Bool
     let isZoomedOut: Bool
+    let canvasScale: CGFloat
     let connectorLength: CGFloat
     let quotedConcept: ConceptDefinition?
     let areResponsesCollapsed: Bool
@@ -1368,6 +1443,10 @@ struct ChatThreadColumn: View {
     let chatBubbleColor = AquinasTheme.Colors.background
     private var bottomInputAnchor: String {
         "bottom-input-anchor-\(branchData.id)"
+    }
+
+    private var usesCanvasIconResponses: Bool {
+        isZoomedOut && canvasScale < 0.55
     }
 
     // MARK: Editable Thread Values
@@ -1670,6 +1749,7 @@ struct ChatThreadColumn: View {
                             columnSpaceName: "ColumnContent-\(branchData.id)",
                             canvasYCorrection: canvasYCorrection,
                             areResponsesCollapsed: areResponsesCollapsed,
+                            usesCanvasIconPreview: usesCanvasIconResponses,
                             onCenterChange: onSpawnYChange,
                             onDuplicateBranch: {
                                 onDuplicateResponse(textContent, index)
@@ -1832,6 +1912,7 @@ struct TrackedResponseCard: View {
     let columnSpaceName: String
     let canvasYCorrection: CGFloat
     let areResponsesCollapsed: Bool
+    let usesCanvasIconPreview: Bool
     var onCenterChange: (Int, CGFloat) -> Void = { _, _ in }
     var onDuplicateBranch: () -> Void = {}
 
@@ -1857,18 +1938,24 @@ struct TrackedResponseCard: View {
     }
 
     var body: some View {
-        ModelResponseCard(
-            title: "Are Some Lies Acceptable?",
-            fullText: textContent,
-            forceCollapsed: areResponsesCollapsed,
-            shouldAnimateOnAppear: shouldAnimateOnAppear,
-            onDuplicateBranch: onDuplicateBranch,
-            onFinish: {
-                hasFinishedStreaming = true
-                onCenterChange(responseIndex, myYCenter)
-                onFinish()
+        Group {
+            if usesCanvasIconPreview {
+                CanvasResponseIconCard()
+            } else {
+                ModelResponseCard(
+                    title: "Are Some Lies Acceptable?",
+                    fullText: textContent,
+                    forceCollapsed: areResponsesCollapsed,
+                    shouldAnimateOnAppear: shouldAnimateOnAppear,
+                    onDuplicateBranch: onDuplicateBranch,
+                    onFinish: {
+                        hasFinishedStreaming = true
+                        onCenterChange(responseIndex, myYCenter)
+                        onFinish()
+                    }
+                )
             }
-        )
+        }
         .background(
             GeometryReader { geo in
                 Color.clear
@@ -1889,6 +1976,25 @@ struct TrackedResponseCard: View {
             parentOpenURL(url)
             return .handled
         })
+    }
+}
+
+private struct CanvasResponseIconCard: View {
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(AquinasTheme.Colors.card)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .stroke(AquinasTheme.Colors.border, lineWidth: 1)
+                }
+
+            Image(systemName: "book.pages")
+                .font(.system(size: 44, weight: .semibold))
+                .foregroundColor(AquinasTheme.Colors.lightGreen)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 360)
     }
 }
 

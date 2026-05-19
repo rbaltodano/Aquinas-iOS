@@ -11,6 +11,11 @@ import UIKit
 struct InsightTreeView: View {
     let insights: [ConceptDefinition]
     var onClose: (() -> Void)?
+    var onRemoveInsight:  ((ConceptDefinition) -> Void)? = nil
+    var onRestoreInsight: ((ConceptDefinition) -> Void)? = nil
+    var onForkInsight:    ((ConceptDefinition) -> Void)? = nil
+
+    @Environment(\.colorScheme) private var colorScheme
 
     @StateObject private var viewModel: InsightTreeViewModel
     @State private var selectedInsight: InsightModel?
@@ -18,11 +23,60 @@ struct InsightTreeView: View {
     @State private var dockedCardDragY: CGFloat = 0
     @State private var restoreFocusedCameraRequest: Int = 0
     @State private var focusedInsightID: UUID?
+    @State private var undoInsight: ConceptDefinition? = nil
+    @State private var undoTask: Task<Void, Never>? = nil
+    @State private var pendingRemoveInsight: InsightModel? = nil
 
-    init(insights: [ConceptDefinition], onClose: (() -> Void)? = nil) {
-        self.insights = insights
-        self.onClose = onClose
+    init(
+        insights: [ConceptDefinition],
+        onClose: (() -> Void)? = nil,
+        onRemoveInsight:  ((ConceptDefinition) -> Void)? = nil,
+        onRestoreInsight: ((ConceptDefinition) -> Void)? = nil,
+        onForkInsight:    ((ConceptDefinition) -> Void)? = nil
+    ) {
+        self.insights          = insights
+        self.onClose           = onClose
+        self.onRemoveInsight   = onRemoveInsight
+        self.onRestoreInsight  = onRestoreInsight
+        self.onForkInsight     = onForkInsight
         _viewModel = StateObject(wrappedValue: InsightTreeViewModel(insights: insights))
+    }
+
+    private var canvasTertiary: Color {
+        colorScheme == .dark
+            ? Color(red: 43/255, green: 37/255, blue: 33/255)   // #2B2521
+            : Color(red: 32/255, green: 28/255, blue: 24/255)   // #201C18
+    }
+
+    @ViewBuilder
+    private var undoButtonView: some View {
+        Button {
+            guard let concept = undoInsight else { return }
+            undoTask?.cancel()
+            onRestoreInsight?(concept)
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                undoInsight = nil
+            }
+        } label: {
+            HStack(alignment: .center, spacing: 8) {
+                Text("Undo")
+                    .font(.custom("Figtree-Bold", size: 16))
+                Image(systemName: "arrow.uturn.backward")
+                    .font(.system(size: 14, weight: .semibold))
+            }
+            .foregroundColor(.white)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+            .background(canvasTertiary)
+            .cornerRadius(12)
+            .shadow(color: canvasTertiary.opacity(0.2), radius: 8, x: 0, y: 8)
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .inset(by: 0.5)
+                    .stroke(canvasTertiary.opacity(0.05), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     var body: some View {
@@ -55,25 +109,27 @@ struct InsightTreeView: View {
                 EmptyInsightTreeView()
             }
 
-            if let selectedInsight {
-                VStack {
-                    Spacer()
+            VStack(spacing: 0) {
+                Spacer()
 
-                    DockedInsightTreeCard(insight: selectedInsight)
-                        .offset(y: dockedCardDragY)
-                        .gesture(dockedCardDismissGesture)
-                        .padding(.horizontal, 10)
-                        .padding(.bottom, 10)
+                if undoInsight != nil {
+                    undoButtonView
+                        .transition(.scale(scale: 0.88).combined(with: .opacity))
+                        .padding(.bottom, (selectedInsight != nil || selectedNode != nil) ? 8 : 48)
                 }
-                .ignoresSafeArea(.keyboard, edges: .bottom)
-                .transition(.move(edge: .bottom))
-                .zIndex(200)
-            }
 
-            if let selectedNode {
-                VStack {
-                    Spacer()
-
+                if let selectedInsight {
+                    DockedInsightTreeCard(
+                        insight: selectedInsight,
+                        onRemove: { pendingRemoveInsight = selectedInsight },
+                        onFork:   { performForkInsight(selectedInsight) }
+                    )
+                    .offset(y: dockedCardDragY)
+                    .gesture(dockedCardDismissGesture)
+                    .transition(.move(edge: .bottom))
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 10)
+                } else if let selectedNode {
                     DockedNodeTreeCard(
                         node: selectedNode,
                         onSelectInsight: { insight in
@@ -81,15 +137,15 @@ struct InsightTreeView: View {
                             showInsightCard(insight)
                         }
                     )
-                        .offset(y: dockedCardDragY)
-                        .gesture(dockedCardDismissGesture)
-                        .padding(.horizontal, 10)
-                        .padding(.bottom, 10)
+                    .offset(y: dockedCardDragY)
+                    .gesture(dockedCardDismissGesture)
+                    .transition(.move(edge: .bottom))
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 10)
                 }
-                .ignoresSafeArea(.keyboard, edges: .bottom)
-                .transition(.move(edge: .bottom))
-                .zIndex(200)
             }
+            .ignoresSafeArea(.keyboard, edges: .bottom)
+            .zIndex(200)
 
             VStack {
                 HStack {
@@ -118,6 +174,20 @@ struct InsightTreeView: View {
                !newValue.contains(where: { $0.id == selectedInsight.id }) {
                 dismissDockedInsight()
             }
+        }
+        .alert("Remove bookmark?", isPresented: Binding(
+            get: { pendingRemoveInsight != nil },
+            set: { if !$0 { pendingRemoveInsight = nil } }
+        )) {
+            Button("Cancel", role: .cancel) {}
+            Button("Remove", role: .destructive) {
+                if let insight = pendingRemoveInsight {
+                    performRemoveInsight(insight)
+                }
+                pendingRemoveInsight = nil
+            }
+        } message: {
+            Text("This insight will be removed from your Insight Tree. You can undo this immediately after.")
         }
         .sheet(item: $viewModel.selectedSuggestedNode) { node in
             SuggestedInsightSheet(node: node) {
@@ -165,6 +235,28 @@ struct InsightTreeView: View {
             }
     }
 
+    private func performRemoveInsight(_ insight: InsightModel) {
+        guard let concept = insights.first(where: { $0.id == insight.id }) else { return }
+        onRemoveInsight?(concept)   // triggers onChange → dismissDockedInsight
+        undoTask?.cancel()
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+            undoInsight = concept
+        }
+        undoTask = Task {
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                undoInsight = nil
+            }
+        }
+    }
+
+    private func performForkInsight(_ insight: InsightModel) {
+        guard let concept = insights.first(where: { $0.id == insight.id }) else { return }
+        dismissDockedInsight()
+        onForkInsight?(concept)
+    }
+
     private func dismissDockedInsight() {
         guard selectedInsight != nil || selectedNode != nil else { return }
 
@@ -186,6 +278,8 @@ struct InsightTreeView: View {
 
 private struct DockedInsightTreeCard: View {
     let insight: InsightModel
+    var onRemove: (() -> Void)? = nil
+    var onFork:   (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -205,8 +299,8 @@ private struct DockedInsightTreeCard: View {
                     canCopy: true,
                     canFork: true,
                     copyText: insight.definition,
-                    onSave: {},
-                    onFork: {}
+                    onSave: { onRemove?() },
+                    onFork: { onFork?() }
                 )
             }
 

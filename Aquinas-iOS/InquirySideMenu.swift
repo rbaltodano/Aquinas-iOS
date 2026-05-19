@@ -67,6 +67,7 @@ struct AquinasSideMenu: View {
     var onRenameConversation: (InquiryConversation) -> Void
     var onPinConversation: (InquiryConversation) -> Void
     var onDeleteConversation: (InquiryConversation) -> Void
+    var newInsightsCount: Int = 0
     var onOpenInsights: () -> Void
     var onToggleColorScheme: () -> Void
     var onClose: () -> Void
@@ -100,7 +101,7 @@ struct AquinasSideMenu: View {
                         VStack(alignment: .leading, spacing: 24) {
                             SideMenuRow(icon: "house", title: "Home", isPresented: isPresented, delay: 0.20, action: {})
                             SideMenuRow(icon: "bubble.left.and.bubble.right", title: "Conversations", isPresented: isPresented, delay: 0.25, action: {})
-                            SideMenuRow(icon: "brain.head.profile", title: "Insights", isPresented: isPresented, delay: 0.30, action: onOpenInsights)
+                            SideMenuRow(icon: "brain.head.profile", title: "Insights", badge: newInsightsCount, isPresented: isPresented, delay: 0.30, action: onOpenInsights)
                             SideMenuRow(icon: "doc", title: "Files", isPresented: isPresented, delay: 0.35, action: {})
                         }
                     }
@@ -300,6 +301,7 @@ private struct SearchRow: View {
 private struct SideMenuRow: View {
     let icon: String
     let title: String
+    var badge: Int = 0
     let isPresented: Bool
     let delay: TimeInterval
     var action: () -> Void
@@ -330,6 +332,17 @@ private struct SideMenuRow: View {
                     .foregroundColor(AquinasTheme.Colors.paragraphText)
                     .opacity(showsText ? 1 : 0)
                     .offset(x: showsText ? 0 : -10)
+
+                if badge > 0 {
+                    Text("\(badge)")
+                        .font(.custom("Figtree-Bold", size: 12))
+                        .foregroundColor(AquinasTheme.Colors.canvasSecondary)
+                        .frame(width: 22, height: 22)
+                        .background(AquinasTheme.Colors.lightGreen.opacity(0.28))
+                        .clipShape(Circle())
+                        .opacity(showsText ? 1 : 0)
+                        .transition(.scale(scale: 0.75).combined(with: .opacity))
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }

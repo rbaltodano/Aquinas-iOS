@@ -174,10 +174,10 @@ struct ConversationCanvasCameraView<FullBranch: View>: View {
     }
 
     private var detailLevel: ConversationCanvasDetailLevel {
-        if scale >= 0.55 {
+        if scale >= 0.18 {
             return .full
         }
-        if scale >= 0.24 {
+        if scale >= 0.12 {
             return .map
         }
         return .icon

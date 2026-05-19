@@ -65,6 +65,11 @@ struct AnimatedDotGridBackground: View, Animatable {
             : Color(red: 0.44, green: 0.41, blue: 0.27)
     }
 
+    // Light mode dots sit on a bright cream background and need a bump to read clearly.
+    private var opacityScale: Double {
+        colorScheme == .dark ? 1.0 : 1.6
+    }
+
     var body: some View {
         // TimelineView drives the noise field at display refresh rate.
         // Animatable drives the camera interpolation at the same rate during springs.
@@ -140,9 +145,9 @@ struct AnimatedDotGridBackground: View, Animatable {
                             }
                         }
 
-                        let opacity = min(blobOpacity(worldX: Double(wx),
-                                                      worldY: Double(wy),
-                                                      t: t) + boost, 0.85)
+                        let opacity = min((blobOpacity(worldX: Double(wx),
+                                                       worldY: Double(wy),
+                                                       t: t) + boost) * opacityScale, 0.85)
 
                         let rect = CGRect(
                             x: sx - dotRadius, y: sy - dotRadius,
@@ -170,8 +175,8 @@ struct AnimatedDotGridBackground: View, Animatable {
 
         let raw        = (v1 + v2 + v3) / 1.93
         let normalised = (raw + 1.0) / 2.0
-        let shaped     = normalised * normalised   // soft-knee: peaks bloom, base stays dark
+        let shaped     = pow(normalised, 4.0)   // steeper knee: empties collapse, peaks bloom
 
-        return 0.02 + shaped * 0.21
+        return 0.01 + shaped * 0.28
     }
 }

@@ -86,9 +86,30 @@ struct ContentView: View {
     @State private var requestedConversationID: UUID? = nil
     @State private var newConversationRequest: Int = 0
     @State private var colorSchemeOverride: ColorScheme? = nil
+    @State private var requestedForkConcept: ConceptDefinition? = nil
 
 
     let canvasColor = AquinasTheme.Colors.canvas
+
+    @ViewBuilder private var insightTreePage: some View {
+        InsightTreeView(
+            insights: collectedDefinitions,
+            onRemoveInsight: { def in
+                withAnimation { collectedDefinitions.removeAll { $0.id == def.id } }
+            },
+            onRestoreInsight: { def in
+                withAnimation { collectedDefinitions.append(def) }
+            },
+            onForkInsight: { def in
+                requestedForkConcept = def
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                    activePage = .conversation
+                }
+            }
+        )
+        .background(canvasColor)
+        .ignoresSafeArea()
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -118,6 +139,7 @@ struct ContentView: View {
                                 sideMenuCurrentTitle: $sideMenuCurrentTitle,
                                 requestedConversationID: $requestedConversationID,
                                 newConversationRequest: $newConversationRequest,
+                                requestedForkConcept: $requestedForkConcept,
                                 colorSchemeOverride: $colorSchemeOverride,
                                 isAtBottom: $isAtBottom,
                                 showFilePicker: $showFilePicker,
@@ -128,9 +150,7 @@ struct ContentView: View {
                                 collectedDefinitions: $collectedDefinitions
                             )
                         case .insights:
-                            InsightTreeView(insights: collectedDefinitions)
-                                .background(canvasColor)
-                                .ignoresSafeArea()
+                            insightTreePage
                         }
                     }
                     .background(AquinasTheme.Colors.activeInquiryChrome)

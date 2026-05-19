@@ -71,8 +71,10 @@ final class InsightTreeViewModel: ObservableObject {
     }
 
     func dismissSuggestedNode(_ node: NodeModel) {
-        nodes.removeAll { $0.id == node.id }
-        edges.removeAll { $0.fromNodeID == node.id || $0.toNodeID == node.id }
+        withAnimation(.spring(response: 0.55, dampingFraction: 0.78)) {
+            nodes.removeAll { $0.id == node.id }
+            edges.removeAll { $0.fromNodeID == node.id || $0.toNodeID == node.id }
+        }
         scene.render(nodes: nodes, edges: edges, animated: true)
     }
 
@@ -122,11 +124,13 @@ final class InsightTreeViewModel: ObservableObject {
             suggestedInsights: suggestionInsights
         )
 
-        nodes.removeAll { $0.isSuggested }
-        edges.removeAll { $0.isSuggested }
-        nodes.append(suggestedNode)
-        edges.append(EdgeModel(id: UUID(), fromNodeID: from.id, toNodeID: suggestedNode.id, distance: 0.18, isSuggested: true, showSuggestButton: false))
-        edges.append(EdgeModel(id: UUID(), fromNodeID: suggestedNode.id, toNodeID: to.id, distance: 0.18, isSuggested: true, showSuggestButton: false))
+        withAnimation(.spring(response: 0.55, dampingFraction: 0.78)) {
+            nodes.removeAll { $0.isSuggested }
+            edges.removeAll { $0.isSuggested }
+            nodes.append(suggestedNode)
+            edges.append(EdgeModel(id: UUID(), fromNodeID: from.id, toNodeID: suggestedNode.id, distance: 0.18, isSuggested: true, showSuggestButton: false))
+            edges.append(EdgeModel(id: UUID(), fromNodeID: suggestedNode.id, toNodeID: to.id, distance: 0.18, isSuggested: true, showSuggestButton: false))
+        }
         scene.render(nodes: nodes, edges: edges, animated: true)
     }
 
@@ -139,8 +143,10 @@ final class InsightTreeViewModel: ObservableObject {
         insights = embeddedInsights
 
         guard embeddedInsights.count >= 5 else {
-            nodes = makeEarlyNodes(from: embeddedInsights)
-            edges = []
+            withAnimation(.spring(response: 0.55, dampingFraction: 0.78)) {
+                nodes = makeEarlyNodes(from: embeddedInsights)
+                edges = []
+            }
             scene.render(nodes: nodes, edges: edges, animated: true)
             return
         }
@@ -182,8 +188,10 @@ final class InsightTreeViewModel: ObservableObject {
             persistPositions(nextNodes)
         }
 
-        nodes = nextNodes
-        edges = nextEdges
+        withAnimation(.spring(response: 0.55, dampingFraction: 0.78)) {
+            nodes = nextNodes
+            edges = nextEdges
+        }
         scene.render(nodes: nodes, edges: edges, animated: true)
     }
 

@@ -28,8 +28,11 @@ struct InsightTreeCanvasView: View {
     @State private var pinchStartScale: CGFloat?
     @State private var pinchStartOffset: CGSize?
     @State private var preFocusCamera: InsightTreeCameraSnapshot?
-    @State private var rippleTrigger: RippleTrigger? = nil
-    @GestureState private var dragOffset: CGSize = .zero
+    @State private var rippleTrigger:      RippleTrigger? = nil
+    @State private var hasAppeared:        Bool = false
+    @State private var revealedInsightIDs: Set<UUID> = []
+    @State private var entranceTask:       Task<Void, Never>? = nil
+    @GestureState private var dragOffset:  CGSize = .zero
 
     private var activeScale: CGFloat {
         clamp(scale, lower: 0.28, upper: 2.6)
@@ -55,7 +58,10 @@ struct InsightTreeCanvasView: View {
                     settledScale:  activeScale,
                     dragOffset:    dragOffset,
                     ripple:        rippleTrigger
-                ).ignoresSafeArea()
+                )
+                .ignoresSafeArea()
+                .opacity(hasAppeared ? 1 : 0)
+                .animation(.easeOut(duration: 0.6), value: hasAppeared)
 
                 graphEdges(camera: camera, size: size)
                 insightConnectors(camera: camera, size: size, labelOpacity: labelOpacity)
@@ -91,6 +97,17 @@ struct InsightTreeCanvasView: View {
                       let focusTarget = insightFocusTarget(for: newValue) else { return }
 
                 focusInsight(at: focusTarget, in: size)
+            }
+            .onAppear {
+                hasAppeared = true
+                let newInsights = computeNewInsights()
+                saveAllInsightIDsAsSeen()
+                entranceTask = Task {
+                    await runEntranceSequence(newInsights: newInsights, in: size)
+                }
+            }
+            .onDisappear {
+                entranceTask?.cancel()
             }
         }
     }
@@ -326,6 +343,8 @@ struct InsightTreeCanvasView: View {
                     .lineLimit(2)
                     .minimumScaleFactor(0.75)
                     .opacity(labelOpacity)
+                    .blur(radius: hasAppeared ? 0 : 8)
+                    .animation(.spring(response: 0.6, dampingFraction: 0.75).delay(0.1), value: hasAppeared)
             }
             .padding(8)
             .background(AquinasTheme.Colors.canvas)
@@ -357,6 +376,10 @@ struct InsightTreeCanvasView: View {
                 .offset(x: 20, y: -10)
             }
         }
+        .offset(y: hasAppeared ? 0 : 24)
+        .opacity(hasAppeared ? 1 : 0)
+        .animation(.spring(response: 0.6, dampingFraction: 0.75).delay(0.1), value: hasAppeared)
+        .transition(.scale(scale: 0.88, anchor: .center).combined(with: .opacity))
         .position(position)
         .zIndex(node.isSuggested ? 20 : 10)
     }
@@ -371,7 +394,8 @@ struct InsightTreeCanvasView: View {
         labelOpacity: Double
     ) -> some View {
         let worldPosition = insightWorldPosition(for: node, index: index, count: count)
-        let position = camera.worldToScreen(worldPosition, in: size)
+        let position      = camera.worldToScreen(worldPosition, in: size)
+        let isRevealed    = revealedInsightIDs.contains(insight.id)
 
         return HStack(spacing: 10) {
             Image(systemName: "text.bubble.fill")
@@ -384,6 +408,8 @@ struct InsightTreeCanvasView: View {
                 .foregroundColor(AquinasTheme.Colors.lightGreen)
                 .lineLimit(1)
                 .opacity(labelOpacity)
+                .blur(radius: isRevealed ? 0 : 8)
+                .animation(.spring(response: 0.6, dampingFraction: 0.75), value: isRevealed)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
@@ -400,6 +426,11 @@ struct InsightTreeCanvasView: View {
             focusInsight(at: worldPosition, in: size)
             onInsightTapped(insight)
         }
+        .offset(y: isRevealed ? 0 : 24)
+        .opacity(isRevealed ? 1 : 0)
+        .blur(radius: isRevealed ? 0 : 8)
+        .animation(.spring(response: 0.6, dampingFraction: 0.75), value: isRevealed)
+        .transition(.scale(scale: 0.88, anchor: .center).combined(with: .opacity))
         .position(position)
         .zIndex(30)
     }
@@ -474,6 +505,133 @@ struct InsightTreeCanvasView: View {
             x: node.position.x + cos(angle) * radius,
             y: node.position.y + sin(angle) * radius
         )
+    }
+
+    // MARK: - New-Insight Entrance Sequence
+
+    private static let seenInsightIDsKey = "AquinasSeenInsightIDs"
+
+    private func loadSeenInsightIDs() -> Set<UUID> {
+        guard let strings = UserDefaults.standard.stringArray(forKey: Self.seenInsightIDsKey) else {
+            return []
+        }
+        return Set(strings.compactMap { UUID(uuidString: $0) })
+    }
+
+    private func saveAllInsightIDsAsSeen() {
+        let ids = nodes.flatMap { $0.insights }.map { $0.id.uuidString }
+        UserDefaults.standard.set(ids, forKey: Self.seenInsightIDsKey)
+    }
+
+    /// Returns insights that weren't present the last time InsightTree was opened.
+    /// Returns empty on the very first open (no persisted state yet).
+    private func computeNewInsights() -> [InsightModel] {
+        let seenIDs = loadSeenInsightIDs()
+        guard !seenIDs.isEmpty else { return [] }
+        return nodes.flatMap { node in
+            Array(node.insights.prefix(6)).filter { !seenIDs.contains($0.id) }
+        }
+    }
+
+    /// World position of an insight looked up by ID (nil if not visible on tree).
+    private func worldPosition(forInsightID id: UUID) -> CGPoint? {
+        for node in nodes {
+            let visible = Array(node.insights.prefix(6))
+            if let idx = visible.firstIndex(where: { $0.id == id }) {
+                return insightWorldPosition(for: node, index: idx, count: min(node.insights.count, 6))
+            }
+        }
+        return nil
+    }
+
+    /// Zoom camera to a single insight (reuses focusInsight so camera memory is saved).
+    private func zoomToInsight(_ insight: InsightModel, in size: CGSize) {
+        guard let worldPos = worldPosition(forInsightID: insight.id) else { return }
+        focusInsight(at: worldPos, in: size)
+    }
+
+    /// Zoom out so that all supplied insights fit in the viewport with padding.
+    private func zoomToFitInsights(_ insights: [InsightModel], in size: CGSize) {
+        let positions = insights.compactMap { worldPosition(forInsightID: $0.id) }
+        guard positions.count >= 2 else {
+            if let pos = positions.first { focusInsight(at: pos, in: size) }
+            return
+        }
+
+        let minX = positions.map { $0.x }.min()!
+        let maxX = positions.map { $0.x }.max()!
+        let minY = positions.map { $0.y }.min()!
+        let maxY = positions.map { $0.y }.max()!
+
+        let padding: CGFloat    = 180
+        let worldWidth          = max(maxX - minX + padding * 2, 1)
+        let worldHeight         = max(maxY - minY + padding * 2, 1)
+        let targetScale         = clamp(
+            min(size.width / worldWidth, size.height / worldHeight) * 0.88,
+            lower: 0.28, upper: 1.4
+        )
+        let centerX = (minX + maxX) / 2
+        let centerY = (minY + maxY) / 2
+
+        rememberCameraBeforeFocusIfNeeded()
+        withAnimation(.spring(response: 0.58, dampingFraction: 0.64, blendDuration: 0.08)) {
+            scale  = targetScale
+            offset = CGSize(width: -(centerX * targetScale), height: centerY * targetScale)
+        }
+    }
+
+    /// Orchestrates the full entrance sequence based on how many new insights there are.
+    private func runEntranceSequence(newInsights: [InsightModel], in size: CGSize) async {
+        let allIDs    = Set(nodes.flatMap { Array($0.insights.prefix(6)).map { $0.id } })
+        let newIDs    = Set(newInsights.map { $0.id })
+        let nonNewIDs = allIDs.subtracting(newIDs)
+
+        // All non-new insights animate in with the standard 0.25 s stagger.
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        guard !Task.isCancelled else { return }
+        revealedInsightIDs = nonNewIDs.isEmpty ? allIDs : nonNewIDs
+
+        if newInsights.isEmpty {
+            // Nothing new — reveal everything at the stagger point and we're done.
+            revealedInsightIDs = allIDs
+            return
+        }
+
+        // Small pause so the user can register the overview before we start zooming.
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        if newInsights.count <= 3 {
+            // Zoom to each new insight in turn, wait for the spring to settle,
+            // then reveal it with its entrance animation.
+            for insight in newInsights {
+                guard !Task.isCancelled else { return }
+                zoomToInsight(insight, in: size)
+                try? await Task.sleep(nanoseconds: 950_000_000)   // spring settle ~0.95 s
+                guard !Task.isCancelled else { return }
+                revealedInsightIDs.insert(insight.id)
+                // Fire a ripple from this insight's world position as it springs in.
+                if let worldPos = worldPosition(forInsightID: insight.id) {
+                    rippleTrigger = RippleTrigger(worldOrigin: worldPos,
+                                                  startTime: Date().timeIntervalSinceReferenceDate)
+                }
+                try? await Task.sleep(nanoseconds: 700_000_000)   // entrance anim + brief pause
+            }
+        } else {
+            // 4+ new — zoom out so all are visible at once, then reveal them together.
+            guard !Task.isCancelled else { return }
+            zoomToFitInsights(newInsights, in: size)
+            try? await Task.sleep(nanoseconds: 1_100_000_000)
+            guard !Task.isCancelled else { return }
+            for id in newIDs { revealedInsightIDs.insert(id) }
+            // Single ripple at the centroid of all new insights.
+            let positions = newInsights.compactMap { worldPosition(forInsightID: $0.id) }
+            if !positions.isEmpty {
+                let cx = positions.map { $0.x }.reduce(0, +) / CGFloat(positions.count)
+                let cy = positions.map { $0.y }.reduce(0, +) / CGFloat(positions.count)
+                rippleTrigger = RippleTrigger(worldOrigin: CGPoint(x: cx, y: cy),
+                                              startTime: Date().timeIntervalSinceReferenceDate)
+            }
+        }
     }
 
     private static func labelOpacity(for scale: CGFloat) -> Double {
