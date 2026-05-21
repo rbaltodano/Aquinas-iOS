@@ -60,17 +60,16 @@ struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable {
 
 enum AppPage: Equatable {
     case conversation
+    case openConversations
+    case settings
     case insights
 }
 
 // MARK: - App Shell
 
 struct ContentView: View {
-    @Environment(\.colorScheme) private var colorScheme
     @State private var questionText: String = ""
     @State private var isAtBottom: Bool = false
-    @State private var sheetOffset: CGFloat = 0
-    @State private var isAtTop: Bool = true
     @FocusState private var isKeyboardVisible: Bool
     @State private var uploadedFiles: [UploadedFile] = []
     @State private var showFilePicker: Bool = false
@@ -79,17 +78,34 @@ struct ContentView: View {
     @State private var showCamera: Bool = false
     @State private var collectedDefinitions: [ConceptDefinition] = []
     @State private var activePage: AppPage = .conversation
+    @State private var displayedPage: AppPage = .conversation
+    @State private var isPageContentVisible: Bool = true
+    @State private var pageContentOffsetY: CGFloat = 0
+    @State private var pendingPageTransitionWorkItem: DispatchWorkItem? = nil
     @State private var isGlobalSideMenuOpen: Bool = false
     @State private var sideMenuConversations: [InquiryConversation] = []
     @State private var sideMenuActiveConversationID: UUID? = nil
     @State private var sideMenuCurrentTitle: String = "New Conversation"
     @State private var requestedConversationID: UUID? = nil
     @State private var newConversationRequest: Int = 0
+    @State private var deletedConversationID: UUID? = nil
     @State private var colorSchemeOverride: ColorScheme? = nil
     @State private var requestedForkConcept: ConceptDefinition? = nil
+    @State private var userName: String = ""
+    @State private var customInstructions: String = ""
 
 
     let canvasColor = AquinasTheme.Colors.canvas
+    private let pageFadeDuration: TimeInterval = 0.25
+    private let pageFadePauseDuration: TimeInterval = 0.15
+    private let pageTransitionOffset: CGFloat = 8
+
+    private var newInsightsCount: Int {
+        guard let strings = UserDefaults.standard.stringArray(forKey: "AquinasSeenInsightIDs"),
+              !strings.isEmpty else { return 0 }
+        let seenIDs = Set(strings.compactMap { UUID(uuidString: $0) })
+        return collectedDefinitions.filter { !seenIDs.contains($0.id) }.count
+    }
 
     @ViewBuilder private var insightTreePage: some View {
         InsightTreeView(
@@ -112,53 +128,97 @@ struct ContentView: View {
     }
 
     var body: some View {
-        GeometryReader { geo in
-            let snapUpPosition = -geo.size.height + 75
-
-            // Root stack: bookshelf sits behind the active inquiry surface.
+        GeometryReader { _ in
             ZStack(alignment: .top) {
+                canvasColor
+                    .ignoresSafeArea()
 
-                // Layer 1: saved insights, history, and the current topic overview.
-                BookshelfView(
-                    isAtTop: $isAtTop,
-                    showFilePicker: $showFilePicker,
-                    collectedDefinitions: $collectedDefinitions
-                )
-                .background(canvasColor)
-                .ignoresSafeArea()
-
-                // Layer 2: routed app pages.
                 VStack(spacing: 0) {
                     VStack(spacing: 0) {
-                        switch activePage {
-                        case .conversation:
-                            ActiveInquiryView(
-                                activePage: $activePage,
-                                sideMenuConversations: $sideMenuConversations,
-                                sideMenuActiveConversationID: $sideMenuActiveConversationID,
-                                sideMenuCurrentTitle: $sideMenuCurrentTitle,
-                                requestedConversationID: $requestedConversationID,
-                                newConversationRequest: $newConversationRequest,
-                                requestedForkConcept: $requestedForkConcept,
-                                colorSchemeOverride: $colorSchemeOverride,
-                                isAtBottom: $isAtBottom,
-                                showFilePicker: $showFilePicker,
-                                showPhotoPicker: $showPhotoPicker,
-                                showCamera: $showCamera,
-                                questionText: $questionText,
-                                uploadedFiles: $uploadedFiles,
-                                collectedDefinitions: $collectedDefinitions
-                            )
-                        case .insights:
-                            insightTreePage
+                        Group {
+                            switch displayedPage {
+                            case .conversation:
+                                CurrentConversationView(
+                                    onOpenMenu: {
+                                        dismissKeyboard()
+                                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                                            isGlobalSideMenuOpen = true
+                                        }
+                                    },
+                                    collectedDefinitions: $collectedDefinitions,
+                                    sideMenuConversations: $sideMenuConversations,
+                                    sideMenuCurrentTitle: $sideMenuCurrentTitle,
+                                    sideMenuActiveConversationID: $sideMenuActiveConversationID,
+                                    requestedConversationID: $requestedConversationID,
+                                    newConversationRequest: $newConversationRequest,
+                                    deletedConversationID: $deletedConversationID,
+                                    requestedForkConcept: $requestedForkConcept
+                                )
+                                // ActiveInquiryView(
+                                //     activePage: $activePage,
+                                //     sideMenuConversations: $sideMenuConversations,
+                                //     sideMenuActiveConversationID: $sideMenuActiveConversationID,
+                                //     sideMenuCurrentTitle: $sideMenuCurrentTitle,
+                                //     requestedConversationID: $requestedConversationID,
+                                //     newConversationRequest: $newConversationRequest,
+                                //     requestedForkConcept: $requestedForkConcept,
+                                //     colorSchemeOverride: $colorSchemeOverride,
+                                //     isAtBottom: $isAtBottom,
+                                //     showFilePicker: $showFilePicker,
+                                //     showPhotoPicker: $showPhotoPicker,
+                                //     showCamera: $showCamera,
+                                //     questionText: $questionText,
+                                //     uploadedFiles: $uploadedFiles,
+                                //     collectedDefinitions: $collectedDefinitions
+                                // )
+                            case .openConversations:
+                                OpenConversationsView(
+                                    conversations: sideMenuConversations,
+                                    activeConversationID: sideMenuActiveConversationID,
+                                    savedInsights: $collectedDefinitions,
+                                    onOpenMenu: {
+                                        dismissKeyboard()
+                                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                                            isGlobalSideMenuOpen = true
+                                        }
+                                    },
+                                    onSelectConversation: { conversation in
+                                        requestedConversationID = conversation.id
+                                        activePage = .conversation
+                                    },
+                                    onNewChat: {
+                                        newConversationRequest += 1
+                                        activePage = .conversation
+                                    },
+                                    onRenameConversation: { conversation, title in
+                                        renameConversation(conversation, to: title)
+                                    }
+                                )
+                            case .settings:
+                                SettingsView(
+                                    colorSchemeOverride: $colorSchemeOverride,
+                                    userName: $userName,
+                                    customInstructions: $customInstructions,
+                                    onOpenMenu: {
+                                        dismissKeyboard()
+                                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                                            isGlobalSideMenuOpen = true
+                                        }
+                                    }
+                                )
+                            case .insights:
+                                insightTreePage
+                            }
                         }
+                        .opacity(isPageContentVisible ? 1 : 0)
+                        .offset(y: pageContentOffsetY)
                     }
                     .background(AquinasTheme.Colors.activeInquiryChrome)
                 }
                 .overlay(alignment: .topLeading) {
                     if activePage == .insights && !isGlobalSideMenuOpen {
                         SideMenuTriggerButton {
-                            isKeyboardVisible = false
+                            dismissKeyboard()
                             withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
                                 isGlobalSideMenuOpen = true
                             }
@@ -170,7 +230,7 @@ struct ContentView: View {
                     }
                 }
                 .overlay {
-                    if activePage == .insights && isGlobalSideMenuOpen {
+                    if isGlobalSideMenuOpen {
                         Color.black.opacity(0.16)
                             .ignoresSafeArea()
                             .onTapGesture {
@@ -183,14 +243,13 @@ struct ContentView: View {
                     }
                 }
                 .overlay(alignment: .leading) {
-                    if activePage == .insights {
-                        AquinasSideMenu(
+                    AquinasSideMenu(
                             currentTitle: sideMenuCurrentTitle,
                             conversations: sideMenuConversations,
                             activeConversationID: sideMenuActiveConversationID,
+                            activePage: activePage,
                             selectedPersonality: "Friendly",
                             isPresented: isGlobalSideMenuOpen,
-                            isDarkMode: colorSchemeOverride.map { $0 == .dark } ?? (colorScheme == .dark),
                             onNewChat: {
                                 newConversationRequest += 1
                                 activePage = .conversation
@@ -205,15 +264,32 @@ struct ContentView: View {
                                     isGlobalSideMenuOpen = false
                                 }
                             },
-                            onRenameConversation: { _ in },
-                            onPinConversation: { _ in },
-                            onDeleteConversation: { _ in },
-                            onOpenInsights: {
+                            onRenameConversation: { conversation, title in
+                                renameConversation(conversation, to: title)
+                            },
+                            onPinConversation: { _ in /* pin not yet implemented */ },
+                            onDeleteConversation: { conversation in
+                                deleteConversation(conversation)
+                            },
+                            newInsightsCount: newInsightsCount,
+                            onOpenConversations: {
+                                activePage = .openConversations
                                 withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
                                     isGlobalSideMenuOpen = false
                                 }
                             },
-                            onToggleColorScheme: toggleColorScheme,
+                            onOpenInsights: {
+                                activePage = .insights
+                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                                    isGlobalSideMenuOpen = false
+                                }
+                            },
+                            onOpenSettings: {
+                                activePage = .settings
+                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                                    isGlobalSideMenuOpen = false
+                                }
+                            },
                             onClose: {
                                 withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
                                     isGlobalSideMenuOpen = false
@@ -225,7 +301,6 @@ struct ContentView: View {
                         .opacity(isGlobalSideMenuOpen ? 1 : 0.96)
                         .zIndex(4)
                         .animation(.spring(response: 0.42, dampingFraction: 0.84), value: isGlobalSideMenuOpen)
-                    }
                 }
 
                 // Shared document picker used by the bottom plus button.
@@ -312,66 +387,95 @@ struct ContentView: View {
                     .ignoresSafeArea()
                 }
 
-                // Bookshelf sheet physics. Drag from the bottom handle to open; drag from the top handle to close.
-                .simultaneousGesture(
-                    DragGesture()
-                        .onChanged { value in
-                            let grabbedTopHandle = sheetOffset < 0 && value.startLocation.y < 150
-                            let grabbedBottomHandle = sheetOffset == 0 && value.startLocation.y > (geo.size.height - 150)
-
-                            if grabbedBottomHandle && sheetOffset == 0 && value.translation.height < 0 {
-                                sheetOffset = value.translation.height * 0.85
-                            }
-                            else if grabbedTopHandle && sheetOffset < 0 && value.translation.height > 0 {
-                                let newOffset = snapUpPosition + (value.translation.height * 0.85)
-                                sheetOffset = min(newOffset, 0)
-                            }
-                        }
-                        .onEnded { value in
-                            let startedNearTopHandle = value.startLocation.y < 150
-                            let startedNearBottomHandle = value.startLocation.y > (geo.size.height - 150)
-                            let startedOnSheetHandle = startedNearTopHandle || startedNearBottomHandle
-                            guard startedOnSheetHandle || sheetOffset != 0 else { return }
-
-                            let isSwipingUp = startedNearBottomHandle && value.translation.height < -50
-                            let isSwipingDown = startedNearTopHandle && value.translation.height > 50
-
-                            if isSwipingUp {
-                                isKeyboardVisible = false
-                            }
-
-                            DispatchQueue.main.asyncAfter(deadline: .now() + (isSwipingUp ? 0.05 : 0)) {
-                                withAnimation(.spring(response: 0.4, dampingFraction: 0.75)) {
-                                    if isSwipingUp {
-                                        sheetOffset = snapUpPosition
-                                    } else if isSwipingDown {
-                                        sheetOffset = 0
-                                    } else {
-                                        sheetOffset = sheetOffset < (snapUpPosition / 2) ? snapUpPosition : 0
-                                    }
-                                }
-                            }
-                        }
-                )
-
             }
             .ignoresSafeArea(.container, edges: .bottom)
         }
         .preferredColorScheme(colorSchemeOverride)
         .onAppear {
+            displayedPage = activePage
+            isPageContentVisible = true
+            pageContentOffsetY = 0
             let savedInsights = InsightLibraryStore.load()
             if !savedInsights.isEmpty {
                 collectedDefinitions = savedInsights
             }
+        }
+        .onChange(of: activePage) { oldValue, newValue in
+            transitionDisplayedPage(to: newValue)
         }
         .onChange(of: collectedDefinitions) { oldValue, newValue in
             InsightLibraryStore.save(newValue)
         }
     }
 
-    private func toggleColorScheme() {
-        let currentIsDark = colorSchemeOverride.map { $0 == .dark } ?? (colorScheme == .dark)
-        colorSchemeOverride = currentIsDark ? .light : .dark
+    private func transitionDisplayedPage(to nextPage: AppPage) {
+        guard displayedPage != nextPage else {
+            withAnimation(.easeInOut(duration: pageFadeDuration)) {
+                isPageContentVisible = true
+                pageContentOffsetY = 0
+            }
+            return
+        }
+
+        pendingPageTransitionWorkItem?.cancel()
+        let startDelay: TimeInterval = isGlobalSideMenuOpen ? pageFadeDuration : 0
+
+        let fadeOutWork = DispatchWorkItem {
+            withAnimation(.easeInOut(duration: pageFadeDuration)) {
+                isPageContentVisible = false
+                pageContentOffsetY = pageTransitionOffset
+            }
+
+            let fadeInWork = DispatchWorkItem {
+                displayedPage = nextPage
+                pageContentOffsetY = pageTransitionOffset
+                withAnimation(.easeInOut(duration: pageFadeDuration)) {
+                    isPageContentVisible = true
+                    pageContentOffsetY = 0
+                }
+            }
+
+            pendingPageTransitionWorkItem = fadeInWork
+            DispatchQueue.main.asyncAfter(deadline: .now() + pageFadeDuration + pageFadePauseDuration, execute: fadeInWork)
+        }
+
+        pendingPageTransitionWorkItem = fadeOutWork
+        DispatchQueue.main.asyncAfter(deadline: .now() + startDelay, execute: fadeOutWork)
+    }
+
+    private func dismissKeyboard() {
+        isKeyboardVisible = false
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+
+    private func deleteConversation(_ conversation: InquiryConversation) {
+        // Remove from the side menu list immediately for snappy feedback.
+        sideMenuConversations.removeAll { $0.id == conversation.id }
+        // Signal the canvas to remove the thread (and any forks).
+        deletedConversationID = conversation.id
+        // If we were on the open-conversations page and nothing's left, go back.
+        if activePage == .openConversations && sideMenuConversations.isEmpty {
+            activePage = .conversation
+        }
+    }
+
+    private func renameConversation(_ conversation: InquiryConversation, to title: String) {
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else { return }
+
+        if let index = sideMenuConversations.firstIndex(where: { $0.id == conversation.id }) {
+            sideMenuConversations[index].title = trimmedTitle
+        }
+
+        if sideMenuActiveConversationID == conversation.id {
+            sideMenuCurrentTitle = trimmedTitle
+        }
+
+        if var snapshot = InquiryPersistenceStore.load(),
+           let index = snapshot.conversations.firstIndex(where: { $0.id == conversation.id }) {
+            snapshot.conversations[index].title = trimmedTitle
+            InquiryPersistenceStore.save(snapshot)
+        }
     }
 }
 

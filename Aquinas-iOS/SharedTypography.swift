@@ -184,12 +184,14 @@ extension Font {
     static let figtreeParagraphLarge = AquinasTheme.Typography.bodyLarge
     static let figtreeParagraphInsight = AquinasTheme.Typography.inlineInsight
     static let figtreeChipLabel = AquinasTheme.Typography.chipLabel
+    static let figtreeSmall = Font.custom("Figtree-Regular", size: 12)
 
     // MARK: Libre Baskerville aliases
     static let baskervilleHeading1 = AquinasTheme.Typography.title
     static let baskervilleHeading2 = AquinasTheme.Typography.heading
     static let baskervilleHeading3 = Font.custom("LibreBaskerville-Regular", size: 14)
     static let baskervilleBody = Font.custom("LibreBaskerville-Regular", size: 16)
+    static let baskervilleParagraph = Font.custom("LibreBaskerville-Regular", size: 14)
     static let baskervilleQuote = AquinasTheme.Typography.quote
     static let baskervilleSmall = AquinasTheme.Typography.baskervilleSmall
 }

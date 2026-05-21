@@ -12,7 +12,6 @@ import UIKit
 // MARK: - Active Inquiry Screen
 
 struct ActiveInquiryView: View {
-    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
     @Binding var activePage: AppPage
     @Binding var sideMenuConversations: [InquiryConversation]
@@ -40,9 +39,6 @@ struct ActiveInquiryView: View {
     @State private var isZoomedOut: Bool = false
     @State private var canvasScale: CGFloat = 1.0
     @State private var canvasZoomOffset: CGSize = .zero
-    @State private var canvasPanStartOffset: CGSize? = nil
-    @State private var canvasPinchStartScale: CGFloat? = nil
-    @State private var canvasPinchStartOffset: CGSize? = nil
     @State private var focusedBranchID: UUID? = nil
     @State private var isViewingEntireCanvas: Bool = false
     @State private var viewportSize: CGSize = .zero
@@ -55,15 +51,10 @@ struct ActiveInquiryView: View {
     @State private var areResponsesCollapsed: Bool = false
     @State private var scrollToBottomRequest: Int = 0
     @State private var viewEntireCanvasRequest: Int = 0
-    @State private var unscaledCanvasHeight: CGFloat = 0
-    @State private var isResponseRelayoutPending: Bool = false
-    @State private var pendingChildOffsets: [BranchResponseAnchor: CGFloat] = [:]
-    @State private var pendingRelayoutWorkItem: DispatchWorkItem? = nil
+    @State private var pendingPersistenceWorkItem: DispatchWorkItem? = nil
     @State private var hasRestoredPersistedConversations: Bool = false
     @State private var handledNewConversationRequest: Int = 0
     @State private var pendingFocusBranchID: UUID? = nil
-    // Horizontal pull amount while the user drags a branch toward Canvas mode.
-    @State private var pullOffset: CGFloat = 0
 
     // Latest measured center Y of the response card that can spawn the next branch.
     @State private var targetSpawnY: CGFloat = 300
@@ -72,11 +63,6 @@ struct ActiveInquiryView: View {
     struct TriggerWord: Identifiable {
         let id = UUID()
         let text: String
-    }
-
-    private struct BranchResponseAnchor: Hashable {
-        let branchID: UUID
-        let responseIndex: Int
     }
 
     @State private var activeSheetWord: TriggerWord? = nil
@@ -106,8 +92,9 @@ struct ActiveInquiryView: View {
     }
 
     private func publishShellMenuState() {
-        sideMenuConversations = conversations
-        sideMenuActiveConversationID = activeConversationID ?? conversations.first?.id
+        let snapshot = persistenceSnapshot()
+        sideMenuConversations = snapshot.conversations
+        sideMenuActiveConversationID = snapshot.activeConversationID
         sideMenuCurrentTitle = currentConversationTitle()
     }
 
@@ -276,6 +263,16 @@ struct ActiveInquiryView: View {
         publishShellMenuState()
     }
 
+    private func renameConversation(_ conversation: InquiryConversation, to title: String) {
+        guard let index = conversations.firstIndex(where: { $0.id == conversation.id }) else {
+            return
+        }
+
+        conversations[index].title = title
+        saveConversationMemory(title: conversation.id == activeConversationID ? title : nil)
+        publishShellMenuState()
+    }
+
     private func switchToConversation(_ conversation: InquiryConversation) {
         persistActiveConversation()
         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
@@ -335,10 +332,6 @@ struct ActiveInquiryView: View {
         return index
     }
 
-    private func branchModeOffset(canvasWidth: CGFloat) -> CGFloat {
-        -CGFloat(focusedBranchIndex()) * (canvasWidth + branchSpacing)
-    }
-
     private func branchIDsToRemove(startingAt branchID: UUID) -> Set<UUID> {
         var idsToRemove: Set<UUID> = [branchID]
         var didAddChild = true
@@ -371,18 +364,13 @@ struct ActiveInquiryView: View {
 
     /// Calculates the max-fit zoom for the "View Entire Canvas" button.
     private func fitCanvasScale(for size: CGSize) -> CGFloat {
-        guard !activeBranches.isEmpty, size.width > 0, size.height > 0 else {
-            return 0.8
-        }
-
+        guard !activeBranches.isEmpty, size.width > 0 else { return 0.8 }
         let branchCount = CGFloat(activeBranches.count)
         let spacingCount = CGFloat(max(activeBranches.count - 1, 0))
         let availableWidth = max(size.width - 24, 1)
-        let availableHeight = max(size.height - 160, 1)
         let worldWidth = (branchCount * size.width) + (spacingCount * overviewBranchSpacing)
         let widthScale = availableWidth / max(worldWidth, 1)
-        let heightScale = unscaledCanvasHeight > 0 ? availableHeight / unscaledCanvasHeight : 1.0
-        return min(1.0, max(0.18, min(widthScale, heightScale)))
+        return min(1.0, max(0.18, widthScale))
     }
 
     private func canvasOffsetForFocusedBranch(in size: CGSize, scale: CGFloat) -> CGSize {
@@ -423,65 +411,8 @@ struct ActiveInquiryView: View {
         )
     }
 
-    private func seamlessCanvasPanGesture() -> some Gesture {
-        DragGesture(minimumDistance: 2)
-            .onChanged { value in
-                guard isZoomedOut else { return }
-                if canvasPanStartOffset == nil {
-                    canvasPanStartOffset = canvasZoomOffset
-                }
-
-                let startOffset = canvasPanStartOffset ?? canvasZoomOffset
-                canvasZoomOffset = CGSize(
-                    width: startOffset.width + value.translation.width,
-                    height: startOffset.height + value.translation.height
-                )
-            }
-            .onEnded { _ in
-                canvasPanStartOffset = nil
-            }
-    }
-
-    private func seamlessCanvasZoomGesture(in size: CGSize) -> some Gesture {
-        MagnifyGesture(minimumScaleDelta: 0.01)
-            .onChanged { value in
-                guard isZoomedOut else { return }
-                if canvasPinchStartScale == nil {
-                    canvasPinchStartScale = canvasScale
-                    canvasPinchStartOffset = canvasZoomOffset
-                }
-
-                let initialScale = canvasPinchStartScale ?? canvasScale
-                let initialOffset = canvasPinchStartOffset ?? canvasZoomOffset
-                let nextScale = clampedCanvasScale(initialScale * pow(value.magnification, 0.72), in: size)
-                let anchor = CGPoint(x: value.startAnchor.x * size.width, y: value.startAnchor.y * size.height)
-
-                canvasScale = nextScale
-                canvasZoomOffset = canvasOffsetKeeping(anchor, fixedFrom: initialOffset, initialScale: initialScale, nextScale: nextScale)
-            }
-            .onEnded { value in
-                guard isZoomedOut else { return }
-                let initialScale = canvasPinchStartScale ?? canvasScale
-                let initialOffset = canvasPinchStartOffset ?? canvasZoomOffset
-                let nextScale = clampedCanvasScale(initialScale * pow(value.magnification, 0.72), in: size)
-                let anchor = CGPoint(x: value.startAnchor.x * size.width, y: value.startAnchor.y * size.height)
-
-                canvasScale = nextScale
-                canvasZoomOffset = canvasOffsetKeeping(anchor, fixedFrom: initialOffset, initialScale: initialScale, nextScale: nextScale)
-                canvasPinchStartScale = nil
-                canvasPinchStartOffset = nil
-                isViewingEntireCanvas = nextScale <= fitCanvasScale(for: size) + 0.01
-            }
-    }
-
-    /// Branch connectors follow the exact parent response card they forked from.
+    /// Updates the stored yOffset on child branches so Canvas Mode connector lines stay attached.
     private func updateChildren(of parentID: UUID, responseIndex: Int, to yOffset: CGFloat) {
-        let anchor = BranchResponseAnchor(branchID: parentID, responseIndex: responseIndex)
-        if isResponseRelayoutPending {
-            pendingChildOffsets[anchor] = yOffset
-            return
-        }
-
         for index in activeBranches.indices
         where activeBranches[index].parentBranchID == parentID
             && activeBranches[index].parentResponseIndex == responseIndex {
@@ -489,48 +420,16 @@ struct ActiveInquiryView: View {
         }
     }
 
-    /// Applies deferred connector updates after response cards finish resizing.
-    private func applyPendingChildOffsets() {
-        for (anchor, yOffset) in pendingChildOffsets {
-            for index in activeBranches.indices
-            where activeBranches[index].parentBranchID == anchor.branchID
-                && activeBranches[index].parentResponseIndex == anchor.responseIndex {
-                activeBranches[index].yOffset = yOffset
-            }
-        }
-        pendingChildOffsets.removeAll()
-    }
-
-    /// Buffers connector updates so collapse/expand does not make branch lines jump.
-    private func scheduleResponseRelayout() {
-        isResponseRelayoutPending = true
-        pendingRelayoutWorkItem?.cancel()
-
-        let workItem = DispatchWorkItem {
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                applyPendingChildOffsets()
-                isResponseRelayoutPending = false
-            }
-        }
-
-        pendingRelayoutWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.65, execute: workItem)
-    }
-
-    /// Returns from Canvas mode into one focused branch lane.
-    private func focusBranch(_ branch: ChatBranch, anchor: String, proxy: ScrollViewProxy) {
-        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+    /// Animates the camera to fully focus the given branch (scale = 1, offset centred on branch).
+    private func focusBranch(_ branch: ChatBranch) {
+        let idx = activeBranches.firstIndex(where: { $0.id == branch.id }) ?? 0
+        let laneStep = viewportSize.width + canvasBranchSpacing
+        withAnimation(.spring(response: 0.5, dampingFraction: 0.78)) {
             focusedBranchID = branch.id
             isZoomedOut = false
             isViewingEntireCanvas = false
             canvasScale = 1.0
-            canvasZoomOffset = .zero
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-                proxy.scrollTo(anchor, anchor: .top)
-            }
+            canvasZoomOffset = CGSize(width: -CGFloat(idx) * laneStep, height: 0)
         }
     }
 
@@ -564,13 +463,11 @@ struct ActiveInquiryView: View {
 
     private func toggleCanvasMode() {
         dismissKeyboard()
-        withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
-            if isZoomedOut {
-                isZoomedOut = false
-                isViewingEntireCanvas = false
-                canvasScale = 1.0
-                canvasZoomOffset = .zero
-            } else {
+        if isZoomedOut {
+            guard let focused = activeBranches.first(where: { $0.id == focusedBranchID }) ?? activeBranches.first else { return }
+            focusBranch(focused)
+        } else {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
                 isZoomedOut = true
                 isViewingEntireCanvas = false
                 canvasScale = 0.80
@@ -579,213 +476,169 @@ struct ActiveInquiryView: View {
         }
     }
 
-    private func toggleColorScheme() {
-        let currentlyDark = colorSchemeOverride.map { $0 == .dark } ?? (colorScheme == .dark)
-        colorSchemeOverride = currentlyDark ? .light : .dark
-    }
-
-    @ViewBuilder
-    private func branchLaneView(
-        for branch: Binding<ChatBranch>,
-        canvasSize: CGSize,
-        proxy: ScrollViewProxy
-    ) -> some View {
-        let branchValue = branch.wrappedValue
-        let anchor = branchAnchor(for: branchValue)
-
-        BranchLaneView(
-            branchData: branch,
-            branchAnchor: anchor,
-            canvasSize: canvasSize,
-            isZoomedOut: isZoomedOut,
-            canvasScale: canvasScale,
-            pullOffset: $pullOffset,
-            targetSpawnY: $targetSpawnY,
-            targetSpawnResponseIndex: $targetSpawnResponseIndex,
-            uploadedFiles: $uploadedFiles,
-            showsPendingUploads: branchValue.id == (focusedBranchID ?? activeBranches.first?.id),
-            quotedConcept: branchValue.id == (focusedBranchID ?? activeBranches.first?.id) ? attachedConcept : nil,
-            areResponsesCollapsed: areResponsesCollapsed,
-            onFocus: {
-                focusBranch(branchValue, anchor: anchor, proxy: proxy)
-            },
-            onQuoteHandled: {
-                attachedConcept = nil
-            },
-            onSpawnYChange: { responseIndex, yOffset in
-                updateChildren(of: branchValue.id, responseIndex: responseIndex, to: yOffset)
-            },
-            onDuplicateResponse: { responseText, responseIndex in
-                let newBranch = ChatBranch(
-                    startingConcept: nil,
-                    parentBranchID: branchValue.id,
-                    parentResponseIndex: responseIndex,
-                    duplicatedResponse: responseText,
-                    yOffset: targetSpawnY
-                )
-
-                withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
-                    insertBranch(newBranch, after: branchValue.id)
-                }
-            },
-            onDeleteBranch: {
-                guard let parentID = branchValue.parentBranchID else { return }
-                let fallbackParent = activeBranches.first { $0.id == parentID } ?? activeBranches.first
-                let idsToRemove = branchIDsToRemove(startingAt: branchValue.id)
-
-                withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
-                    activeBranches.removeAll { idsToRemove.contains($0.id) }
-                }
-
-                if let fallbackParent {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                        focusBranch(
-                            fallbackParent,
-                            anchor: branchAnchor(for: fallbackParent),
-                            proxy: proxy
-                        )
-                    }
-                }
-            },
-            onConversationTitleChange: { title in
-                renameActiveConversation(to: title)
-            },
-            onBottomInputFocused: {
-                let inputAnchor = bottomInputAnchor(for: branchValue)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
-                        proxy.scrollTo(inputAnchor, anchor: .top)
-                    }
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) {
-                    withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
-                        proxy.scrollTo(inputAnchor, anchor: .top)
-                    }
-                }
-            },
-            onEnterCanvas: {
-                let branchIndex = activeBranches.firstIndex { $0.id == branchValue.id } ?? focusedBranchIndex()
-                withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-                    focusedBranchID = branchValue.id
+    /// Horizontal swipe anywhere on the focused branch zooms the camera out to canvas mode.
+    private var canvasActivationGesture: some Gesture {
+        DragGesture(minimumDistance: 16)
+            .onEnded { value in
+                guard canvasScale >= ConversationCanvasCameraView<AnyView>.focusedScaleThreshold else { return }
+                let isHorizontal = abs(value.translation.width) > abs(value.translation.height) * 1.4
+                guard isHorizontal && abs(value.translation.width) > 60 else { return }
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                     isZoomedOut = true
                     isViewingEntireCanvas = false
                     canvasScale = 0.80
-                    canvasZoomOffset = canvasOffsetForBranch(at: branchIndex, in: canvasSize, scale: 0.80)
+                    canvasZoomOffset = canvasOffsetForFocusedBranch(in: viewportSize, scale: 0.80)
                 }
             }
-        )
     }
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            backgroundColor
-                .ignoresSafeArea()
-	            VStack(spacing: 0) {
-	                GeometryReader { canvasGeo in
-	                    ScrollViewReader { proxy in
-	                        ScrollView(.vertical, showsIndicators: false) {
-	                            VStack(alignment: .leading, spacing: 0) {
-	                                HStack(alignment: .top, spacing: isZoomedOut ? canvasBranchSpacing : branchSpacing) {
-	                                    ForEach($activeBranches) { $branch in
-	                                        branchLaneView(for: $branch, canvasSize: canvasGeo.size, proxy: proxy)
-	                                    }
-	                                }
-	                                .scaleEffect(isZoomedOut ? canvasScale : 1, anchor: .topLeading)
-	                                .offset(
-	                                    x: isZoomedOut ? canvasZoomOffset.width : branchModeOffset(canvasWidth: canvasGeo.size.width),
-	                                    y: isZoomedOut ? canvasZoomOffset.height : 0
-	                                )
-	                                .background(
-	                                    GeometryReader { hstackGeo in
-	                                        Color.clear
-	                                            .onAppear {
-	                                                unscaledCanvasHeight = hstackGeo.size.height
-	                                            }
-	                                            .onChange(of: hstackGeo.size.height) { oldValue, newValue in
-	                                                unscaledCanvasHeight = newValue
-	                                            }
-	                                    }
-	                                )
-	                                .padding(.bottom, 40)
-	
-	                                Color.clear
-	                                    .frame(width: 1, height: 1)
-	                                    .id(bottomAnchorID)
-	                                    .background(
-	                                        GeometryReader { bottomGeo in
-	                                            Color.clear
-	                                                .onAppear {
-	                                                    isAtBottom = bottomGeo.frame(in: .named("GlobalCanvas")).maxY <= canvasGeo.size.height + 32
-	                                                }
-	                                                .onChange(of: bottomGeo.frame(in: .named("GlobalCanvas")).maxY) { oldValue, newValue in
-	                                                    isAtBottom = newValue <= canvasGeo.size.height + 32
-	                                                }
-	                                        }
-	                                    )
-	                            }
-	                        }
-	                        .coordinateSpace(name: "GlobalCanvas")
-	                        .scrollDisabled(isZoomedOut)
-	                        .simultaneousGesture(seamlessCanvasPanGesture())
-	                        .simultaneousGesture(seamlessCanvasZoomGesture(in: canvasGeo.size))
-	                        .onAppear {
-	                            viewportSize = canvasGeo.size
-	                        }
-                            .onChange(of: canvasGeo.size) { oldValue, newValue in
-                                viewportSize = newValue
-                            }
+            backgroundColor.ignoresSafeArea()
 
-                            // New child branches open directly in focused Branch mode.
-                            .onChange(of: activeBranches.count) { oldValue, newValue in
-                                if newValue > oldValue {
-                                    let branchToFocus = pendingFocusBranchID.flatMap { pendingID in
-                                        activeBranches.first { $0.id == pendingID }
-                                    } ?? activeBranches.last
-
-                                    pendingFocusBranchID = nil
-
-                                    guard let branchToFocus else { return }
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                        focusBranch(branchToFocus, anchor: branchAnchor(for: branchToFocus), proxy: proxy)
-                                    }
-                                }
-                            }
-                            .onChange(of: scrollToBottomRequest) { oldValue, newValue in
-                                guard !isZoomedOut else { return }
-                                withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
-                                    proxy.scrollTo(bottomAnchorID, anchor: .bottom)
-                                }
-                            }
-                            .onChange(of: viewEntireCanvasRequest) { oldValue, newValue in
-                                if isViewingEntireCanvas {
-                                    withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
-                                        isZoomedOut = true
-                                        isViewingEntireCanvas = false
-                                        canvasScale = 0.80
-                                        canvasZoomOffset = canvasOffsetForFocusedBranch(in: canvasGeo.size, scale: 0.80)
-                                    }
-                                } else {
-                                    let fitScale = fitCanvasScale(for: canvasGeo.size)
-                                    withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
-                                        isZoomedOut = true
-                                        isViewingEntireCanvas = true
-                                        canvasScale = fitScale
-                                        canvasZoomOffset = fitCanvasOffset(for: canvasGeo.size, scale: fitScale)
-                                    }
-                                }
-                            }
-                            .onChange(of: areResponsesCollapsed) { oldValue, newValue in
-                                scheduleResponseRelayout()
-                                if isViewingEntireCanvas {
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-                                        withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
-                                            let fitScale = fitCanvasScale(for: canvasGeo.size)
-                                            canvasScale = fitScale
-                                            canvasZoomOffset = fitCanvasOffset(for: canvasGeo.size, scale: fitScale)
+            GeometryReader { geo in
+                ConversationCanvasCameraView(
+                    branches: $activeBranches,
+                    scale: $canvasScale,
+                    offset: $canvasZoomOffset,
+                    isViewingEntireCanvas: $isViewingEntireCanvas,
+                    size: geo.size,
+                    focusedBranchID: focusedBranchID ?? activeBranches.first?.id,
+                    branchSpacing: canvasBranchSpacing,
+                    areResponsesCollapsed: areResponsesCollapsed,
+                    makeFullBranch: { $branch, size in
+                        // Each branch renders its own ScrollView so vertical scroll
+                        // stays native when the camera is fully zoomed in.
+                        ScrollViewReader { proxy in
+                            ScrollView(.vertical, showsIndicators: false) {
+                                ChatThreadColumn(
+                                    branchData: $branch,
+                                    branchAnchor: branchAnchor(for: branch),
+                                    targetSpawnY: $targetSpawnY,
+                                    uploadedFiles: $uploadedFiles,
+                                    showsPendingUploads: branch.id == (focusedBranchID ?? activeBranches.first?.id),
+                                    quotedConcept: branch.id == (focusedBranchID ?? activeBranches.first?.id) ? attachedConcept : nil,
+                                    areResponsesCollapsed: areResponsesCollapsed,
+                                    targetSpawnResponseIndex: $targetSpawnResponseIndex,
+                                    onSpawnYChange: { responseIndex, yOffset in
+                                        updateChildren(of: branch.id, responseIndex: responseIndex, to: yOffset)
+                                    },
+                                    onDuplicateResponse: { responseText, responseIndex in
+                                        let newBranch = ChatBranch(
+                                            startingConcept: nil,
+                                            parentBranchID: branch.id,
+                                            parentResponseIndex: responseIndex,
+                                            duplicatedResponse: responseText,
+                                            yOffset: targetSpawnY
+                                        )
+                                        withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
+                                            insertBranch(newBranch, after: branch.id)
                                         }
+                                    },
+                                    onDeleteBranch: {
+                                        guard let parentID = branch.parentBranchID else { return }
+                                        let fallback = activeBranches.first { $0.id == parentID } ?? activeBranches.first
+                                        let toRemove = branchIDsToRemove(startingAt: branch.id)
+                                        withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
+                                            activeBranches.removeAll { toRemove.contains($0.id) }
+                                        }
+                                        if let fallback {
+                                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                                                focusBranch(fallback)
+                                            }
+                                        }
+                                    },
+                                    onConversationTitleChange: { title in renameActiveConversation(to: title) },
+                                    onBottomInputFocused: {
+                                        guard canvasScale >= ConversationCanvasCameraView<AnyView>.focusedScaleThreshold else { return }
+                                        let anchor = bottomInputAnchor(for: branch)
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                            withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                                                proxy.scrollTo(anchor, anchor: .top)
+                                            }
+                                        }
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) {
+                                            withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                                                proxy.scrollTo(anchor, anchor: .top)
+                                            }
+                                        }
+                                    },
+                                    onQuoteHandled: { attachedConcept = nil }
+                                )
+
+                                Color.clear.frame(width: 1, height: 1)
+                                    .id("branch-bottom-\(branch.id)")
+                                    .background(
+                                        GeometryReader { bg in
+                                            Color.clear
+                                                .onAppear {
+                                                    if branch.id == (focusedBranchID ?? activeBranches.first?.id) {
+                                                        isAtBottom = bg.frame(in: .named("BranchScroll-\(branch.id)")).maxY <= geo.size.height + 32
+                                                    }
+                                                }
+                                                .onChange(of: bg.frame(in: .named("BranchScroll-\(branch.id)")).maxY) { _, newY in
+                                                    if branch.id == (focusedBranchID ?? activeBranches.first?.id) {
+                                                        isAtBottom = newY <= geo.size.height + 32
+                                                    }
+                                                }
+                                        }
+                                    )
+                            }
+                            .coordinateSpace(name: "BranchScroll-\(branch.id)")
+                            .onChange(of: scrollToBottomRequest) { _, _ in
+                                guard branch.id == (focusedBranchID ?? activeBranches.first?.id),
+                                      canvasScale >= ConversationCanvasCameraView<AnyView>.focusedScaleThreshold
+                                else { return }
+                                withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
+                                    proxy.scrollTo("branch-bottom-\(branch.id)", anchor: .bottom)
+                                }
+                            }
+                            .onChange(of: focusedBranchID) { _, newID in
+                                guard newID == branch.id else { return }
+                                // Scroll to top when camera re-focuses this branch.
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                        proxy.scrollTo(branchAnchor(for: branch), anchor: .top)
                                     }
                                 }
                             }
+                        }
+                    },
+                    onFocusBranch: { branch in
+                        focusBranch(branch)
+                    }
+                )
+                .simultaneousGesture(canvasActivationGesture)
+                .onAppear { viewportSize = geo.size }
+                .onChange(of: geo.size) { _, newSize in viewportSize = newSize }
+                .onChange(of: activeBranches.count) { oldCount, newCount in
+                    guard newCount > oldCount else { return }
+                    let target = pendingFocusBranchID.flatMap { id in
+                        activeBranches.first { $0.id == id }
+                    } ?? activeBranches.last
+                    pendingFocusBranchID = nil
+                    guard let target else { return }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        focusBranch(target)
+                    }
+                }
+                .onChange(of: viewEntireCanvasRequest) { _, _ in
+                    if isViewingEntireCanvas {
+                        withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                            isZoomedOut = true
+                            isViewingEntireCanvas = false
+                            canvasScale = 0.80
+                            canvasZoomOffset = canvasOffsetForFocusedBranch(in: geo.size, scale: 0.80)
+                        }
+                    } else {
+                        let fitScale = fitCanvasScale(for: geo.size)
+                        withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                            isZoomedOut = true
+                            isViewingEntireCanvas = true
+                            canvasScale = fitScale
+                            canvasZoomOffset = fitCanvasOffset(for: geo.size, scale: fitScale)
+                        }
                     }
                 }
             }
@@ -856,22 +709,35 @@ struct ActiveInquiryView: View {
                 currentTitle: currentConversationTitle(),
                 conversations: conversations,
                 activeConversationID: activeConversationID ?? conversations.first?.id,
+                activePage: .conversation,
                 selectedPersonality: selectedPersonality,
                 isPresented: isSideMenuOpen,
-                isDarkMode: colorSchemeOverride.map { $0 == .dark } ?? (colorScheme == .dark),
                 onNewChat: startNewConversation,
                 onSelectConversation: switchToConversation,
-                onRenameConversation: { _ in },
+                onRenameConversation: { conversation, title in
+                    renameConversation(conversation, to: title)
+                },
                 onPinConversation: pinConversation,
                 onDeleteConversation: deleteConversation,
                 newInsightsCount: newInsightsCount,
+                onOpenConversations: {
+                    withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                        isSideMenuOpen = false
+                    }
+                    activePage = .openConversations
+                },
                 onOpenInsights: {
                     withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
                         isSideMenuOpen = false
                     }
                     activePage = .insights
                 },
-                onToggleColorScheme: toggleColorScheme,
+                onOpenSettings: {
+                    withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                        isSideMenuOpen = false
+                    }
+                    activePage = .settings
+                },
                 onClose: {
                     withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
                         isSideMenuOpen = false
@@ -899,8 +765,12 @@ struct ActiveInquiryView: View {
                 saveConversationMemory()
             }
         }
-        .onChange(of: activeBranches) { oldValue, newValue in
-            saveConversationMemory()
+        .onChange(of: activeBranches) { _, _ in
+            publishShellMenuState()
+            pendingPersistenceWorkItem?.cancel()
+            let work = DispatchWorkItem { saveConversationMemory() }
+            pendingPersistenceWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
         }
         .onChange(of: activeConversationID) { oldValue, newValue in
             saveConversationMemory()
@@ -1038,7 +908,7 @@ struct ActiveInquiryView: View {
 
 // MARK: - Lightweight Canvas Map
 
-/// Kept as a fallback experiment. The active Canvas path above currently uses the real branch lanes.
+/// Canvas Mode view: static full-column previews of every branch, with connector lines.
 struct LightweightCanvasMapView: View {
     let branches: [ChatBranch]
     let branchWidth: CGFloat
@@ -1214,10 +1084,22 @@ private struct LightweightCanvasResponseCard: View {
     let text: String
     let isCollapsed: Bool
 
+    private var previewTitle: String {
+        let stopWords: Set<String> = ["the","a","an","and","or","but","is","are","was","were","of","to","in","for","with","as","on"]
+        let words = text
+            .replacingOccurrences(of: "[^A-Za-z0-9\\s]", with: " ", options: .regularExpression)
+            .split(separator: " ")
+            .map { String($0) }
+            .filter { !stopWords.contains($0.lowercased()) }
+            .prefix(4)
+            .map { $0.capitalized }
+        return words.isEmpty ? "Response" : words.joined(separator: " ")
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
-                Text("Are Some Lies Acceptable?")
+                Text(previewTitle)
                     .font(.figtreeHeading1)
                     .foregroundColor(AquinasTheme.Colors.primaryReadable)
                     .lineLimit(1)
@@ -1316,103 +1198,6 @@ private func cleanPreviewText(_ text: String) -> String {
         .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
 }
 
-// MARK: - Branch Lane
-
-/// A single full-height lane. In Branch mode the side handles activate Canvas mode.
-struct BranchLaneView: View {
-    @Binding var branchData: ChatBranch
-    let branchAnchor: String
-    let canvasSize: CGSize
-    let isZoomedOut: Bool
-    let canvasScale: CGFloat
-    @Binding var pullOffset: CGFloat
-    @Binding var targetSpawnY: CGFloat
-    @Binding var targetSpawnResponseIndex: Int?
-    @Binding var uploadedFiles: [UploadedFile]
-    let showsPendingUploads: Bool
-    let quotedConcept: ConceptDefinition?
-    let areResponsesCollapsed: Bool
-    private let connectorLength: CGFloat = 136
-
-    var onFocus: () -> Void
-    var onQuoteHandled: () -> Void
-    var onSpawnYChange: (Int, CGFloat) -> Void
-    var onDuplicateResponse: (String, Int) -> Void
-    var onDeleteBranch: () -> Void
-    var onConversationTitleChange: (String) -> Void
-    var onBottomInputFocused: () -> Void
-    var onEnterCanvas: () -> Void
-
-    private var canvasActivationGesture: some Gesture {
-        // Lower the distance/threshold if Canvas mode should activate with a lighter swipe.
-        DragGesture(minimumDistance: 6)
-            .onChanged { value in
-                if abs(value.translation.width) > abs(value.translation.height) * 1.15 {
-                    pullOffset = value.translation.width / 1.8
-                }
-            }
-            .onEnded { _ in
-                if abs(pullOffset) > 34 {
-                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                    onEnterCanvas()
-                }
-                withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
-                    pullOffset = 0
-                }
-            }
-    }
-
-    var body: some View {
-        ChatThreadColumn(
-            branchData: $branchData,
-            branchAnchor: branchAnchor,
-            targetSpawnY: $targetSpawnY,
-            uploadedFiles: $uploadedFiles,
-            showsPendingUploads: showsPendingUploads,
-            isZoomedOut: isZoomedOut,
-            canvasScale: canvasScale,
-            connectorLength: connectorLength,
-            quotedConcept: quotedConcept,
-            areResponsesCollapsed: areResponsesCollapsed,
-            targetSpawnResponseIndex: $targetSpawnResponseIndex,
-            onSpawnYChange: onSpawnYChange,
-            onDuplicateResponse: onDuplicateResponse,
-            onDeleteBranch: onDeleteBranch,
-            onConversationTitleChange: onConversationTitleChange,
-            onBottomInputFocused: onBottomInputFocused,
-            onQuoteHandled: onQuoteHandled
-        )
-        .padding(.horizontal, 12)
-        .frame(width: canvasSize.width)
-        .frame(minHeight: canvasSize.height, alignment: .top)
-        .overlay {
-            if isZoomedOut {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        onFocus()
-                    }
-            } else {
-                HStack(spacing: 0) {
-                    Color.clear
-                        .frame(width: 72)
-                        .contentShape(Rectangle())
-                        .gesture(canvasActivationGesture)
-
-                    Spacer(minLength: 0)
-
-                    Color.clear
-                        .frame(width: 72)
-                        .contentShape(Rectangle())
-                        .gesture(canvasActivationGesture)
-                }
-            }
-        }
-        .offset(x: !isZoomedOut ? pullOffset : 0)
-    }
-}
-
 // MARK: - Chat Thread Column
 
 /// The actual vertical conversation: branch title, locked questions, model responses, and next input.
@@ -1422,9 +1207,6 @@ struct ChatThreadColumn: View {
     @Binding var targetSpawnY: CGFloat
     @Binding var uploadedFiles: [UploadedFile]
     let showsPendingUploads: Bool
-    let isZoomedOut: Bool
-    let canvasScale: CGFloat
-    let connectorLength: CGFloat
     let quotedConcept: ConceptDefinition?
     let areResponsesCollapsed: Bool
     @Binding var targetSpawnResponseIndex: Int?
@@ -1443,10 +1225,6 @@ struct ChatThreadColumn: View {
     let chatBubbleColor = AquinasTheme.Colors.background
     private var bottomInputAnchor: String {
         "bottom-input-anchor-\(branchData.id)"
-    }
-
-    private var usesCanvasIconResponses: Bool {
-        isZoomedOut && canvasScale < 0.55
     }
 
     // MARK: Editable Thread Values
@@ -1475,24 +1253,6 @@ struct ChatThreadColumn: View {
 
     private var branchKeyword: String? {
         nil
-    }
-
-    // In Canvas mode, child branches are vertically aligned to their parent response.
-    private var canvasTopPadding: CGFloat {
-        guard branchData.parentBranchID != nil else {
-            return readingTopPadding
-        }
-        return max(readingTopPadding, branchData.yOffset - (branchHeadHeight / 2))
-    }
-
-    // In Branch mode the title stays near the top; in Canvas mode it follows the branch relationship.
-    private var topCardPadding: CGFloat {
-        isZoomedOut ? canvasTopPadding : readingTopPadding
-    }
-
-    // Keeps connector math stable when Canvas mode adds top padding to child branches.
-    private var canvasYCorrection: CGFloat {
-        canvasTopPadding - topCardPadding
     }
 
     // Temporary local title generator. Replace with the model summary later.
@@ -1719,19 +1479,7 @@ struct ChatThreadColumn: View {
                         }
                 }
             )
-            .overlay(
-                Group {
-                    if branchData.startingConcept != nil {
-                        Rectangle()
-                            .fill(AquinasTheme.Colors.divider)
-                            .frame(width: connectorLength, height: 1)
-                            .offset(x: -connectorLength)
-                            .opacity(isZoomedOut ? 1.0 : 0.0)
-                    }
-                }
-                , alignment: .leading
-            )
-            .padding(.top, topCardPadding)
+            .padding(.top, readingTopPadding)
 
             // MARK: Conversation Blocks
             // Alternates between user questions and model response cards.
@@ -1747,9 +1495,7 @@ struct ChatThreadColumn: View {
                             targetSpawnY: $targetSpawnY,
                             targetSpawnResponseIndex: $targetSpawnResponseIndex,
                             columnSpaceName: "ColumnContent-\(branchData.id)",
-                            canvasYCorrection: canvasYCorrection,
                             areResponsesCollapsed: areResponsesCollapsed,
-                            usesCanvasIconPreview: usesCanvasIconResponses,
                             onCenterChange: onSpawnYChange,
                             onDuplicateBranch: {
                                 onDuplicateResponse(textContent, index)
@@ -1901,21 +1647,17 @@ struct ChatThreadColumn: View {
 
 // MARK: - Response Geometry Tracker
 
-/// Wraps a response card and reports its visual center so child branch lines stay attached.
+/// Wraps a response card and reports its visual center Y so child branch connector lines stay attached.
 struct TrackedResponseCard: View {
     let textContent: String
     let responseIndex: Int
     let shouldAnimateOnAppear: Bool
     @Binding var targetSpawnY: CGFloat
     @Binding var targetSpawnResponseIndex: Int?
-
     let columnSpaceName: String
-    let canvasYCorrection: CGFloat
     let areResponsesCollapsed: Bool
-    let usesCanvasIconPreview: Bool
     var onCenterChange: (Int, CGFloat) -> Void = { _, _ in }
     var onDuplicateBranch: () -> Void = {}
-
     var onFinish: () -> Void
 
     @State private var myYCenter: CGFloat = 0
@@ -1925,49 +1667,37 @@ struct TrackedResponseCard: View {
 
     private func updateCenter(from geo: GeometryProxy, notifyParent: Bool) {
         let localY = geo.frame(in: .named(columnSpaceName)).minY
-        let currentHeight = geo.size.height
-        let responseBodyHeight = max(0, currentHeight - responseChromeHeight)
-        myYCenter = canvasYCorrection + localY + responseChromeHeight + (responseBodyHeight / 2)
-
+        let responseBodyHeight = max(0, geo.size.height - responseChromeHeight)
+        myYCenter = localY + responseChromeHeight + (responseBodyHeight / 2)
         if notifyParent {
             let center = myYCenter
-            DispatchQueue.main.async {
-                onCenterChange(responseIndex, center)
-            }
+            DispatchQueue.main.async { onCenterChange(responseIndex, center) }
         }
     }
 
     var body: some View {
-        Group {
-            if usesCanvasIconPreview {
-                CanvasResponseIconCard()
-            } else {
-                ModelResponseCard(
-                    title: "Are Some Lies Acceptable?",
-                    fullText: textContent,
-                    forceCollapsed: areResponsesCollapsed,
-                    shouldAnimateOnAppear: shouldAnimateOnAppear,
-                    onDuplicateBranch: onDuplicateBranch,
-                    onFinish: {
-                        hasFinishedStreaming = true
-                        onCenterChange(responseIndex, myYCenter)
-                        onFinish()
-                    }
-                )
+        ModelResponseCard(
+            title: "Are Some Lies Acceptable?",
+            fullText: textContent,
+            forceCollapsed: areResponsesCollapsed,
+            shouldAnimateOnAppear: shouldAnimateOnAppear,
+            onDuplicateBranch: onDuplicateBranch,
+            onFinish: {
+                hasFinishedStreaming = true
+                onCenterChange(responseIndex, myYCenter)
+                onFinish()
             }
-        }
+        )
         .background(
             GeometryReader { geo in
                 Color.clear
-                    .onChange(of: geo.frame(in: .named(columnSpaceName)).minY) { oldValue, newValue in
+                    .onChange(of: geo.frame(in: .named(columnSpaceName)).minY) { _, _ in
                         updateCenter(from: geo, notifyParent: hasFinishedStreaming || !shouldAnimateOnAppear)
                     }
-                    .onChange(of: geo.size.height) { oldValue, newValue in
+                    .onChange(of: geo.size.height) { _, _ in
                         updateCenter(from: geo, notifyParent: hasFinishedStreaming || !shouldAnimateOnAppear)
                     }
-                    .onAppear {
-                        updateCenter(from: geo, notifyParent: true)
-                    }
+                    .onAppear { updateCenter(from: geo, notifyParent: true) }
             }
         )
         .environment(\.openURL, OpenURLAction { url in
@@ -1979,28 +1709,9 @@ struct TrackedResponseCard: View {
     }
 }
 
-private struct CanvasResponseIconCard: View {
-    var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .fill(AquinasTheme.Colors.card)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .stroke(AquinasTheme.Colors.border, lineWidth: 1)
-                }
-
-            Image(systemName: "book.pages")
-                .font(.system(size: 44, weight: .semibold))
-                .foregroundColor(AquinasTheme.Colors.lightGreen)
-        }
-        .frame(maxWidth: .infinity)
-        .frame(height: 360)
-    }
-}
-
 // MARK: - Insight Sheet Content
 
-private struct InsightSheetContentHeightKey: PreferenceKey {
+struct InsightSheetContentHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {

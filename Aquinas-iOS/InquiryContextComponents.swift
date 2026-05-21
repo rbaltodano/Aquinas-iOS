@@ -145,7 +145,7 @@ struct UploadedFileThumbnail: View {
                 }) {
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                        .foregroundColor(AquinasTheme.Colors.darkBrown)
                         .sfSymbolDrawOn()
                         .frame(width: 22, height: 22)
                         .background(AquinasTheme.Colors.uploadBorder)

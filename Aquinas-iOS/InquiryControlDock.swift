@@ -21,6 +21,7 @@ struct InquiryControlDock: View {
     var onScrollToBottom: () -> Void
     var onViewEntireCanvas: () -> Void
     var onOpenInsights: () -> Void
+    var onSend: () -> Void = {}
 
     var body: some View {
         ZStack {
@@ -33,7 +34,8 @@ struct InquiryControlDock: View {
                 isPersonalityMenuOpen: $isPersonalityMenuOpen,
                 isAtBottom: isAtBottom,
                 onScrollToBottom: onScrollToBottom,
-                onOpenInsights: onOpenInsights
+                onOpenInsights: onOpenInsights,
+                onSend: onSend
             )
             .offset(y: isCanvasMode ? 96 : 0)
             .opacity(isCanvasMode ? 0 : 1)
@@ -61,6 +63,7 @@ struct BranchControlBar: View {
     let isAtBottom: Bool
     var onScrollToBottom: () -> Void
     var onOpenInsights: () -> Void
+    var onSend: () -> Void = {}
     @State private var isAttachmentMenuOpen: Bool = false
     @State private var thinkingIconDrawID = UUID()
     @State private var personalityIconDrawID = UUID()
@@ -145,7 +148,7 @@ struct BranchControlBar: View {
                         .sfSymbolDrawOn()
                     Text(selectedPersonality)
                         .font(.custom("Figtree-Bold", size: 12))
-                        .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                        .foregroundColor(AquinasTheme.Colors.lightGreen)
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
                     Image(systemName: "chevron.down")
@@ -175,6 +178,14 @@ struct BranchControlBar: View {
                         .aquinasIconControl(isPrimary: true)
                 }
                 .transition(.scale(scale: 0.4).combined(with: .opacity))
+            }
+
+            // Send button — always trailing; submits the active question.
+            Button(action: onSend) {
+                Image(systemName: "paperplane.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .sfSymbolDrawOn()
+                    .aquinasIconControl(isPrimary: true)
             }
         }
         .padding(.horizontal, 16)

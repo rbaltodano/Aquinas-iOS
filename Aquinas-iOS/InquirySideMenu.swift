@@ -59,21 +59,23 @@ struct AquinasSideMenu: View {
     let currentTitle: String
     let conversations: [InquiryConversation]
     let activeConversationID: UUID?
+    let activePage: AppPage
     let selectedPersonality: String
     let isPresented: Bool
-    let isDarkMode: Bool
     var onNewChat: () -> Void
     var onSelectConversation: (InquiryConversation) -> Void
-    var onRenameConversation: (InquiryConversation) -> Void
+    var onRenameConversation: (InquiryConversation, String) -> Void
     var onPinConversation: (InquiryConversation) -> Void
     var onDeleteConversation: (InquiryConversation) -> Void
     var newInsightsCount: Int = 0
+    var onOpenConversations: () -> Void
     var onOpenInsights: () -> Void
-    var onToggleColorScheme: () -> Void
+    var onOpenSettings: () -> Void
     var onClose: () -> Void
     @State private var showsTitle = false
     @State private var showsOpenConversationsTitle = false
-    @State private var themeIconDrawID = UUID()
+    @State private var conversationBeingRenamed: InquiryConversation? = nil
+    @State private var renameDraft = ""
 
     var body: some View {
         GeometryReader { geometry in
@@ -98,10 +100,25 @@ struct AquinasSideMenu: View {
                     VStack(alignment: .leading, spacing: 24) {
                         SearchRow(isPresented: isPresented, delay: 0.15)
 
-                        VStack(alignment: .leading, spacing: 24) {
+                        VStack(alignment: .leading, spacing: 0) {
                             SideMenuRow(icon: "house", title: "Home", isPresented: isPresented, delay: 0.20, action: {})
-                            SideMenuRow(icon: "bubble.left.and.bubble.right", title: "Conversations", isPresented: isPresented, delay: 0.25, action: {})
-                            SideMenuRow(icon: "brain.head.profile", title: "Insights", badge: newInsightsCount, isPresented: isPresented, delay: 0.30, action: onOpenInsights)
+                            SideMenuRow(
+                                icon: "bubble.left.and.bubble.right",
+                                title: "Conversations",
+                                isActive: activePage == .openConversations,
+                                isPresented: isPresented,
+                                delay: 0.25,
+                                action: onOpenConversations
+                            )
+                            SideMenuRow(
+                                icon: "brain.head.profile",
+                                title: "Insights",
+                                badge: newInsightsCount,
+                                isActive: activePage == .insights,
+                                isPresented: isPresented,
+                                delay: 0.30,
+                                action: onOpenInsights
+                            )
                             SideMenuRow(icon: "doc", title: "Files", isPresented: isPresented, delay: 0.35, action: {})
                         }
                     }
@@ -110,8 +127,8 @@ struct AquinasSideMenu: View {
                 FooterDivider(isPresented: isPresented, delay: 0)
 
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("Open Conversations")
-                        .font(.custom("LibreBaskerville-Regular", size: 18))
+                    Text("Recents")
+                        .font(.custom("Figtree-Bold", size: 18))
                         .lineSpacing(9)
                         .foregroundColor(AquinasTheme.Colors.primaryReadable)
                         .opacity(showsOpenConversationsTitle ? 1 : 0)
@@ -121,14 +138,15 @@ struct AquinasSideMenu: View {
                         ForEach(Array(conversations.enumerated()), id: \.element.id) { index, conversation in
                             ConversationMenuRow(
                                 conversation: conversation,
-                                isActive: conversation.id == activeConversationID,
+                                isActive: activePage == .conversation && conversation.id == activeConversationID,
                                 isPresented: isPresented,
                                 delay: 0.20 + (Double(index) * 0.05),
                                 onSelect: {
                                     onSelectConversation(conversation)
                                 },
                                 onRename: {
-                                    onRenameConversation(conversation)
+                                    renameDraft = conversation.title
+                                    conversationBeingRenamed = conversation
                                 },
                                 onPin: {
                                     onPinConversation(conversation)
@@ -145,25 +163,12 @@ struct AquinasSideMenu: View {
             Spacer(minLength: 24)
 
             HStack(alignment: .center) {
-                HStack(spacing: 18) {
-                    Button(action: {}) {
-                        Image(systemName: "gearshape")
-                            .font(.system(size: 16, weight: .semibold))
-                            .sfSymbolDrawOn()
-                    }
-                    .accessibilityLabel("Settings")
-
-                    Button(action: {
-                        onToggleColorScheme()
-                        themeIconDrawID = UUID()
-                    }) {
-                        Image(systemName: isDarkMode ? "sun.max" : "moon")
-                            .font(.system(size: 16, weight: .semibold))
-                            .id(themeIconDrawID)
-                            .sfSymbolDrawOn()
-                    }
-                    .accessibilityLabel(isDarkMode ? "Switch to light mode" : "Switch to dark mode")
+                Button(action: onOpenSettings) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 16, weight: .semibold))
+                        .sfSymbolDrawOn()
                 }
+                .accessibilityLabel("Settings")
                 .foregroundColor(AquinasTheme.Colors.primaryReadable)
 
                 Spacer()
@@ -200,7 +205,45 @@ struct AquinasSideMenu: View {
         .onChange(of: isPresented) { oldValue, newValue in
             runTitleEntrance()
         }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 18)
+                .onEnded { value in
+                    guard value.translation.width < -60,
+                          abs(value.translation.width) > abs(value.translation.height) else {
+                        return
+                    }
+                    onClose()
+                }
+        )
+        .alert("Rename Conversation", isPresented: renamePromptBinding) {
+            TextField("Conversation name", text: $renameDraft)
+            Button("Cancel", role: .cancel) {
+                conversationBeingRenamed = nil
+                renameDraft = ""
+            }
+            Button("Save") {
+                guard let conversationBeingRenamed else { return }
+                let title = renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !title.isEmpty {
+                    onRenameConversation(conversationBeingRenamed, title)
+                }
+                self.conversationBeingRenamed = nil
+                renameDraft = ""
+            }
         }
+        }
+    }
+
+    private var renamePromptBinding: Binding<Bool> {
+        Binding(
+            get: { conversationBeingRenamed != nil },
+            set: { isPresented in
+                if !isPresented {
+                    conversationBeingRenamed = nil
+                    renameDraft = ""
+                }
+            }
+        )
     }
 
     private func runTitleEntrance() {
@@ -302,6 +345,7 @@ private struct SideMenuRow: View {
     let icon: String
     let title: String
     var badge: Int = 0
+    var isActive: Bool = false
     let isPresented: Bool
     let delay: TimeInterval
     var action: () -> Void
@@ -336,15 +380,19 @@ private struct SideMenuRow: View {
                 if badge > 0 {
                     Text("\(badge)")
                         .font(.custom("Figtree-Bold", size: 12))
-                        .foregroundColor(AquinasTheme.Colors.canvasSecondary)
+                        .foregroundColor(AquinasTheme.Colors.sideMenuSurface)
                         .frame(width: 22, height: 22)
-                        .background(AquinasTheme.Colors.lightGreen.opacity(0.28))
+                        .background(AquinasTheme.Colors.lightGreen)
                         .clipShape(Circle())
                         .opacity(showsText ? 1 : 0)
                         .transition(.scale(scale: 0.75).combined(with: .opacity))
                 }
             }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 16)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isActive ? AquinasTheme.Colors.systemSelection : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
         .onAppear(perform: runEntrance)
@@ -458,6 +506,7 @@ private struct ConversationMenuRow: View {
             isOptionsMenuOpen = false
             runEntrance()
         }
+        .zIndex(isOptionsMenuOpen ? 100 : 0)
     }
 
     private func runEntrance() {
@@ -478,7 +527,7 @@ private struct ConversationMenuRow: View {
     }
 }
 
-private struct ConversationOptionsMenu: View {
+struct ConversationOptionsMenu: View {
     var onRename: () -> Void
     var onPin: () -> Void
     var onDelete: () -> Void
