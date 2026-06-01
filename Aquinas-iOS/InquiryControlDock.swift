@@ -5,6 +5,10 @@
 
 import SwiftUI
 
+extension Notification.Name {
+    static let aquinasMiniScrollButtonVisibilityChanged = Notification.Name("aquinasMiniScrollButtonVisibilityChanged")
+}
+
 // MARK: - Bottom Control Dock
 
 /// Swaps between the Branch-mode controls and the Canvas-mode controls.
@@ -67,133 +71,157 @@ struct BranchControlBar: View {
     @State private var isAttachmentMenuOpen: Bool = false
     @State private var thinkingIconDrawID = UUID()
     @State private var personalityIconDrawID = UUID()
+    @State private var isScrollButtonVisible: Bool = false
 
     var body: some View {
-        HStack(spacing: 8) {
-            // Attachment menu: photo library, document upload, camera.
-            Button(action: {
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
-                    isAttachmentMenuOpen.toggle()
+        ZStack(alignment: .top) {
+            HStack(spacing: 8) {
+                // Attachment menu: photo library, document upload, camera.
+                Button(action: {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                        isAttachmentMenuOpen.toggle()
+                    }
+                }) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 18, weight: .regular))
+                        .sfSymbolDrawOn()
+                        .aquinasIconControl()
                 }
-            }) {
-                Image(systemName: "plus")
-                    .font(.system(size: 18, weight: .regular))
-                    .sfSymbolDrawOn()
-                    .aquinasIconControl()
-            }
-            .overlay(alignment: .bottomLeading) {
-                if isAttachmentMenuOpen {
-                    AttachmentMenu(
-                        isAttachmentMenuOpen: $isAttachmentMenuOpen,
-                        showPhotoPicker: $showPhotoPicker,
-                        showFilePicker: $showFilePicker,
-                        showCamera: $showCamera,
-                        onOpenInsights: onOpenInsights
-                    )
-                    .offset(y: -56)
-                }
-            }
-
-            // Thinking toggle: visual only for now, ready to connect to model settings.
-            Button(action: {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    let isTurningOn = !isThinkingEnabled
-                    isThinkingEnabled.toggle()
-                    if isTurningOn {
-                        thinkingIconDrawID = UUID()
+                .overlay(alignment: .bottomLeading) {
+                    if isAttachmentMenuOpen {
+                        AttachmentMenu(
+                            isAttachmentMenuOpen: $isAttachmentMenuOpen,
+                            showPhotoPicker: $showPhotoPicker,
+                            showFilePicker: $showFilePicker,
+                            showCamera: $showCamera,
+                            onOpenInsights: onOpenInsights
+                        )
+                        .offset(y: -56)
                     }
                 }
-            }) {
-                HStack(spacing: 10) {
-                    if isThinkingEnabled {
-                        Image(systemName: "globe")
-                            .font(.system(size: 18, weight: .semibold))
-                            .foregroundColor(AquinasTheme.Colors.canvas)
-                            .id(thinkingIconDrawID)
+
+                // Thinking toggle: visual only for now, ready to connect to model settings.
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        let isTurningOn = !isThinkingEnabled
+                        isThinkingEnabled.toggle()
+                        if isTurningOn {
+                            thinkingIconDrawID = UUID()
+                        }
+                    }
+                }) {
+                    HStack(spacing: 10) {
+                        if isThinkingEnabled {
+                            Image(systemName: "globe")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundColor(AquinasTheme.Colors.canvas)
+                                .id(thinkingIconDrawID)
+                                .sfSymbolDrawOn()
+                        } else {
+                            Image(systemName: "globe")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundColor(AquinasTheme.Colors.secondaryMuted)
+                        }
+                        Text("Thinking")
+                            .font(.custom("Figtree-Bold", size: 12))
+                            .foregroundColor(isThinkingEnabled ? AquinasTheme.Colors.canvas : AquinasTheme.Colors.secondaryMuted)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
+                    .frame(minHeight: AquinasTheme.Spacing.controlHeight)
+                    .background(isThinkingEnabled ? AquinasTheme.Colors.secondaryMuted : AquinasTheme.Colors.surface)
+                    .clipShape(Capsule())
+                    .overlay(
+                        Capsule()
+                            .stroke(AquinasTheme.Colors.controlBorder, lineWidth: isThinkingEnabled ? 0 : 1)
+                    )
+                }
+
+                // Personality selector: currently toggles between Friendly and Scholarly.
+                Button(action: {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                        isPersonalityMenuOpen.toggle()
+                    }
+                }) {
+                    HStack(spacing: 10) {
+                        Image(systemName: selectedPersonality == "Friendly" ? "brain.head.profile.fill" : "book.pages.fill")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundColor(AquinasTheme.Colors.linkGreen)
+                            .frame(width: 16, height: 16)
+                            .id(personalityIconDrawID)
                             .sfSymbolDrawOn()
-                    } else {
-                        Image(systemName: "globe")
-                            .font(.system(size: 18, weight: .semibold))
-                            .foregroundColor(AquinasTheme.Colors.secondaryMuted)
+                        Text(selectedPersonality)
+                            .font(.custom("Figtree-Bold", size: 12))
+                            .foregroundColor(AquinasTheme.Colors.lightGreen)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(AquinasTheme.Colors.linkGreen)
+                            .sfSymbolDrawOn()
                     }
-                    Text("Thinking")
-                        .font(.custom("Figtree-Bold", size: 12))
-                        .foregroundColor(isThinkingEnabled ? AquinasTheme.Colors.canvas : AquinasTheme.Colors.secondaryMuted)
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
+                    .aquinasCapsuleControl()
                 }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 12)
-                .frame(minHeight: AquinasTheme.Spacing.controlHeight)
-                .background(isThinkingEnabled ? AquinasTheme.Colors.secondaryMuted : AquinasTheme.Colors.surface)
-                .clipShape(Capsule())
-                .overlay(
-                    Capsule()
-                        .stroke(AquinasTheme.Colors.controlBorder, lineWidth: isThinkingEnabled ? 0 : 1)
-                )
-            }
+                .overlay(alignment: .bottomLeading) {
+                    if isPersonalityMenuOpen {
+                        PersonalityMenu(
+                            selectedPersonality: $selectedPersonality,
+                            isPersonalityMenuOpen: $isPersonalityMenuOpen
+                        )
+                        .offset(y: -56)
+                    }
+                }
 
-            // Personality selector: currently toggles between Friendly and Scholarly.
-            Button(action: {
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
-                    isPersonalityMenuOpen.toggle()
-                }
-            }) {
-                HStack(spacing: 10) {
-                    Image(systemName: selectedPersonality == "Friendly" ? "brain.head.profile.fill" : "book.pages.fill")
+                // Send button — always trailing; submits the active question.
+                Button(action: onSend) {
+                    Image(systemName: "paperplane.fill")
                         .font(.system(size: 16, weight: .semibold))
-                        .foregroundColor(AquinasTheme.Colors.linkGreen)
-                        .frame(width: 16, height: 16)
-                        .id(personalityIconDrawID)
-                        .sfSymbolDrawOn()
-                    Text(selectedPersonality)
-                        .font(.custom("Figtree-Bold", size: 12))
-                        .foregroundColor(AquinasTheme.Colors.lightGreen)
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundColor(AquinasTheme.Colors.linkGreen)
-                        .sfSymbolDrawOn()
-                }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 12)
-                .aquinasCapsuleControl()
-            }
-            .overlay(alignment: .bottomLeading) {
-                if isPersonalityMenuOpen {
-                    PersonalityMenu(
-                        selectedPersonality: $selectedPersonality,
-                        isPersonalityMenuOpen: $isPersonalityMenuOpen
-                    )
-                    .offset(y: -56)
-                }
-            }
-            if !isAtBottom {
-                // Appears only when the current branch is scrolled away from the bottom.
-                Button(action: onScrollToBottom) {
-                    Image(systemName: "arrow.down")
-                        .font(.system(size: 16, weight: .bold))
                         .sfSymbolDrawOn()
                         .aquinasIconControl(isPrimary: true)
                 }
-                .transition(.scale(scale: 0.4).combined(with: .opacity))
+            }
+            .padding(.horizontal, 12)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .background {
+                ControlBarGlow()
             }
 
-            // Send button — always trailing; submits the active question.
-            Button(action: onSend) {
-                Image(systemName: "paperplane.fill")
-                    .font(.system(size: 16, weight: .semibold))
-                    .sfSymbolDrawOn()
-                    .aquinasIconControl(isPrimary: true)
+            // Appears only when the current branch is scrolled away from the bottom.
+                Button(action: onScrollToBottom) {
+                    Image(systemName: "arrow.down")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(Color(hex: 0xFFFAF0))
+                        .frame(width: 24, height: 24)
+                        .background(AquinasTheme.Colors.lightBrown)
+                        .clipShape(Circle())
+                        .overlay(
+                            Circle()
+                                .stroke(AquinasTheme.Colors.lightBrown.opacity(0.05), lineWidth: 1)
+                        )
+                }
+            .buttonStyle(.plain)
+            .offset(y: isScrollButtonVisible ? -40 : -32)
+            .opacity(isScrollButtonVisible ? 1 : 0)
+            .allowsHitTesting(isScrollButtonVisible)
+            .zIndex(2)
+            .animation(.easeInOut(duration: 0.16), value: isScrollButtonVisible)
+        }
+        .frame(maxWidth: .infinity)
+        .onAppear {
+            if isAtBottom {
+                isScrollButtonVisible = false
             }
         }
-        .padding(.horizontal, 16)
-        .frame(maxWidth: .infinity, alignment: .center)
-        .background {
-            ControlBarGlow()
+        .onReceive(NotificationCenter.default.publisher(
+            for: .aquinasMiniScrollButtonVisibilityChanged
+        )) { notification in
+            guard let isVisible = notification.userInfo?["isVisible"] as? Bool else { return }
+            isScrollButtonVisible = isVisible
         }
-        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isAtBottom)
         .onChange(of: selectedPersonality) { oldValue, newValue in
             personalityIconDrawID = UUID()
         }

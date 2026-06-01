@@ -15,6 +15,10 @@ struct ResponseButtons: View {
     var canQuote: Bool = false
     var canFork: Bool = true
     var copyText: String? = nil
+    /// When set, overrides the default `responseButton` color for all icons.
+    var tintColor: Color? = nil
+    /// When set, overrides the save/bookmark icon color independently.
+    var saveTintColor: Color? = nil
     var onSave: (() -> Void)? = nil
     var onCopy: (() -> Void)? = nil
     var onQuote: (() -> Void)? = nil
@@ -22,6 +26,7 @@ struct ResponseButtons: View {
 
     @State private var visibleActionCount = 0
     @State private var showCopied = false
+    @State private var revealRunID = UUID()
 
     private var actions: [ResponseButtonAction] {
         var items: [ResponseButtonAction] = []
@@ -48,25 +53,45 @@ struct ResponseButtons: View {
     var body: some View {
         HStack(spacing: 12) {
             ForEach(Array(actions.enumerated()), id: \.offset) { index, action in
-                if visibleActionCount > index {
-                    Button {
-                        handle(action)
-                    } label: {
-                        Image(systemName: action.systemName)
-                            .font(.system(size: 16, weight: action.weight))
-                            .rotationEffect(action == .fork ? .degrees(90) : .degrees(0))
-                            .foregroundColor(action.foregroundColor)
-                            .frame(width: 16, height: 16)
-                            .sfSymbolDrawOn()
+                ZStack {
+                    buttonIcon(for: action)
+                        .hidden()
+                        .accessibilityHidden(true)
+
+                    if visibleActionCount > index {
+                        Button {
+                            handle(action)
+                        } label: {
+                            buttonIcon(for: action)
+                                .sfSymbolDrawOn()
+                        }
+                        .buttonStyle(.plain)
+                        .transition(.scale(scale: 0.88).combined(with: .opacity))
                     }
-                    .buttonStyle(.plain)
-                    .transition(.scale(scale: 0.88).combined(with: .opacity))
                 }
+                .frame(width: 16, height: 16)
             }
         }
         .onAppear(perform: revealButtons)
         .onChange(of: actions.count) { oldValue, newValue in
             revealButtons()
+        }
+    }
+
+    private func buttonIcon(for action: ResponseButtonAction) -> some View {
+        Image(systemName: action.systemName)
+            .font(.system(size: 16, weight: action.weight))
+            .rotationEffect(action == .fork ? .degrees(90) : .degrees(0))
+            .foregroundColor(iconColor(for: action))
+            .frame(width: 16, height: 16)
+    }
+
+    private func iconColor(for action: ResponseButtonAction) -> Color {
+        switch action {
+        case .save:
+            return saveTintColor ?? tintColor ?? action.foregroundColor
+        default:
+            return tintColor ?? action.foregroundColor
         }
     }
 
@@ -95,10 +120,13 @@ struct ResponseButtons: View {
     }
 
     private func revealButtons() {
+        let runID = UUID()
+        revealRunID = runID
         visibleActionCount = 0
 
         for index in actions.indices {
-            DispatchQueue.main.asyncAfter(deadline: .now() + (Double(index) * 0.15)) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + (Double(index) * 0.10)) {
+                guard revealRunID == runID else { return }
                 withAnimation(.easeOut(duration: 0.28)) {
                     visibleActionCount = max(visibleActionCount, index + 1)
                 }

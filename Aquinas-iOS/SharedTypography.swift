@@ -12,8 +12,10 @@ enum AquinasTheme {
     // MARK: Colors
     // Canonical visual tokens mirrored from the Figma paint styles.
     enum Colors {
-        static let canvas = Color(light: 0xFFFAF0, dark: 0x181511)
-        static let canvasSecondary = Color(light: 0xFBF4E7, dark: 0x1B1714)
+        static let canvas = Color(light: 0xFFFAF0, dark: 0x0A0602)
+        /// The canvas colour of the *opposite* mode — dark in light-mode, light in dark-mode.
+        static let canvasInverse = Color(light: 0x0A0602, dark: 0xFFFAF0)
+        static let canvasSecondary = Color(light: 0xFBF4E7, dark: 0x110D09)
         static let componentBackground = Color(
             light: 0x6F6844,
             lightAlpha: 0.05,
@@ -28,7 +30,9 @@ enum AquinasTheme {
         )
         static let lightGreen = Color(light: 0x867E4F, dark: 0xB7AE78)
         static let darkGreen = Color(light: 0x6F6844, dark: 0xB7AE78)
-        static let lightBrown = Color(light: 0x4A321C, dark: 0xFFFAF0)
+        static let primaryBrown = Color(light: 0x4A321C, dark: 0xFFFAF0)
+        // Light Brown: floating scroll control fill.
+        static let lightBrown = Color(light: 0x614C40, dark: 0x2B2521)
         static let paragraphText = Color(
             light: 0x4A321C,
             lightAlpha: 0.75,
@@ -41,6 +45,10 @@ enum AquinasTheme {
             dark: 0xFFFAF0,
             darkAlpha: 0.50
         )
+        static let placeholderTextDarkMode = Color(hex: 0xFFFAF0, alpha: 0.50)
+        static let paragraphTextDarkMode = Color(hex: 0xFFFAF0, alpha: 0.75)
+        static let primaryReadableDarkMode = Color(hex: 0xFFFAF0)
+        static let darkGreenDarkMode = Color(hex: 0xB7AE78)
         static let darkBrown = Color(light: 0x220F01, dark: 0xFFFAF0)
         static let brownBorder = Color(
             light: 0x220F01,
@@ -54,13 +62,13 @@ enum AquinasTheme {
             dark: 0xFFFAF0,
             darkAlpha: 0.08
         )
-        static let systemSelection = Color(light: 0xF0E9DA, dark: 0x110E0B)
+        static let systemSelection = Color(light: 0xF0E9DA, dark: 0x181511)
         static let accentRed = Color(light: 0xAF4949, dark: 0xAF4949)
         static let uploadBorder = Color(light: 0xFFFFFF, dark: 0xFFFAF0)
 
         // Compatibility aliases used by older views. New code should prefer the tokens above.
-        static let primary = lightBrown
-        static let primaryReadable = lightBrown
+        static let primary = primaryBrown
+        static let primaryReadable = primaryBrown
         static let secondary = lightGreen
         static let secondaryMuted = darkGreen
         static let secondaryLight = lightGreen
@@ -147,6 +155,15 @@ extension Color {
 
 extension UIColor {
     static let aquinasAccent = UIColor(light: 0xAF4949, dark: 0xAF4949)
+    /// Primary readable text — warm brown in light, warm cream in dark.
+    /// Prefer this over UIColor(AquinasTheme.Colors.primaryReadable) for UIKit
+    /// text-color properties; the Color→UIColor round-trip can freeze at the
+    /// light-mode value inside UIViewRepresentable contexts.
+    static let aquinasPrimaryReadable = UIColor(light: 0x4A321C, dark: 0xFFFAF0)
+    static let aquinasPlaceholderText = UIColor(
+        light: 0x4A321C, lightAlpha: 0.50,
+        dark: 0xFFFAF0,  darkAlpha: 0.50
+    )
     static let aquinasParagraphText = UIColor(
         light: 0x4A321C,
         lightAlpha: 0.75,
@@ -271,12 +288,35 @@ struct SFSymbolDrawOnStyle: ViewModifier {
     @ViewBuilder
     private func animatedContent(_ content: Content) -> some View {
         if #available(iOS 26.0, *) {
-            // Draw On is a symbol transition effect, so it runs when this wrapper inserts the icon.
-            content.transition(.symbolEffect(.drawOn))
+            // Draw On is a symbol transition effect, so it runs when this wrapper inserts or removes the icon.
+            content.transition(.symbolEffect(.drawOn).combined(with: IconBlurRevealTransition()))
         } else {
             // Earlier OS versions still get a gentle entrance instead of a hard pop-in.
-            content.transition(.opacity.combined(with: .scale(scale: 0.94)))
+            content.transition(.opacity.combined(with: .scale(scale: 0.94)).combined(with: AnyTransition.iconBlurReveal))
         }
+    }
+}
+
+private struct IconBlurRevealTransition: Transition {
+    func body(content: Content, phase: TransitionPhase) -> some View {
+        content.blur(radius: phase.isIdentity ? 0 : 4)
+    }
+}
+
+private struct IconBlurReveal: ViewModifier {
+    let blur: CGFloat
+
+    func body(content: Content) -> some View {
+        content.blur(radius: blur)
+    }
+}
+
+private extension AnyTransition {
+    static var iconBlurReveal: AnyTransition {
+        .modifier(
+            active: IconBlurReveal(blur: 4),
+            identity: IconBlurReveal(blur: 0)
+        )
     }
 }
 

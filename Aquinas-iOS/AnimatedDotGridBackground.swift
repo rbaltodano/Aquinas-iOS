@@ -62,12 +62,16 @@ struct AnimatedDotGridBackground: View, Animatable {
     private var baseColor: Color {
         colorScheme == .dark
             ? Color(red: 0.85, green: 0.80, blue: 0.65)
-            : Color(red: 0.44, green: 0.41, blue: 0.27)
+            : AquinasTheme.Colors.lightGreen
     }
 
     // Light mode dots sit on a bright cream background and need a bump to read clearly.
     private var opacityScale: Double {
         colorScheme == .dark ? 1.0 : 1.6
+    }
+
+    private var rippleBoostScale: Double {
+        colorScheme == .dark ? 0.10 : 0.25
     }
 
     var body: some View {
@@ -141,7 +145,7 @@ struct AnimatedDotGridBackground: View, Animatable {
                                 let bump  = cos(norm * Double.pi / 2)
                                 // Ease-in fade: holds brightness then drops off at end.
                                 let decay = 1.0 - pow(progress, 2.2)
-                                boost = bump * bump * decay * 0.12
+                                boost = bump * bump * decay * rippleBoostScale
                             }
                         }
 

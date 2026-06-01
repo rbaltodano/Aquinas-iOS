@@ -34,24 +34,27 @@ struct InsightTreeInsightCard: View {
     var onStartConversation: (() -> Void)? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            HStack(alignment: .center, spacing: 12) {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .center, spacing: 8) {
                 Image(systemName: "text.bubble.fill")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundColor(AquinasTheme.Colors.lightGreen)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(AquinasTheme.Colors.darkGreen)
                     .sfSymbolDrawOn()
 
                 Text(insight.title)
-                    .font(.figtreeHeading1)
-                    .foregroundColor(AquinasTheme.Colors.lightGreen)
+                    .font(.custom("Figtree-Bold", size: 18))
+                    .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
 
                 Spacer()
             }
 
             Text(insight.definition)
-                .font(.figtreeParagraphLarge)
-                .lineSpacing(10)
+                .font(.figtreeParagraph)
+                .lineSpacing(12)
                 .foregroundColor(AquinasTheme.Colors.paragraphText)
+                .fixedSize(horizontal: false, vertical: true)
 
             if showsStartConversation {
                 Button(action: { onStartConversation?() }) {
@@ -69,7 +72,12 @@ struct InsightTreeInsightCard: View {
             }
         }
         .padding(24)
-        .parchmentCard(radius: 24, background: AquinasTheme.Colors.componentBackground, border: AquinasTheme.Colors.controlBorder)
+        .background(AquinasTheme.Colors.canvas)
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
+        )
+        .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 16)
     }
 }
-

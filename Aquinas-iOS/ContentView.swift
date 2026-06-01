@@ -63,6 +63,7 @@ enum AppPage: Equatable {
     case openConversations
     case settings
     case insights
+    case studyTopics
 }
 
 // MARK: - App Shell
@@ -87,15 +88,22 @@ struct ContentView: View {
     @State private var sideMenuActiveConversationID: UUID? = nil
     @State private var sideMenuCurrentTitle: String = "New Conversation"
     @State private var requestedConversationID: UUID? = nil
+    @State private var requestedTopicID: UUID? = nil
     @State private var newConversationRequest: Int = 0
+    @State private var newConversationTopicID: UUID? = nil
+    @State private var newConversationIsStudyTopic: Bool = false
     @State private var deletedConversationID: UUID? = nil
     @State private var colorSchemeOverride: ColorScheme? = nil
     @State private var requestedForkConcept: ConceptDefinition? = nil
     @State private var userName: String = ""
     @State private var customInstructions: String = ""
+    @AppStorage("aquinas.settings.conversationFontSize") private var conversationFontSize: ConversationFontSizeOption = .small
+    @State private var inputTextAlignment: InputTextAlignmentOption = .center
+    @State private var inputFont: ConversationFontOption = .serif
+    @State private var responseFont: ConversationFontOption = .sans
 
 
-    let canvasColor = AquinasTheme.Colors.canvas
+    let canvasColor = AquinasTheme.Colors.canvasSecondary
     private let pageFadeDuration: TimeInterval = 0.25
     private let pageFadePauseDuration: TimeInterval = 0.15
     private let pageTransitionOffset: CGFloat = 8
@@ -121,10 +129,40 @@ struct ContentView: View {
                 withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
                     activePage = .conversation
                 }
-            }
+            },
+            inputFont: inputFont,
+            conversationFontSize: conversationFontSize
         )
         .background(canvasColor)
-        .ignoresSafeArea()
+        .ignoresSafeArea(.container)  // edges/notch only — keyboard safe area is respected
+    }
+
+    /// Extracted so the compiler doesn't time out type-checking a single large expression.
+    @ViewBuilder private var conversationView: some View {
+        CurrentConversationView(
+            onOpenMenu: {
+                dismissKeyboard()
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                    isGlobalSideMenuOpen = true
+                }
+            },
+            collectedDefinitions: $collectedDefinitions,
+            sideMenuConversations: $sideMenuConversations,
+            sideMenuCurrentTitle: $sideMenuCurrentTitle,
+            sideMenuActiveConversationID: $sideMenuActiveConversationID,
+            requestedConversationID: $requestedConversationID,
+            newConversationRequest: $newConversationRequest,
+            newConversationTopicID: $newConversationTopicID,
+            newConversationIsStudyTopic: $newConversationIsStudyTopic,
+            deletedConversationID: $deletedConversationID,
+            requestedForkConcept: $requestedForkConcept,
+            conversationFontSize: conversationFontSize,
+            inputTextAlignment: inputTextAlignment,
+            inputFont: inputFont,
+            responseFont: responseFont,
+            uploadedFiles: $uploadedFiles,
+            showFilePicker: $showFilePicker
+        )
     }
 
     var body: some View {
@@ -138,22 +176,7 @@ struct ContentView: View {
                         Group {
                             switch displayedPage {
                             case .conversation:
-                                CurrentConversationView(
-                                    onOpenMenu: {
-                                        dismissKeyboard()
-                                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                            isGlobalSideMenuOpen = true
-                                        }
-                                    },
-                                    collectedDefinitions: $collectedDefinitions,
-                                    sideMenuConversations: $sideMenuConversations,
-                                    sideMenuCurrentTitle: $sideMenuCurrentTitle,
-                                    sideMenuActiveConversationID: $sideMenuActiveConversationID,
-                                    requestedConversationID: $requestedConversationID,
-                                    newConversationRequest: $newConversationRequest,
-                                    deletedConversationID: $deletedConversationID,
-                                    requestedForkConcept: $requestedForkConcept
-                                )
+                                conversationView
                                 // ActiveInquiryView(
                                 //     activePage: $activePage,
                                 //     sideMenuConversations: $sideMenuConversations,
@@ -199,6 +222,10 @@ struct ContentView: View {
                                     colorSchemeOverride: $colorSchemeOverride,
                                     userName: $userName,
                                     customInstructions: $customInstructions,
+                                    conversationFontSize: $conversationFontSize,
+                                    inputTextAlignment: $inputTextAlignment,
+                                    inputFont: $inputFont,
+                                    responseFont: $responseFont,
                                     onOpenMenu: {
                                         dismissKeyboard()
                                         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
@@ -208,6 +235,38 @@ struct ContentView: View {
                                 )
                             case .insights:
                                 insightTreePage
+                            case .studyTopics:
+                                StudyTopicsView(
+                                    conversations: sideMenuConversations,
+                                    activeConversationID: sideMenuActiveConversationID,
+                                    savedInsights: $collectedDefinitions,
+                                    onOpenMenu: {
+                                        dismissKeyboard()
+                                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                                            isGlobalSideMenuOpen = true
+                                        }
+                                    },
+                                    onSelectConversation: { conversation in
+                                        requestedConversationID = conversation.id
+                                        activePage = .conversation
+                                    },
+                                    onNewChat: {
+                                        newConversationRequest += 1
+                                        activePage = .conversation
+                                    },
+                                    onNewChatInTopic: { topicID in
+                                        newConversationTopicID = topicID
+                                        newConversationRequest += 1
+                                        activePage = .conversation
+                                    },
+                                    onAttachConversationToTopic: { conversation, topicID in
+                                        attachConversation(conversation, toStudyTopic: topicID)
+                                    },
+                                    onRenameConversation: { conversation, title in
+                                        renameConversation(conversation, to: title)
+                                    },
+                                    requestedTopicID: requestedTopicID
+                                )
                             }
                         }
                         .opacity(isPageContentVisible ? 1 : 0)
@@ -268,6 +327,9 @@ struct ContentView: View {
                                 renameConversation(conversation, to: title)
                             },
                             onPinConversation: { _ in /* pin not yet implemented */ },
+                            onAddConversationToStudyTopic: { conversation, topicID in
+                                attachConversation(conversation, toStudyTopic: topicID)
+                            },
                             onDeleteConversation: { conversation in
                                 deleteConversation(conversation)
                             },
@@ -280,6 +342,20 @@ struct ContentView: View {
                             },
                             onOpenInsights: {
                                 activePage = .insights
+                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                                    isGlobalSideMenuOpen = false
+                                }
+                            },
+                            onOpenStudyTopics: {
+                                requestedTopicID = nil
+                                activePage = .studyTopics
+                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                                    isGlobalSideMenuOpen = false
+                                }
+                            },
+                            onSelectStudyTopic: { topic in
+                                requestedTopicID = topic.id
+                                activePage = .studyTopics
                                 withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
                                     isGlobalSideMenuOpen = false
                                 }
@@ -475,6 +551,25 @@ struct ContentView: View {
            let index = snapshot.conversations.firstIndex(where: { $0.id == conversation.id }) {
             snapshot.conversations[index].title = trimmedTitle
             InquiryPersistenceStore.save(snapshot)
+        }
+    }
+
+    private func attachConversation(_ conversation: InquiryConversation, toStudyTopic topicID: UUID) {
+        // Update in-memory — CurrentConversationView's onChange will pick this up
+        // and call persistConversations() if it is currently mounted.
+        if let index = sideMenuConversations.firstIndex(where: { $0.id == conversation.id }) {
+            sideMenuConversations[index].studyTopicID = topicID
+        }
+
+        // Write directly to CurrentConversationsStore so the attachment survives the
+        // next app launch even when CurrentConversationView is not mounted (e.g. the
+        // user is on the Study Topics page). InquiryPersistenceStore uses a different
+        // UserDefaults key and is never read by CurrentConversationView, so writing
+        // only to that store was silently losing the attachment.
+        if var snapshot = CurrentConversationsStore.load(),
+           let index = snapshot.conversations.firstIndex(where: { $0.id == conversation.id }) {
+            snapshot.conversations[index].studyTopicID = topicID
+            CurrentConversationsStore.save(snapshot)
         }
     }
 }

@@ -718,6 +718,13 @@ struct ActiveInquiryView: View {
                     renameConversation(conversation, to: title)
                 },
                 onPinConversation: pinConversation,
+                onAddConversationToStudyTopic: { conversation, topicID in
+                    if let index = conversations.firstIndex(where: { $0.id == conversation.id }) {
+                        conversations[index].studyTopicID = topicID
+                        saveConversationMemory()
+                        publishShellMenuState()
+                    }
+                },
                 onDeleteConversation: deleteConversation,
                 newInsightsCount: newInsightsCount,
                 onOpenConversations: {
@@ -731,6 +738,12 @@ struct ActiveInquiryView: View {
                         isSideMenuOpen = false
                     }
                     activePage = .insights
+                },
+                onOpenStudyTopics: {
+                    withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                        isSideMenuOpen = false
+                    }
+                    activePage = .studyTopics
                 },
                 onOpenSettings: {
                     withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
@@ -886,12 +899,12 @@ struct ActiveInquiryView: View {
 
     private var insightSheetHeight: CGFloat {
         let measuredContent = max(insightSheetContentHeight, 178)
-        let availableHeight = max(viewportSize.height, UIScreen.main.bounds.height)
+        let availableHeight = max(viewportSize.height, 1)
         return min(measuredContent + 24, availableHeight * 0.82)
     }
 
     private var insightLibrarySheetHeight: CGFloat {
-        let availableHeight = max(viewportSize.height, UIScreen.main.bounds.height)
+        let availableHeight = max(viewportSize.height, 1)
         return min(max(insightLibraryPopupHeight, 220), availableHeight * 0.86)
     }
 
@@ -979,6 +992,7 @@ struct LightweightCanvasMapView: View {
 private struct LightweightCanvasBranchPreview: View {
     let branch: ChatBranch
     let areResponsesCollapsed: Bool
+    @Environment(\.colorScheme) private var colorScheme
 
     private var title: String {
         branch.generatedBranchTitle ?? (branch.parentBranchID == nil ? "New Conversation" : "New Branch")
@@ -1048,7 +1062,7 @@ private struct LightweightCanvasBranchPreview: View {
             } else {
                 Text("Ask Theo a question...")
                     .font(.custom("LibreBaskerville-Regular", size: 16))
-                    .foregroundColor(AquinasTheme.Colors.placeholderText)
+                    .foregroundColor(colorScheme == .dark ? Color(hex: 0xFFFAF0, alpha: 0.50) : Color(hex: 0x4A321C, alpha: 0.50))
                     .lineLimit(1)
             }
 
@@ -1210,24 +1224,49 @@ struct ChatThreadColumn: View {
     let quotedConcept: ConceptDefinition?
     let areResponsesCollapsed: Bool
     @Binding var targetSpawnResponseIndex: Int?
+    var externalSubmitTrigger: Int = 0
+    var conversationFontSize: ConversationFontSizeOption = .large
+    var inputTextAlignment: InputTextAlignmentOption = .center
+    var inputFont: ConversationFontOption = .serif
+    var responseFont: ConversationFontOption = .sans
     var onSpawnYChange: (Int, CGFloat) -> Void
     var onDuplicateResponse: (String, Int) -> Void
     var onDeleteBranch: () -> Void
     var onConversationTitleChange: (String) -> Void
+    var onTopInputFocused: () -> Void = {}
     var onBottomInputFocused: () -> Void
     var onQuoteHandled: () -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
 
     @State private var branchHeadHeight: CGFloat = 0
     @State private var animatedResponseIndices: Set<Int> = []
     @Namespace private var quotedContextChipNamespace
+    @FocusState private var isTopQuestionFocused: Bool
     @FocusState private var isBottomQuestionFocused: Bool
+    /// Tracks UITextView buffer emptiness for placeholder visibility (not tied to binding).
+    @State private var topFieldIsEmpty: Bool = true
+    @State private var bottomFieldIsEmpty: Bool = true
+    /// Relay references for reading live UITextView text at submit time without
+    /// requiring per-keystroke binding writes (which would re-render the whole tree).
+    @State private var topFieldRelay = TextInputRelay()
+    @State private var bottomFieldRelay = TextInputRelay()
+
+    /// Placeholder text color resolved directly from the SwiftUI color-scheme environment,
+    /// bypassing the Color(UIColor(dynamicProvider:)) conversion which can freeze to the
+    /// light-mode value inside UIViewRepresentable-hosted view hierarchies.
+    private var placeholderColor: Color {
+        colorScheme == .dark
+            ? Color(hex: 0xFFFAF0, alpha: 0.50)
+            : Color(hex: 0x4A321C, alpha: 0.50)
+    }
 
     let chatBubbleColor = AquinasTheme.Colors.background
     private var bottomInputAnchor: String {
         "bottom-input-anchor-\(branchData.id)"
     }
 
-    // MARK: Editable Thread Values
+    // MARK: Editable Thread Values=
     // readingTopPadding controls how far the branch title sits from the top in Branch mode.
     // simulatedResponse is temporary prototype content; replace this when the real model is connected.
     private let readingTopPadding: CGFloat = 30
@@ -1293,16 +1332,41 @@ struct ChatThreadColumn: View {
     // Prototype model response. Replace with async model call when backend is ready.
     private func appendSimulatedResponse() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            // Insert into animatedResponseIndices BEFORE appending the block.
+            // Both mutations live in different @State owners (ChatThreadColumn vs
+            // the @Binding source in ActiveInquiryView), so SwiftUI can process
+            // them in separate render passes. Committing the index first guarantees
+            // that when the ForEach creates the new card, animatedResponseIndices
+            // already contains it → shouldAnimateOnAppear = true.
+            let responseIndex = branchData.activeChatBlocks.count
+            animatedResponseIndices.insert(responseIndex)
             withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
-                let responseIndex = branchData.activeChatBlocks.count
-                animatedResponseIndices.insert(responseIndex)
                 branchData.activeChatBlocks.append(.text(simulatedResponse))
             }
         }
     }
 
+    private func inputContainer<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .padding(inputTextAlignment.inputContainerPadding)
+            .background(AquinasTheme.Colors.canvas)
+            .clipShape(RoundedRectangle(cornerRadius: inputTextAlignment.inputContainerRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: inputTextAlignment.inputContainerRadius, style: .continuous)
+                    .stroke(
+                        AquinasTheme.Colors.darkBrown.opacity(inputTextAlignment.inputContainerBorderOpacity),
+                        lineWidth: 1
+                    )
+            )
+            .animation(.spring(response: 0.34, dampingFraction: 0.84), value: inputTextAlignment)
+    }
+
     // Locks the first branch question, uploads, and context chip.
     private func submitTopQuestionIfNeeded() {
+        // Flush the UITextView's live buffer into the binding synchronously.
+        // Because we stopped per-keystroke binding writes, the relay is the only
+        // way to read text that was typed but not yet blurred.
+        branchData.topQuestionText = topFieldRelay.currentText()
         let submittedQuestion = branchData.topQuestionText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !submittedQuestion.isEmpty, !branchData.topQuestionSubmitted else {
             branchData.topQuestionText = submittedQuestion
@@ -1332,6 +1396,8 @@ struct ChatThreadColumn: View {
 
     // Adds a follow-up question lower in the thread and locks its attachments/context.
     private func submitBottomQuestionIfNeeded() {
+        // Flush live UITextView text to binding before reading (relay avoids per-keystroke writes).
+        branchData.bottomQuestionText = bottomFieldRelay.currentText()
         let submittedQuestion = branchData.bottomQuestionText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !submittedQuestion.isEmpty else {
             branchData.bottomQuestionText = submittedQuestion
@@ -1419,54 +1485,34 @@ struct ChatThreadColumn: View {
                     )
                 }
 
-                Group {
-                    if branchData.topQuestionSubmitted {
-                        Text(branchData.topQuestionText)
-                            .font(.baskervilleBody)
-                            .lineSpacing(10)
-                            .foregroundColor(AquinasTheme.Colors.primaryReadable)
-                            .multilineTextAlignment(.center)
-                            .frame(minHeight: 88, alignment: .center)
-                            .frame(maxWidth: .infinity)
-                    } else {
-                        ZStack {
-                            if branchData.topQuestionText.isEmpty {
-                                Text("Ask Theo a question...")
-                                    .font(.baskervilleBody)
-                                    .foregroundColor(AquinasTheme.Colors.placeholderText)
-                                    .multilineTextAlignment(.center)
-                            }
-
-                            TextField("", text: $branchData.topQuestionText, axis: .vertical)
-                                .font(.baskervilleBody)
-                                .lineSpacing(10)
-                                .foregroundColor(AquinasTheme.Colors.primaryReadable)
-                                .multilineTextAlignment(.center)
-                                .submitLabel(.send)
-                                .frame(minHeight: 88, alignment: .center)
-                                .contentShape(Rectangle())
-                                .onChange(of: branchData.topQuestionText) { oldValue, newValue in
-                                    if newValue.hasSuffix("\n") {
-                                        submitTopQuestionIfNeeded()
-                                    }
-                                }
-                                .onSubmit {
-                                    submitTopQuestionIfNeeded()
-                                }
-                                .onKeyPress(.return) {
-                                    if !branchData.topQuestionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                        submitTopQuestionIfNeeded()
-                                        return .handled
-                                    }
-                                    return .ignored
-                                }
+                inputContainer {
+                    ZStack {
+                        if topFieldIsEmpty && !branchData.topQuestionSubmitted {
+                            Text("Ask Theo a question...")
+                                .font(inputFont.textFont(size: conversationFontSize))
+                                .foregroundColor(placeholderColor)
+                                .multilineTextAlignment(inputTextAlignment.textAlignment)
+                                .frame(maxWidth: .infinity, alignment: inputTextAlignment.frameAlignment)
+                                .allowsHitTesting(false)
                         }
+
+                        ListAwareTextField(
+                            text: $branchData.topQuestionText,
+                            font: inputFont.uiFont(size: conversationFontSize),
+                            isLocked: branchData.topQuestionSubmitted,
+                            textColor: .aquinasPrimaryReadable,
+                            textAlignment: inputTextAlignment.nsTextAlignment,
+                            onFocusChange: { focused in
+                                if focused { onTopInputFocused() }
+                            },
+                            relay: topFieldRelay,
+                            onTextChange: { topFieldIsEmpty = $0.isEmpty }
+                        )
+                        .frame(maxWidth: .infinity, alignment: inputTextAlignment.frameAlignment)
                     }
                 }
+                .id("top-input-anchor-\(branchData.id)")
             }
-            .padding(.horizontal, 0)
-            .padding(.vertical, 16)
-            .padding(.top, 110)
             .frame(maxWidth: .infinity)
             .background(
                 GeometryReader { geo in
@@ -1496,6 +1542,8 @@ struct ChatThreadColumn: View {
                             targetSpawnResponseIndex: $targetSpawnResponseIndex,
                             columnSpaceName: "ColumnContent-\(branchData.id)",
                             areResponsesCollapsed: areResponsesCollapsed,
+                            responseFont: responseFont,
+                            conversationFontSize: conversationFontSize,
                             onCenterChange: onSpawnYChange,
                             onDuplicateBranch: {
                                 onDuplicateResponse(textContent, index)
@@ -1523,22 +1571,26 @@ struct ChatThreadColumn: View {
                                 UploadedFileStrip(files: attachments)
 
                                 if let concept = quotedConcept {
-                                    BranchContextChip(
-                                        title: concept.word.capitalized,
-                                        icon: "text.bubble.fill",
-                                        isFilled: true,
-                                        showRemove: false
-                                    )
+	                                    BranchContextChip(
+	                                        title: concept.word.capitalized,
+	                                        icon: "text.bubble.fill",
+	                                        isFilled: true,
+	                                        animatesAppearance: false,
+	                                        showRemove: false
+	                                    )
                                     .matchedGeometryEffect(id: concept.id, in: quotedContextChipNamespace)
                                 }
-                                Text(questionText)
-                                    .font(.baskervilleBody)
-                                    .lineSpacing(10)
-                                    .multilineTextAlignment(.center)
-                                    .foregroundColor(AquinasTheme.Colors.primaryReadable)
-                                    .frame(maxWidth: .infinity)
+                                inputContainer {
+                                    ListAwareTextField(
+                                        text: .constant(questionText),
+                                        font: inputFont.uiFont(size: conversationFontSize),
+                                        isLocked: true,
+                                        textColor: .aquinasPrimaryReadable,
+                                        textAlignment: inputTextAlignment.nsTextAlignment
+                                    )
+                                    .frame(maxWidth: .infinity, alignment: inputTextAlignment.frameAlignment)
+                                }
                             }
-                            .padding(.horizontal, 0).padding(.vertical, 8)
                             .frame(maxWidth: .infinity)
                         }
                         .frame(maxWidth: .infinity).padding(.bottom, 16)
@@ -1576,53 +1628,44 @@ struct ChatThreadColumn: View {
                             .transition(.scale.combined(with: .opacity))
                         }
 
-                        ZStack {
-                            if branchData.bottomQuestionText.isEmpty {
-                                Text("Ask Theo a question...")
-                                    .font(.baskervilleBody)
-                                    .foregroundColor(AquinasTheme.Colors.placeholderText)
-                                    .multilineTextAlignment(.center)
-                            }
+                        inputContainer {
+                            ZStack {
+                                if bottomFieldIsEmpty {
+                                    Text("Ask Theo a question...")
+                                        .font(inputFont.textFont(size: conversationFontSize))
+                                        .foregroundColor(placeholderColor)
+                                        .multilineTextAlignment(inputTextAlignment.textAlignment)
+                                        .frame(maxWidth: .infinity, alignment: inputTextAlignment.frameAlignment)
+                                        .allowsHitTesting(false)
+                                }
 
-                            TextField("", text: $branchData.bottomQuestionText, axis: .vertical)
-                                .font(.baskervilleBody)
-                                .lineSpacing(10)
-                                .multilineTextAlignment(.center)
-                                .foregroundColor(AquinasTheme.Colors.primaryReadable)
-                                .submitLabel(.send)
-                                .frame(minHeight: 88, alignment: .center)
-                                .contentShape(Rectangle())
-                                .focused($isBottomQuestionFocused)
-                                .onTapGesture {
-                                    onBottomInputFocused()
-                                }
-                                .onChange(of: isBottomQuestionFocused) { oldValue, newValue in
-                                    if newValue {
-                                        onBottomInputFocused()
-                                    }
-                                }
-                                .onChange(of: branchData.bottomQuestionText) { oldValue, newValue in
-                                    if newValue.hasSuffix("\n") {
-                                        submitBottomQuestionIfNeeded()
-                                    }
-                                }
-                                .onSubmit {
-                                    submitBottomQuestionIfNeeded()
-                                }
-                                .onKeyPress(.return) {
-                                    if !branchData.bottomQuestionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                        submitBottomQuestionIfNeeded()
-                                        return .handled
-                                    }
-                                    return .ignored
-                                }
+                                ListAwareTextField(
+                                    text: $branchData.bottomQuestionText,
+                                    font: inputFont.uiFont(size: conversationFontSize),
+                                    textColor: .aquinasPrimaryReadable,
+                                    textAlignment: inputTextAlignment.nsTextAlignment,
+                                    onFocusChange: { focused in
+                                        if focused { onBottomInputFocused() }
+                                    },
+                                    relay: bottomFieldRelay,
+                                    onTextChange: { bottomFieldIsEmpty = $0.isEmpty }
+                                )
+                                .frame(maxWidth: .infinity, alignment: inputTextAlignment.frameAlignment)
+                            }
                         }
                     }
-                    .padding(.horizontal, 0).padding(.vertical, 16)
                     .frame(maxWidth: .infinity)
                 }
                 .id(bottomInputAnchor)
                 .frame(maxWidth: .infinity)
+                .onAppear {
+                    // Reset placeholder state every time this section reappears.
+                    // bottomFieldIsEmpty is driven by onTextChange callbacks, so it
+                    // stays stale at `false` when showBottomInput cycles false→true
+                    // (the UITextView is destroyed and recreated with empty text, but
+                    // no change event fires). Re-syncing here restores the placeholder.
+                    bottomFieldIsEmpty = branchData.bottomQuestionText.isEmpty
+                }
                 .transition(.move(edge: .top).combined(with: .opacity).combined(with: .scale(scale: 0.95)))
             }
         }
@@ -1632,6 +1675,9 @@ struct ChatThreadColumn: View {
             if let concept = branchData.startingConcept {
                 branchData.branchContextConcept = concept
             }
+            // Sync placeholder visibility with any pre-filled text (e.g. restored branch)
+            topFieldIsEmpty    = branchData.topQuestionText.isEmpty
+            bottomFieldIsEmpty = branchData.bottomQuestionText.isEmpty
         }
         .onChange(of: quotedConcept) { oldValue, newValue in
             if let concept = newValue {
@@ -1640,6 +1686,18 @@ struct ChatThreadColumn: View {
                     branchData.showBottomInput = true
                 }
                 onQuoteHandled()
+            }
+        }
+        // Top field focus → notify parent so it can scroll the field to the top.
+        .onChange(of: isTopQuestionFocused) { _, focused in
+            if focused { onTopInputFocused() }
+        }
+        // Dock arrow button fires externalSubmitTrigger → submit whichever input is active.
+        .onChange(of: externalSubmitTrigger) { _, _ in
+            if branchData.showBottomInput {
+                submitBottomQuestionIfNeeded()
+            } else {
+                submitTopQuestionIfNeeded()
             }
         }
     }
@@ -1656,6 +1714,8 @@ struct TrackedResponseCard: View {
     @Binding var targetSpawnResponseIndex: Int?
     let columnSpaceName: String
     let areResponsesCollapsed: Bool
+    let responseFont: ConversationFontOption
+    let conversationFontSize: ConversationFontSizeOption
     var onCenterChange: (Int, CGFloat) -> Void = { _, _ in }
     var onDuplicateBranch: () -> Void = {}
     var onFinish: () -> Void
@@ -1681,6 +1741,8 @@ struct TrackedResponseCard: View {
             fullText: textContent,
             forceCollapsed: areResponsesCollapsed,
             shouldAnimateOnAppear: shouldAnimateOnAppear,
+            responseFont: responseFont,
+            conversationFontSize: conversationFontSize,
             onDuplicateBranch: onDuplicateBranch,
             onFinish: {
                 hasFinishedStreaming = true

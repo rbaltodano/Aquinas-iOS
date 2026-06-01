@@ -8,12 +8,17 @@ import UIKit
 
 // MARK: - Insight Tree View
 
+private let insightTreeCanvasColor = Color(hex: 0x130F0C)
+private let insightTreeInsightColor = AquinasTheme.Colors.canvasSecondary
+
 struct InsightTreeView: View {
     let insights: [ConceptDefinition]
     var onClose: (() -> Void)?
     var onRemoveInsight:  ((ConceptDefinition) -> Void)? = nil
     var onRestoreInsight: ((ConceptDefinition) -> Void)? = nil
     var onForkInsight:    ((ConceptDefinition) -> Void)? = nil
+    var inputFont: ConversationFontOption = .serif
+    var conversationFontSize: ConversationFontSizeOption = .small
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -26,25 +31,34 @@ struct InsightTreeView: View {
     @State private var undoInsight: ConceptDefinition? = nil
     @State private var undoTask: Task<Void, Never>? = nil
     @State private var pendingRemoveInsight: InsightModel? = nil
+    @State private var questionBarContextInsight: InsightModel? = nil
+    @State private var questionBarKeyboardActive: Bool = false
+    @State private var cardShouldHide: Bool = false
+    @State private var chipShouldShow: Bool = false
+    @State private var questionBarFocusTrigger: Int = 0
 
     init(
         insights: [ConceptDefinition],
         onClose: (() -> Void)? = nil,
         onRemoveInsight:  ((ConceptDefinition) -> Void)? = nil,
         onRestoreInsight: ((ConceptDefinition) -> Void)? = nil,
-        onForkInsight:    ((ConceptDefinition) -> Void)? = nil
+        onForkInsight:    ((ConceptDefinition) -> Void)? = nil,
+        inputFont: ConversationFontOption = .serif,
+        conversationFontSize: ConversationFontSizeOption = .small
     ) {
-        self.insights          = insights
-        self.onClose           = onClose
-        self.onRemoveInsight   = onRemoveInsight
-        self.onRestoreInsight  = onRestoreInsight
-        self.onForkInsight     = onForkInsight
+        self.insights              = insights
+        self.onClose               = onClose
+        self.onRemoveInsight       = onRemoveInsight
+        self.onRestoreInsight      = onRestoreInsight
+        self.onForkInsight         = onForkInsight
+        self.inputFont             = inputFont
+        self.conversationFontSize  = conversationFontSize
         _viewModel = StateObject(wrappedValue: InsightTreeViewModel(insights: insights))
     }
 
     private var canvasTertiary: Color {
         colorScheme == .dark
-            ? Color(red: 43/255, green: 37/255, blue: 33/255)   // #2B2521
+            ? Color(hex: 0x130F0C)
             : Color(red: 32/255, green: 28/255, blue: 24/255)   // #201C18
     }
 
@@ -86,6 +100,8 @@ struct InsightTreeView: View {
                 edges: viewModel.edges,
                 restoreFocusedCameraRequest: restoreFocusedCameraRequest,
                 focusedInsightID: focusedInsightID,
+                pulsingInsightID: questionBarContextInsight?.id,
+                pulsingNodeID: selectedNode?.id,
                 onNodeTapped: { node in
                     showNodeCard(node)
                 },
@@ -103,49 +119,11 @@ struct InsightTreeView: View {
                 }
             )
                 .ignoresSafeArea()
-                .background(AquinasTheme.Colors.canvas)
+                .background(insightTreeCanvasColor)
 
             if viewModel.nodes.isEmpty {
                 EmptyInsightTreeView()
             }
-
-            VStack(spacing: 0) {
-                Spacer()
-
-                if undoInsight != nil {
-                    undoButtonView
-                        .transition(.scale(scale: 0.88).combined(with: .opacity))
-                        .padding(.bottom, (selectedInsight != nil || selectedNode != nil) ? 8 : 48)
-                }
-
-                if let selectedInsight {
-                    DockedInsightTreeCard(
-                        insight: selectedInsight,
-                        onRemove: { pendingRemoveInsight = selectedInsight },
-                        onFork:   { performForkInsight(selectedInsight) }
-                    )
-                    .offset(y: dockedCardDragY)
-                    .gesture(dockedCardDismissGesture)
-                    .transition(.move(edge: .bottom))
-                    .padding(.horizontal, 10)
-                    .padding(.bottom, 10)
-                } else if let selectedNode {
-                    DockedNodeTreeCard(
-                        node: selectedNode,
-                        onSelectInsight: { insight in
-                            focusedInsightID = insight.id
-                            showInsightCard(insight)
-                        }
-                    )
-                    .offset(y: dockedCardDragY)
-                    .gesture(dockedCardDismissGesture)
-                    .transition(.move(edge: .bottom))
-                    .padding(.horizontal, 10)
-                    .padding(.bottom, 10)
-                }
-            }
-            .ignoresSafeArea(.keyboard, edges: .bottom)
-            .zIndex(200)
 
             VStack {
                 HStack {
@@ -167,6 +145,126 @@ struct InsightTreeView: View {
 
                 Spacer()
             }
+        }
+        // safeAreaInset moves with the keyboard automatically — no manual observation needed.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 12) {
+                if undoInsight != nil {
+                    undoButtonView
+                        .transition(.scale(scale: 0.88).combined(with: .opacity))
+                }
+
+                if !cardShouldHide {
+                    if let selectedInsight {
+                        DockedInsightTreeCard(
+                            insight: selectedInsight,
+                            onRemove: { pendingRemoveInsight = selectedInsight },
+                            onFork:   { performForkInsight(selectedInsight) }
+                        )
+                        .offset(y: dockedCardDragY)
+                        .gesture(dockedCardDismissGesture)
+                        .transition(.scale(scale: 0.35, anchor: .bottom).combined(with: .opacity))
+                        .padding(.horizontal, 10)
+                    } else if let selectedNode {
+                        DockedNodeTreeCard(
+                            node: selectedNode,
+                            onSelectInsight: { insight in
+                                focusedInsightID = insight.id
+                                showInsightCard(insight)
+                            }
+                        )
+                        .offset(y: dockedCardDragY)
+                        .gesture(dockedCardDismissGesture)
+                        .transition(.scale(scale: 0.35, anchor: .bottom).combined(with: .opacity))
+                        .padding(.horizontal, 10)
+                    }
+                }
+
+                // Insight chip — appears above the bar when keyboard is open, mirrors card dismiss animation
+                if chipShouldShow, let insight = questionBarContextInsight {
+                    BranchContextChip(
+                        title: insight.title,
+                        icon: "text.bubble.fill",
+                        isFilled: true,
+                        fillColor: AquinasTheme.Colors.canvasSecondary,
+                        animatesAppearance: false,
+                        showRemove: true,
+                        onRemove: {
+                            withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
+                                chipShouldShow = false
+                                questionBarContextInsight = nil
+                            }
+                        }
+                    )
+                    .transition(.scale(scale: 0.35, anchor: .bottom).combined(with: .opacity))
+                    // Swipe up → dismiss keyboard → card reappears
+                    .gesture(
+                        DragGesture(minimumDistance: 20)
+                            .onEnded { value in
+                                let isUpward = value.translation.height < -20
+                                let isVertical = abs(value.translation.width) < abs(value.translation.height)
+                                if isUpward && isVertical {
+                                    UIApplication.shared.sendAction(
+                                        #selector(UIResponder.resignFirstResponder),
+                                        to: nil, from: nil, for: nil
+                                    )
+                                }
+                            }
+                    )
+                }
+
+                InsightQuestionBar(
+                    contextInsight: $questionBarContextInsight,
+                    inputFont: inputFont,
+                    conversationFontSize: conversationFontSize,
+                    onOpen: {},
+                    onKeyboardActiveChange: { active in
+                        questionBarKeyboardActive = active
+                        if active {
+                            if let insight = selectedInsight {
+                                withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
+                                    questionBarContextInsight = insight
+                                }
+                            }
+                            // Card hides and chip appears simultaneously after 0.15s.
+                            // Guard prevents stale blocks from firing if keyboard already closed.
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                                guard questionBarKeyboardActive else { return }
+                                withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
+                                    cardShouldHide = true
+                                    chipShouldShow = true
+                                }
+                            }
+                        } else {
+                            // Chip disappears immediately; card waits 0.2s then scales back in.
+                            // Guard prevents stale blocks from firing if keyboard already reopened.
+                            withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
+                                chipShouldShow = false
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                                guard !questionBarKeyboardActive else { return }
+                                withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
+                                    cardShouldHide = false
+                                }
+                            }
+                        }
+                    },
+                    onCollapse: {
+                        // Drawer closed — force all card/chip/keyboard state clean
+                        questionBarKeyboardActive = false
+                        withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
+                            cardShouldHide = false
+                            chipShouldShow = false
+                        }
+                    },
+                    focusTrigger: questionBarFocusTrigger
+                )
+                .padding(.horizontal, 16)
+            }
+            .padding(.bottom, 16)
+            .animation(.spring(response: 0.42, dampingFraction: 0.86), value: selectedInsight?.id)
+            .animation(.spring(response: 0.42, dampingFraction: 0.86), value: selectedNode?.id)
+            .animation(.spring(response: 0.34, dampingFraction: 0.86), value: undoInsight != nil)
         }
         .onChange(of: insights) { oldValue, newValue in
             viewModel.updateInsights(newValue)
@@ -200,12 +298,22 @@ struct InsightTreeView: View {
     }
 
     private func showInsightCard(_ insight: InsightModel) {
+        // Keyboard is open — update the chip and ensure it's visible
+        if questionBarKeyboardActive {
+            withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
+                questionBarContextInsight = insight
+                chipShouldShow = true
+            }
+            return
+        }
+
         playDockedCardHaptic()
 
         withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
             dockedCardDragY = 0
             selectedNode = nil
             selectedInsight = insight
+            questionBarContextInsight = insight
         }
     }
 
@@ -216,6 +324,7 @@ struct InsightTreeView: View {
             dockedCardDragY = 0
             selectedInsight = nil
             selectedNode = node
+            questionBarContextInsight = nil
         }
     }
 
@@ -225,8 +334,17 @@ struct InsightTreeView: View {
                 dockedCardDragY = max(0, value.translation.height)
             }
             .onEnded { value in
-                if value.translation.height > 44 || value.predictedEndTranslation.height > 90 {
+                let h = value.translation.height
+                let predicted = value.predictedEndTranslation.height
+                if h > 100 || predicted > 180 {
+                    // Large swipe → full dismiss
                     dismissDockedInsight()
+                } else if h > 28 {
+                    // Small swipe down → collapse to chip (focus question bar)
+                    withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) {
+                        dockedCardDragY = 0
+                    }
+                    questionBarFocusTrigger += 1
                 } else {
                     withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) {
                         dockedCardDragY = 0
@@ -266,6 +384,22 @@ struct InsightTreeView: View {
             dockedCardDragY = 0
             selectedInsight = nil
             selectedNode = nil
+            questionBarContextInsight = nil
+        }
+    }
+
+    // Dismisses the docked card without clearing the question bar chip.
+    // Called when the question bar keyboard opens so the card slides away
+    // but the quoted insight remains available in the bar.
+    private func dismissDockedCard() {
+        guard selectedInsight != nil || selectedNode != nil else { return }
+
+        playDockedCardHaptic()
+
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+            dockedCardDragY = 0
+            selectedInsight = nil
+            selectedNode = nil
         }
     }
 
@@ -278,17 +412,20 @@ struct InsightTreeView: View {
 
 private struct DockedInsightTreeCard: View {
     let insight: InsightModel
+
     var onRemove: (() -> Void)? = nil
     var onFork:   (() -> Void)? = nil
 
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .center, spacing: 8) {
-                DockedCardTextBubbleIcon(size: 12, delay: 0.18)
+                DockedCardTextBubbleIcon(size: 12, delay: 0.18, color: AquinasTheme.Colors.darkGreen)
 
                 Text(insight.title)
                     .font(.custom("Figtree-Bold", size: 18))
-                    .foregroundColor(AquinasTheme.Colors.darkGreen)
+                    .foregroundColor(AquinasTheme.Colors.primaryReadable)
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
 
@@ -299,6 +436,8 @@ private struct DockedInsightTreeCard: View {
                     canCopy: true,
                     canFork: true,
                     copyText: insight.definition,
+                    tintColor: AquinasTheme.Colors.placeholderText,
+                    saveTintColor: AquinasTheme.Colors.accentRed,
                     onSave: { onRemove?() },
                     onFork: { onFork?() }
                 )
@@ -307,23 +446,27 @@ private struct DockedInsightTreeCard: View {
             Text(insight.definition)
                 .font(.figtreeParagraph)
                 .lineSpacing(12)
-                .foregroundColor(AquinasTheme.Colors.bodyText)
+                .foregroundColor(AquinasTheme.Colors.paragraphText)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(32)
+        .padding(24)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(AquinasTheme.Colors.canvasSecondary)
-        .clipShape(RoundedRectangle(cornerRadius: 48, style: .continuous))
+        .background(insightTreeInsightColor)
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 48, style: .continuous)
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
                 .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
         )
+        .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 16)
     }
 }
 
 private struct DockedNodeTreeCard: View {
     let node: NodeModel
+
     var onSelectInsight: (InsightModel) -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
 
     private var summaryText: String {
         let titles = node.insights.prefix(3).map(\.title)
@@ -345,13 +488,13 @@ private struct DockedNodeTreeCard: View {
 
                 Image(systemName: "ellipsis")
                     .font(.system(size: 16, weight: .bold))
-                    .foregroundColor(AquinasTheme.Colors.primaryReadable.opacity(0.72))
+                    .foregroundColor(AquinasTheme.Colors.placeholderText)
             }
 
             Text(summaryText)
                 .font(.figtreeParagraph)
                 .lineSpacing(8)
-                .foregroundColor(AquinasTheme.Colors.bodyText)
+                .foregroundColor(AquinasTheme.Colors.paragraphText)
                 .lineLimit(3)
 
             VStack(alignment: .leading, spacing: 16) {
@@ -360,7 +503,7 @@ private struct DockedNodeTreeCard: View {
                         onSelectInsight(insight)
                     } label: {
                         HStack(spacing: 12) {
-                            DockedCardTextBubbleIcon(size: 14, delay: 0.18 + (Double(index) * 0.04))
+                            DockedCardTextBubbleIcon(size: 14, delay: 0.18 + (Double(index) * 0.04), color: AquinasTheme.Colors.darkGreen)
 
                             Text(insight.title)
                                 .font(.custom("Figtree-Bold", size: 16))
@@ -378,24 +521,26 @@ private struct DockedNodeTreeCard: View {
         }
         .padding(32)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(AquinasTheme.Colors.canvasSecondary)
-        .clipShape(RoundedRectangle(cornerRadius: 48, style: .continuous))
+        .background(insightTreeInsightColor)
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 48, style: .continuous)
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
                 .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
         )
+        .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 16)
     }
 }
 
 private struct DockedCardTextBubbleIcon: View {
     let size: CGFloat
     var delay: TimeInterval = 0
+    var color: Color = AquinasTheme.Colors.darkGreenDarkMode
     @State private var isVisible = false
 
     var body: some View {
         Image(systemName: "text.bubble.fill")
             .font(.system(size: size, weight: .semibold))
-            .foregroundColor(AquinasTheme.Colors.darkGreen)
+            .foregroundColor(color)
             .scaleEffect(isVisible ? 1 : 0.86)
             .opacity(isVisible ? 1 : 0)
             .onAppear {

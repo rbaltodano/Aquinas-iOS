@@ -25,7 +25,7 @@ final class InsightTreeViewModel: ObservableObject {
 
     init(insights: [ConceptDefinition]) {
         self.insights = insights.map { InsightModel(concept: $0) }
-        scene = InsightTreeScene(size: UIScreen.main.bounds.size)
+        scene = InsightTreeScene(size: CGSize(width: 390, height: 844))
         scene.scaleMode = .resizeFill
         scene.backgroundColor = UIColor(AquinasTheme.Colors.canvas)
         scene.onNodeTapped = { [weak self] node in

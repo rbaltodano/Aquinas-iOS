@@ -14,7 +14,9 @@ struct BranchContextChip: View {
     let icon: String
     var animationKey: String = "static"
     var isFilled: Bool = false
+    var fillColor: Color = AquinasTheme.Colors.componentBackground
     var appearDelay: TimeInterval = 0
+    var animatesAppearance: Bool = true
     var showRemove: Bool = false
     var onRemove: (() -> Void)? = nil
     @State private var borderDrawProgress: CGFloat = 0
@@ -29,7 +31,7 @@ struct BranchContextChip: View {
                 .id(icon)
                 .sfSymbolDrawOn(delay: appearDelay + 0.25)
             Text(title)
-                .font(.baskervilleSmall)
+                .font(.figtreeChipLabel)
                 .foregroundColor(AquinasTheme.Colors.darkGreen)
                 .lineLimit(1)
             if showRemove, let onRemove {
@@ -44,7 +46,7 @@ struct BranchContextChip: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 16)
-        .background(isFilled ? AquinasTheme.Colors.componentBackground : Color.clear)
+        .background(isFilled ? fillColor : Color.clear)
         .cornerRadius(12)
         .overlay(
             RoundedRectangle(cornerRadius: 12)
@@ -62,6 +64,12 @@ struct BranchContextChip: View {
     }
 
     private func revealChip() {
+        guard animatesAppearance else {
+            isVisible = true
+            borderDrawProgress = 1
+            return
+        }
+
         isVisible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + appearDelay) {
             withAnimation(.easeOut(duration: 0.25)) {
@@ -145,7 +153,7 @@ struct UploadedFileThumbnail: View {
                 }) {
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(AquinasTheme.Colors.darkBrown)
+                        .foregroundColor(AquinasTheme.Colors.canvasInverse)
                         .sfSymbolDrawOn()
                         .frame(width: 22, height: 22)
                         .background(AquinasTheme.Colors.uploadBorder)

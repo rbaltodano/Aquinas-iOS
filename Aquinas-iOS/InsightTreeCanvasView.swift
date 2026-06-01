@@ -14,6 +14,8 @@ struct InsightTreeCanvasView: View {
     let edges: [EdgeModel]
     let restoreFocusedCameraRequest: Int
     let focusedInsightID: UUID?
+    let pulsingInsightID: UUID?
+    let pulsingNodeID: UUID?
     var onNodeTapped: (NodeModel) -> Void
     var onInsightTapped: (InsightModel) -> Void
     var onCanvasMoved: () -> Void
@@ -32,6 +34,8 @@ struct InsightTreeCanvasView: View {
     @State private var hasAppeared:        Bool = false
     @State private var revealedInsightIDs: Set<UUID> = []
     @State private var entranceTask:       Task<Void, Never>? = nil
+    @State private var pulseCycleStartedAt = Date().timeIntervalSinceReferenceDate
+    @State private var connectorPulseDelayUntil = Date().timeIntervalSinceReferenceDate
     @GestureState private var dragOffset:  CGSize = .zero
 
     private var activeScale: CGFloat {
@@ -45,6 +49,14 @@ struct InsightTreeCanvasView: View {
         )
     }
 
+    private var insightTreeCanvasColor: Color {
+        Color(hex: 0x130F0C)
+    }
+
+    private var insightTreeInsightColor: Color {
+        Color(light: 0xFFFAF0, dark: 0x0A0602)
+    }
+
     var body: some View {
         GeometryReader { proxy in
             let size = proxy.size
@@ -52,7 +64,7 @@ struct InsightTreeCanvasView: View {
             let labelOpacity = Self.labelOpacity(for: activeScale)
 
             ZStack {
-                AquinasTheme.Colors.canvas.ignoresSafeArea()
+                insightTreeCanvasColor.ignoresSafeArea()
                 AnimatedDotGridBackground(
                     settledOffset: offset,
                     settledScale:  activeScale,
@@ -65,6 +77,7 @@ struct InsightTreeCanvasView: View {
 
                 graphEdges(camera: camera, size: size)
                 insightConnectors(camera: camera, size: size, labelOpacity: labelOpacity)
+                connectorPulseOverlay(camera: camera, size: size)
                 edgeHitTargets(camera: camera, size: size)
 
                 ForEach(nodes) { node in
@@ -108,6 +121,23 @@ struct InsightTreeCanvasView: View {
             }
             .onDisappear {
                 entranceTask?.cancel()
+            }
+            .task(id: pulseSourceKey) {
+                guard pulseSourceKey != nil else { return }
+                let now = Date().timeIntervalSinceReferenceDate
+                connectorPulseDelayUntil = now + 0.58
+                pulseCycleStartedAt = connectorPulseDelayUntil
+
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    guard !Task.isCancelled,
+                          let worldPosition = pulsingWorldPosition() else { continue }
+
+                    rippleTrigger = RippleTrigger(
+                        worldOrigin: worldPosition,
+                        startTime: Date().timeIntervalSinceReferenceDate
+                    )
+                }
             }
         }
     }
@@ -242,15 +272,16 @@ struct InsightTreeCanvasView: View {
                 let end = camera.worldToScreen(to.position, in: size)
 
                 AnimatableLine(start: start, end: end)
-                .stroke(
-                    AquinasTheme.Colors.divider.opacity(edge.isSuggested ? 0.55 : 0.9),
-                    style: StrokeStyle(
-                        lineWidth: 1,
-                        lineCap: .round,
-                        dash: edge.isSuggested ? [6, 4] : []
+                    .stroke(
+                        AquinasTheme.Colors.divider.opacity(edge.isSuggested ? 0.55 : 0.9),
+                        style: StrokeStyle(
+                            lineWidth: 1,
+                            lineCap: .round,
+                            dash: edge.isSuggested ? [6, 4] : []
+                        )
                     )
-                )
-                .allowsHitTesting(false)
+                    .frame(width: size.width, height: size.height)
+                    .allowsHitTesting(false)
             }
         }
     }
@@ -266,13 +297,200 @@ struct InsightTreeCanvasView: View {
                 )
 
                 AnimatableLine(start: start, end: end)
-                .stroke(
-                    AquinasTheme.Colors.divider.opacity(0.2 + (0.35 * labelOpacity)),
-                    style: StrokeStyle(lineWidth: 1, lineCap: .round)
-                )
-                .allowsHitTesting(false)
+                    .stroke(
+                        AquinasTheme.Colors.divider.opacity(0.2 + (0.35 * labelOpacity)),
+                        style: StrokeStyle(lineWidth: 1, lineCap: .round)
+                    )
+                    .frame(width: size.width, height: size.height)
+                    .allowsHitTesting(false)
             }
         }
+    }
+
+    @ViewBuilder
+    private func connectorPulseOverlay(camera: InsightTreeCamera, size: CGSize) -> some View {
+        TimelineView(.animation) { timeline in
+            let pulseProgress = connectorPulseProgress(at: timeline.date)
+            let sourceNodeID = pulsingNodeID ?? pulsingInsightNodeID()
+
+            ZStack {
+                graphEdgePulseOverlay(sourceNodeID: sourceNodeID, camera: camera, size: size, progress: pulseProgress)
+
+                ForEach(nodes) { node in
+                    let visibleInsights = Array(node.insights.prefix(6))
+                    let isPulsingNode = pulsingNodeID == node.id
+                    let selectedInsightIndex = pulsingInsightID.flatMap { pulsingID in
+                        visibleInsights.firstIndex { $0.id == pulsingID }
+                    }
+
+                    ForEach(Array(visibleInsights.enumerated()), id: \.element.id) { index, insight in
+                        let nodePosition = camera.worldToScreen(node.position, in: size)
+                        let insightPosition = camera.worldToScreen(
+                            insightWorldPosition(for: node, index: index, count: min(node.insights.count, 6)),
+                            in: size
+                        )
+
+                        if let selectedInsightIndex {
+                            connectorPulseLine(
+                                nodePosition: nodePosition,
+                                insightPosition: insightPosition,
+                                isSelectedInsight: index == selectedInsightIndex,
+                                isSelectedNodeConcept: false,
+                                progress: pulseProgress
+                            )
+                            .frame(width: size.width, height: size.height)
+                            .allowsHitTesting(false)
+                        } else if isPulsingNode {
+                            connectorPulseLine(
+                                nodePosition: nodePosition,
+                                insightPosition: insightPosition,
+                                isSelectedInsight: false,
+                                isSelectedNodeConcept: true,
+                                progress: pulseProgress
+                            )
+                            .frame(width: size.width, height: size.height)
+                            .allowsHitTesting(false)
+                        }
+                    }
+                }
+            }
+            .frame(width: size.width, height: size.height)
+        }
+        .frame(width: size.width, height: size.height)
+        .allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private func graphEdgePulseOverlay(
+        sourceNodeID: UUID?,
+        camera: InsightTreeCamera,
+        size: CGSize,
+        progress: Double
+    ) -> some View {
+        if let sourceNodeID {
+            ForEach(displayGraphEdges()) { edge in
+                if edge.fromNodeID == sourceNodeID || edge.toNodeID == sourceNodeID,
+                   let sourceNode = nodes.first(where: { $0.id == sourceNodeID }) {
+                    let targetNodeID = edge.fromNodeID == sourceNodeID ? edge.toNodeID : edge.fromNodeID
+
+                    if let targetNode = nodes.first(where: { $0.id == targetNodeID }) {
+                        let start = camera.worldToScreen(sourceNode.position, in: size)
+                        let end = camera.worldToScreen(targetNode.position, in: size)
+
+                        travelingPulseLine(start: start, end: end, progress: progress, lineWidth: 2.2)
+                            .frame(width: size.width, height: size.height)
+                            .allowsHitTesting(false)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func connectorPulseLine(
+        nodePosition: CGPoint,
+        insightPosition: CGPoint,
+        isSelectedInsight: Bool,
+        isSelectedNodeConcept: Bool,
+        progress: Double
+    ) -> some View {
+        if isSelectedInsight {
+            travelingPulseLine(start: insightPosition, end: nodePosition, progress: progress, lineWidth: 2.2)
+        } else if isSelectedNodeConcept {
+            travelingPulseLine(start: insightPosition, end: nodePosition, progress: progress, lineWidth: 1.8)
+        }
+    }
+
+    @ViewBuilder
+    private func travelingPulseLine(
+        start: CGPoint,
+        end: CGPoint,
+        progress: Double,
+        lineWidth: CGFloat
+    ) -> some View {
+        let segmentWidth = 0.22
+        let segmentStart = max(0, progress - segmentWidth)
+        let segmentEnd = min(progress, 1)
+
+        if segmentEnd > segmentStart {
+            pulseSegment(start: start, end: end, from: segmentStart, to: segmentEnd, lineWidth: lineWidth)
+        }
+    }
+
+    private func pulseSegment(
+        start: CGPoint,
+        end: CGPoint,
+        from segmentStart: Double,
+        to segmentEnd: Double,
+        lineWidth: CGFloat
+    ) -> some View {
+        let dx = end.x - start.x
+        let dy = end.y - start.y
+        let distance = hypot(dx, dy)
+        let centerProgress = (segmentStart + segmentEnd) / 2
+        let segmentLength = max(distance * CGFloat(segmentEnd - segmentStart), 1)
+        let center = CGPoint(
+            x: start.x + dx * CGFloat(centerProgress),
+            y: start.y + dy * CGFloat(centerProgress)
+        )
+        let angle = Angle(radians: Double(atan2(dy, dx)))
+
+        return Capsule()
+            .fill(
+                LinearGradient(
+                    stops: [
+                        Gradient.Stop(color: Color(red: 0.53, green: 0.49, blue: 0.31).opacity(0), location: 0.00),
+                        Gradient.Stop(color: Color(red: 0.53, green: 0.49, blue: 0.31), location: 0.50),
+                        Gradient.Stop(color: Color(red: 0.53, green: 0.49, blue: 0.31).opacity(0), location: 1.00)
+                    ],
+                    startPoint: UnitPoint(x: 0, y: 0.5),
+                    endPoint: UnitPoint(x: 1, y: 0.5)
+                )
+            )
+            .frame(width: segmentLength, height: lineWidth)
+            .rotationEffect(angle)
+            .opacity(0.5)
+            .position(center)
+    }
+
+    private func connectorPulseProgress(at date: Date) -> Double {
+        let cycleDuration = 2.0
+        guard date.timeIntervalSinceReferenceDate >= connectorPulseDelayUntil else { return 0 }
+
+        return max(0, date.timeIntervalSinceReferenceDate - pulseCycleStartedAt)
+            .truncatingRemainder(dividingBy: cycleDuration) / cycleDuration
+    }
+
+    private var pulseSourceKey: String? {
+        if let pulsingInsightID {
+            return "insight-\(pulsingInsightID.uuidString)"
+        }
+
+        if let pulsingNodeID {
+            return "node-\(pulsingNodeID.uuidString)"
+        }
+
+        return nil
+    }
+
+    private func pulsingWorldPosition() -> CGPoint? {
+        if let pulsingInsightID {
+            return insightFocusTarget(for: pulsingInsightID)
+        }
+
+        if let pulsingNodeID {
+            return nodes.first(where: { $0.id == pulsingNodeID })?.position
+        }
+
+        return nil
+    }
+
+    private func pulsingInsightNodeID() -> UUID? {
+        guard let pulsingInsightID else { return nil }
+
+        return nodes.first { node in
+            node.insights.contains { $0.id == pulsingInsightID }
+        }?.id
     }
 
     @ViewBuilder
@@ -347,9 +565,9 @@ struct InsightTreeCanvasView: View {
                     .animation(.spring(response: 0.6, dampingFraction: 0.75).delay(0.1), value: hasAppeared)
             }
             .padding(8)
-            .background(AquinasTheme.Colors.canvas)
+            .background(insightTreeCanvasColor)
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .shadow(color: AquinasTheme.Colors.canvas, radius: 36, x: 0, y: 0)
+            .shadow(color: insightTreeCanvasColor, radius: 36, x: 0, y: 0)
             .frame(width: node.isSuggested ? 220 : 260)
             .contentShape(Rectangle())
             .onTapGesture {
@@ -413,9 +631,9 @@ struct InsightTreeCanvasView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
-        .background(AquinasTheme.Colors.canvas)
+        .background(insightTreeCanvasColor)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .shadow(color: AquinasTheme.Colors.canvas, radius: 24, x: 0, y: 0)
+        .shadow(color: insightTreeCanvasColor, radius: 24, x: 0, y: 0)
         .contentShape(Rectangle())
         .onTapGesture {
             guard canAcceptTap else { return }

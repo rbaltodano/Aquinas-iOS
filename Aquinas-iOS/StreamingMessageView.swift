@@ -15,10 +15,10 @@ struct GlideFadeModifier: ViewModifier {
     let isActive: Bool
     func body(content: Content) -> some View {
         content
-            .blur(radius: isActive ? 4 : 0)
+            .blur(radius: isActive ? 3 : 0)
             .opacity(isActive ? 0 : 1)
-            .offset(y: isActive ? 6 : 0)
-            .scaleEffect(isActive ? 0.97 : 1)
+            .offset(y: isActive ? 14 : 0)
+            .scaleEffect(isActive ? 0.95 : 1)
     }
 }
 
@@ -29,16 +29,42 @@ typealias BlurFadeModifier = GlideFadeModifier
 struct FlowLayout: Layout {
     var spacing: CGFloat = 4.5
 
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let result = FlowResult(in: proposal.width ?? 0, subviews: subviews, spacing: spacing)
-        return result.size
+    // MARK: - Cache
+    //
+    // SwiftUI calls sizeThatFits + placeSubviews on every layout pass, and both
+    // previously recreated a full FlowResult — measuring every word from scratch
+    // each time. For a 500-word response streaming 4 words every 55 ms that
+    // amounted to ~188,000 CoreText sizeThatFits calls before the stream finished.
+    //
+    // The fix: use SwiftUI's built-in Layout cache to remember each word's CGSize
+    // by its subview index. Words are append-only during streaming, so a cached
+    // size is always valid for the lifetime of the layout. New words get measured
+    // once; all previous words are a free dictionary lookup.
+    //
+    // Expected reduction: ~188,000 → ~1,000 total measurements for a 500-word stream.
+
+    typealias Cache = [Int: CGSize]
+
+    func makeCache(subviews: Subviews) -> Cache { [:] }
+
+    func updateCache(_ cache: inout Cache, subviews: Subviews) {
+        if cache.count > subviews.count {
+            cache = cache.filter { $0.key < subviews.count }
+        }
     }
 
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let result = FlowResult(in: bounds.width, subviews: subviews, spacing: spacing)
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize {
+        FlowResult(in: proposal.width ?? 0, subviews: subviews, spacing: spacing, cache: &cache).size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) {
+        let result = FlowResult(in: bounds.width, subviews: subviews, spacing: spacing, cache: &cache)
         for (index, subview) in subviews.enumerated() {
-            let point = result.points[index]
-            subview.place(at: CGPoint(x: bounds.minX + point.x, y: bounds.minY + point.y), proposal: .unspecified)
+            subview.place(
+                at: CGPoint(x: bounds.minX + result.points[index].x,
+                            y: bounds.minY + result.points[index].y),
+                proposal: .unspecified
+            )
         }
     }
 
@@ -46,21 +72,28 @@ struct FlowLayout: Layout {
         var size: CGSize = .zero
         var points: [CGPoint] = []
 
-        init(in maxWidth: CGFloat, subviews: Subviews, spacing: CGFloat) {
+        init(in maxWidth: CGFloat, subviews: Subviews, spacing: CGFloat, cache: inout [Int: CGSize]) {
             var currentX: CGFloat = 0
             var currentY: CGFloat = 0
             var lineHeight: CGFloat = 0
 
-            for subview in subviews {
-                let size = subview.sizeThatFits(.unspecified)
-                if currentX + size.width > maxWidth && currentX > 0 {
+            for (idx, subview) in subviews.enumerated() {
+                let wordSize: CGSize
+                if let hit = cache[idx] {
+                    wordSize = hit
+                } else {
+                    wordSize = subview.sizeThatFits(.unspecified)
+                    cache[idx] = wordSize
+                }
+
+                if currentX + wordSize.width > maxWidth && currentX > 0 {
                     currentX = 0
                     currentY += lineHeight + 8
                     lineHeight = 0
                 }
                 points.append(CGPoint(x: currentX, y: currentY))
-                lineHeight = max(lineHeight, size.height)
-                currentX += size.width + spacing
+                lineHeight = max(lineHeight, wordSize.height)
+                currentX += wordSize.width + spacing
             }
             size = CGSize(width: maxWidth, height: currentY + lineHeight)
         }
@@ -71,6 +104,7 @@ struct FlowLayout: Layout {
 extension AnyTransition {
     static var glideFadeUp: AnyTransition {
         .modifier(active: GlideFadeModifier(isActive: true), identity: GlideFadeModifier(isActive: false))
+        .animation(.easeOut(duration: 0.22))
     }
 
     static var blurSlideUp: AnyTransition {
@@ -78,18 +112,58 @@ extension AnyTransition {
     }
 }
 
+// MARK: - Cached Regex
+
+/// Compiled once per process — never inside init or hot-path functions.
+private enum CachedRegex {
+    static let listLine    = try! NSRegularExpression(pattern: #"^\s*\d+[.)]\s+(.+)"#)
+    static let insightLink = try! NSRegularExpression(pattern: #"^\[([^\]]+)\]\(([^)]+)\)([.,!?;:]*)$"#)
+    static let tokenizer   = try! NSRegularExpression(pattern: #"\[[^\]]+\]\([^)]+\)[.,!?;]*|\S+"#)
+}
+
+// MARK: - Response Segment Model
+
+/// A parsed block of text — either a normal paragraph or a numbered list.
+private struct ResponseSegment: Identifiable {
+    enum Kind {
+        case paragraph
+        case orderedList([String])  // item texts, already stripped of "1." prefix
+    }
+
+    let id = UUID()
+    let kind: Kind
+    /// Flat word array for this segment (drives streaming progress).
+    let words: [String]
+    /// Where this segment starts in the global flat word array.
+    let wordStart: Int
+    /// For orderedList: word index (relative to segment start) where each item begins.
+    let itemWordOffsets: [Int]
+
+    var wordCount: Int { words.count }
+}
+
 // MARK: - Streaming Message View
 
-/// Renders the model response body, animated word-by-word, with bookmark/copy/fork actions.
+/// Renders the model response body, animated word-by-word, with ordered-list bubble formatting
+/// and bookmark/copy/fork actions.
 struct StreamingMessageView: View {
     let fullText: String
     let shouldStream: Bool
+    let responseFont: ConversationFontOption
+    let conversationFontSize: ConversationFontSizeOption
     var onQuote: ((String) -> Void)? = nil
     var onBranch: (() -> Void)? = nil
     var onFinish: (() -> Void)? = nil
+
+    private let segments: [ResponseSegment]
     private let responseWords: [String]
     private let streamBatchSize = 4
     private let streamBatchDelay: UInt64 = 55_000_000
+
+    // Process-level cache keyed by response text. parseSegments + tokenize is
+    // O(words) and called every time a parent view re-renders (SwiftUI creates new
+    // struct values for comparison). Caching makes repeated inits a O(1) lookup.
+    private static var parseCache: [String: (segments: [ResponseSegment], words: [String])] = [:]
 
     @State private var displayedWords: [String] = []
     @State private var isFinished: Bool = false
@@ -98,43 +172,55 @@ struct StreamingMessageView: View {
     init(
         fullText: String,
         shouldStream: Bool = true,
+        responseFont: ConversationFontOption = .sans,
+        conversationFontSize: ConversationFontSizeOption = .large,
         onQuote: ((String) -> Void)? = nil,
         onBranch: (() -> Void)? = nil,
         onFinish: (() -> Void)? = nil
     ) {
         self.fullText = fullText
         self.shouldStream = shouldStream
+        self.responseFont = responseFont
+        self.conversationFontSize = conversationFontSize
         self.onQuote = onQuote
         self.onBranch = onBranch
         self.onFinish = onFinish
-        let words = Self.words(from: fullText)
-        self.responseWords = words
-        _displayedWords = State(initialValue: shouldStream ? [] : words)
+
+        let cached: (segments: [ResponseSegment], words: [String])
+        if let hit = Self.parseCache[fullText] {
+            cached = hit
+        } else {
+            let segs = Self.parseSegments(from: fullText)
+            let words = segs.flatMap { $0.words }
+            cached = (segments: segs, words: words)
+            Self.parseCache[fullText] = cached
+        }
+        self.segments = cached.segments
+        self.responseWords = cached.words
+        _displayedWords = State(initialValue: shouldStream ? [] : cached.words)
         _isFinished = State(initialValue: !shouldStream)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
 
-            // Reserve the final response height up front, then stream visible words inside it.
+            // Reserve the final response height up front so the card doesn't jump,
+            // then reveal content on top of the ghost via streaming progress.
             ZStack(alignment: .topLeading) {
-                wordFlow(words: responseWords)
+                segmentsView(displayedCount: responseWords.count)
                     .hidden()
 
-                wordFlow(words: displayedWords)
+                segmentsView(displayedCount: displayedWords.count)
             }
             .animation(.easeOut(duration: 0.18), value: displayedWords.count)
 
-            // Response actions shown after the streamed text finishes.
             if isFinished {
                 ResponseButtons(
                     canCopy: true,
                     canFork: onBranch != nil,
                     copyText: fullText,
-                    onSave: {
-                        print("Saved to bookmarks!")
-                    },
-                    onQuote: onQuote.map { quote in { quote(fullText) } },
+                    onSave: { print("Saved to bookmarks!") },
+                    onQuote: onQuote.map { q in { q(fullText) } },
                     onFork: onBranch
                 )
                 .padding(.top, 8)
@@ -145,31 +231,96 @@ struct StreamingMessageView: View {
                 )
             }
         }
-
         .frame(maxWidth: .infinity, alignment: .leading)
         .task {
-            if shouldStream {
-                await streamText()
+            if shouldStream { await streamText() }
+        }
+    }
+
+    // MARK: - Segment renderer
+
+    @ViewBuilder
+    private func segmentsView(displayedCount: Int) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            ForEach(segments) { segment in
+                segmentView(segment: segment, displayedCount: displayedCount)
             }
         }
     }
 
-    // MARK: Prototype Stream
+    @ViewBuilder
+    private func segmentView(segment: ResponseSegment, displayedCount: Int) -> some View {
+        let available = max(0, min(segment.wordCount, displayedCount - segment.wordStart))
+        if available > 0 {
+            switch segment.kind {
+            case .paragraph:
+                wordFlow(words: Array(segment.words.prefix(available)))
+
+            case .orderedList(let items):
+                orderedListBubble(
+                    items: items,
+                    allWords: segment.words,
+                    itemOffsets: segment.itemWordOffsets,
+                    available: available
+                )
+            }
+        }
+    }
+
+    // MARK: - Ordered list bubble
+
+    @ViewBuilder
+    private func orderedListBubble(
+        items: [String],
+        allWords: [String],
+        itemOffsets: [Int],
+        available: Int
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(Array(items.enumerated()), id: \.offset) { index, _ in
+                let itemStart = itemOffsets[index]
+                let itemEnd   = index + 1 < itemOffsets.count ? itemOffsets[index + 1] : allWords.count
+
+                if available > itemStart {
+                    let count = min(available - itemStart, itemEnd - itemStart)
+                    let safeEnd = min(itemStart + count, allWords.count)
+                    let itemWords = Array(allWords[itemStart..<safeEnd])
+
+                    HStack(alignment: .top, spacing: 10) {
+                        Text("\(index + 1).")
+                            .font(responseFont.textFont(size: conversationFontSize))
+                            .foregroundColor(AquinasTheme.Colors.bodyText)
+                            .frame(minWidth: 22, alignment: .trailing)
+
+                        wordFlow(words: itemWords)
+                    }
+                    .transition(.glideFadeUp)
+                }
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(AquinasTheme.Colors.background)
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(AquinasTheme.Colors.quietBorder, lineWidth: 1)
+        )
+    }
+
+    // MARK: - Word flow (unchanged)
 
     @ViewBuilder
     private func wordFlow(words: [String]) -> some View {
         FlowLayout {
-            ForEach(Array(words.enumerated()), id: \.offset) { index, word in
+            ForEach(Array(words.enumerated()), id: \.offset) { _, word in
                 if let link = insightLink(from: word) {
-                    Button(action: {
-                        openURL(link.url)
-                    }) {
+                    Button(action: { openURL(link.url) }) {
                         HStack(spacing: 0) {
-                            Text(link.title)
-                                .underline()
+                            Text(link.title).underline().bold()
                             Text(link.trailingPunctuation)
                         }
-                        .font(.figtreeParagraphInsight)
+                        .font(responseFont.textFont(size: conversationFontSize))
                         .foregroundColor(AquinasTheme.Colors.secondaryMuted)
                         .padding(.horizontal, 2)
                         .contentShape(Rectangle())
@@ -178,7 +329,7 @@ struct StreamingMessageView: View {
                     .transition(.glideFadeUp)
                 } else {
                     Text(word)
-                        .font(.figtreeParagraphLarge)
+                        .font(responseFont.textFont(size: conversationFontSize))
                         .foregroundColor(AquinasTheme.Colors.bodyText)
                         .transition(.glideFadeUp)
                 }
@@ -186,18 +337,87 @@ struct StreamingMessageView: View {
         }
     }
 
+    // MARK: - Parsing
+
+    /// Splits fullText into paragraph and ordered-list segments.
+    /// Consecutive lines matching `^\d+[.)]\s+` form one orderedList segment.
+    private static func parseSegments(from text: String) -> [ResponseSegment] {
+        // Matches "1. ", "2) ", "10. " etc. and captures the item text.
+        let listLineRegex = CachedRegex.listLine
+
+        struct RawLine { let isListItem: Bool; let content: String }
+
+        var rawLines: [RawLine] = []
+        for line in text.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { continue }
+
+            if let match = listLineRegex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)),
+               let itemRange = Range(match.range(at: 1), in: trimmed) {
+                rawLines.append(RawLine(isListItem: true, content: String(trimmed[itemRange])))
+            } else {
+                rawLines.append(RawLine(isListItem: false, content: trimmed))
+            }
+        }
+
+        var result: [ResponseSegment] = []
+        var wordCursor = 0
+        var i = 0
+
+        while i < rawLines.count {
+            if rawLines[i].isListItem {
+                // Gather all consecutive list items into one segment.
+                var items: [String] = []
+                while i < rawLines.count && rawLines[i].isListItem {
+                    items.append(rawLines[i].content)
+                    i += 1
+                }
+                var allWords: [String] = []
+                var itemOffsets: [Int] = []
+                for item in items {
+                    itemOffsets.append(allWords.count)
+                    allWords.append(contentsOf: tokenize(item))
+                }
+                result.append(ResponseSegment(
+                    kind: .orderedList(items),
+                    words: allWords,
+                    wordStart: wordCursor,
+                    itemWordOffsets: itemOffsets
+                ))
+                wordCursor += allWords.count
+            } else {
+                // Gather consecutive non-list lines into one paragraph segment.
+                var paraWords: [String] = []
+                while i < rawLines.count && !rawLines[i].isListItem {
+                    paraWords.append(contentsOf: tokenize(rawLines[i].content))
+                    i += 1
+                }
+                result.append(ResponseSegment(
+                    kind: .paragraph,
+                    words: paraWords,
+                    wordStart: wordCursor,
+                    itemWordOffsets: []
+                ))
+                wordCursor += paraWords.count
+            }
+        }
+
+        return result
+    }
+
+    /// Tokenises a single line into words (and markdown links as single tokens).
+    private static func tokenize(_ text: String) -> [String] {
+        return CachedRegex.tokenizer.matches(in: text, range: NSRange(text.startIndex..., in: text))
+            .map { String(text[Range($0.range, in: text)!]) }
+    }
+
     private func insightLink(from word: String) -> (title: String, url: URL, trailingPunctuation: String)? {
-        let pattern = #"^\[([^\]]+)\]\(([^)]+)\)([.,!?;:]*)$"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: word, range: NSRange(word.startIndex..., in: word)),
+        guard let match = CachedRegex.insightLink.firstMatch(in: word, range: NSRange(word.startIndex..., in: word)),
               match.numberOfRanges == 4,
               let titleRange = Range(match.range(at: 1), in: word),
               let urlRange = Range(match.range(at: 2), in: word),
               let punctuationRange = Range(match.range(at: 3), in: word),
-              let url = URL(string: String(word[urlRange])) else {
-            return nil
-        }
-
+              let url = URL(string: String(word[urlRange])) else { return nil }
         return (
             title: String(word[titleRange]),
             url: url,
@@ -205,14 +425,8 @@ struct StreamingMessageView: View {
         )
     }
 
-    private static func words(from text: String) -> [String] {
-        let pattern = "\\[[^\\]]+\\]\\([^\\)]+\\)[.,!?;]*|\\S+"
-        let regex = try! NSRegularExpression(pattern: pattern)
-        let matches = regex.matches(in: text, range: NSRange(text.startIndex..., in: text))
-        return matches.map { String(text[Range($0.range, in: text)!]) }
-    }
+    // MARK: - Prototype Stream
 
-    /// Temporary word-by-word renderer. Replace delays with real model streaming later.
     private func streamText() async {
         try? await Task.sleep(nanoseconds: 400_000_000)
         let words = responseWords
@@ -220,7 +434,6 @@ struct StreamingMessageView: View {
         for batchStart in stride(from: 0, to: words.count, by: streamBatchSize) {
             let batchEnd = min(batchStart + streamBatchSize, words.count)
             displayedWords.append(contentsOf: words[batchStart..<batchEnd])
-
             try? await Task.sleep(nanoseconds: streamBatchDelay)
         }
 
@@ -229,26 +442,30 @@ struct StreamingMessageView: View {
             isFinished = true
         }
 
-        // Tell the parent card it can show the next input.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             onFinish?()
         }
     }
-
 }
 
 
 #Preview {
-    ZStack {
-        AquinasTheme.Colors.surface.ignoresSafeArea()
-
-        VStack(alignment: .leading) {
+    ScrollView {
+        VStack(alignment: .leading, spacing: 24) {
             StreamingMessageView(
-                fullText: "The Didache, also known as The Lord's Teaching Through the Twelve Apostles to the Nations, is a brief anonymous early Christian treatise written in Koine Greek."
+                fullText: """
+                This is what an ordered list should look like
+
+                1. First item in the ordered list
+                2. Second item in the ordered list
+                3. Third item in the ordered list
+
+                Then you should be able to type whatever you want after typing an ordered list and still have it all be a part of the same response.
+                """,
+                shouldStream: false
             )
             .padding()
-
-            Spacer()
         }
     }
+    .background(AquinasTheme.Colors.canvas)
 }

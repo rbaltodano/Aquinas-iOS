@@ -386,7 +386,7 @@ struct ConversationCanvasView: View {
     @Binding var sideMenuCurrentTitle: String
     @Binding var sideMenuActiveConversationID: UUID?
     @Binding var requestedConversationID: UUID?
-    /// Increment to create a new blank thread (from "New Chat" in the side menu).
+    /// Increment to create a new blank thread (from "New Conversation" in the side menu).
     @Binding var newConversationRequest: Int
     /// Set to a thread ID to delete it (from the "..." menu in the side menu).
     @Binding var deletedConversationID: UUID?
@@ -397,7 +397,7 @@ struct ConversationCanvasView: View {
     @State private var lastFocusedID: UUID? = nil
     @State private var camScale: CGFloat = 1.0
     @State private var camOffset: CGSize = .zero
-    @State private var canvasSize: CGSize = UIScreen.main.bounds.size
+    @State private var canvasSize: CGSize = CGSize(width: 390, height: 844)
 
     // MARK: Model controls
     @State private var isThinkingEnabled: Bool = false
@@ -520,7 +520,7 @@ struct ConversationCanvasView: View {
             }
         }
         .onChange(of: newConversationRequest) { _, _ in
-            // "New Chat" tapped — add a blank top-level thread and focus it.
+            // "New Conversation" tapped — add a blank top-level thread and focus it.
             let fresh = CanvasThread()
             withAnimation(.spring(response: 0.52, dampingFraction: 0.74)) {
                 threads.append(fresh)
@@ -1183,18 +1183,24 @@ private struct CanvasMapView: View {
     }
 
     private func threadHeaderView(_ thread: CanvasThread) -> some View {
-        VStack(spacing: 8) {
+        let titleText: AttributedString = {
+            var base = AttributedString("What Is ")
+            base.foregroundColor = AquinasTheme.Colors.primaryReadable
+            var title = AttributedString("\(thread.title)?")
+            title.foregroundColor = AquinasTheme.Colors.lightGreen
+            title.inlinePresentationIntent = .emphasized
+            base.append(title)
+            return base
+        }()
+
+        return VStack(spacing: 8) {
             Image("cross-1")
                 .renderingMode(.template)
                 .resizable().scaledToFit()
                 .frame(width: 24, height: 24)
                 .foregroundColor(AquinasTheme.Colors.accent)
 
-            (Text("What Is ")
-                .foregroundColor(AquinasTheme.Colors.primaryReadable)
-             + Text(thread.title + "?")
-                .italic()
-                .foregroundColor(AquinasTheme.Colors.lightGreen))
+            Text(titleText)
                 .font(.custom("LibreBaskerville-Regular", size: 28))
                 .multilineTextAlignment(.center)
         }
@@ -1212,15 +1218,18 @@ private struct CanvasMapView: View {
                     title: concept.word.capitalized,
                     icon: "text.bubble.fill",
                     isFilled: true,
+                    animatesAppearance: false,
                     showRemove: false
                 )
             }
 
-            Text(msg.text)
-                .font(.baskervilleBody)
-                .foregroundColor(AquinasTheme.Colors.primaryReadable)
-                .multilineTextAlignment(.center)
-                .lineSpacing(6)
+            ListAwareTextField(
+                text: .constant(msg.text),
+                font: UIFont(name: "LibreBaskerville-Regular", size: 16) ?? .systemFont(ofSize: 16),
+                isLocked: true,
+                textColor: .aquinasPrimaryReadable,
+                textAlignment: .center
+            )
         }
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 24)

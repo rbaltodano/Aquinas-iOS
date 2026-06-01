@@ -1,0 +1,1153 @@
+//
+//  InquirySideMenu.swift
+//  Aquinas-iOS
+//
+
+import SwiftUI
+
+// MARK: - Side Menu
+
+/// Always-available top-left trigger for the conversation side panel.
+struct SideMenuTriggerButton: View {
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "line.3.horizontal.decrease")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(AquinasTheme.Colors.darkGreen)
+                .sfSymbolDrawOn()
+                .frame(width: 48, height: 48)
+                .background(AquinasTheme.Colors.surface)
+                .clipShape(Circle())
+                .overlay(
+                    Circle()
+                        .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Open side menu")
+    }
+}
+
+/// Top-right control for quickly moving between focused Branch mode and the wider Canvas view.
+struct CanvasModeToggleButton: View {
+    let isActive: Bool
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "flowchart")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(isActive ? AquinasTheme.Colors.surface : AquinasTheme.Colors.lightGreen)
+                .sfSymbolDrawOn()
+                .frame(width: 48, height: 48)
+                .background(isActive ? AquinasTheme.Colors.lightGreen : AquinasTheme.Colors.surface)
+                .clipShape(Circle())
+                .overlay(
+                    Circle()
+                        .stroke(AquinasTheme.Colors.controlBorder, lineWidth: isActive ? 0 : 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(isActive ? "Return to branch view" : "Open canvas view")
+    }
+}
+
+/// Slide-out navigation panel mirrored from Figma's "03 - User Screen Flow" side-panel frames.
+struct AquinasSideMenu: View {
+    let currentTitle: String
+    let conversations: [InquiryConversation]
+    let activeConversationID: UUID?
+    let activePage: AppPage
+    let selectedPersonality: String
+    let isPresented: Bool
+    var onNewChat: () -> Void
+    var onSelectConversation: (InquiryConversation) -> Void
+    var onRenameConversation: (InquiryConversation, String) -> Void
+    var onPinConversation: (InquiryConversation) -> Void
+    var onAddConversationToStudyTopic: (InquiryConversation, UUID) -> Void
+    var onDeleteConversation: (InquiryConversation) -> Void
+    var newInsightsCount: Int = 0
+    var onOpenConversations: () -> Void
+    var onOpenInsights: () -> Void
+    var onOpenStudyTopics: () -> Void
+    var onSelectStudyTopic: (StudyTopic) -> Void = { _ in }
+    var onOpenSettings: () -> Void
+    var onClose: () -> Void
+    @State private var showsTitle = false
+    @State private var showsOpenConversationsTitle = false
+    @State private var conversationBeingRenamed: InquiryConversation? = nil
+    @State private var conversationBeingAddedToStudyTopic: InquiryConversation? = nil
+    @State private var renameDraft = ""
+    @State private var focusedConversationID: UUID? = nil
+    @State private var focusedTopicID: UUID? = nil
+    @State private var sideMenuStudyTopics: [StudyTopic] = []
+    @State private var topicBeingRenamed: StudyTopic? = nil
+    @State private var topicRenameDraft = ""
+
+    var body: some View {
+        GeometryReader { geometry in
+            let topPadding = max(24, geometry.safeAreaInsets.top + 16)
+
+        ZStack(alignment: .bottom) {
+            // ── Scrollable content ──────────────────────────────────────────
+            VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 24) {
+                    Text(createEditorialTitle(
+                        fullText: currentTitle,
+                        keyword: "The Didache?",
+                        fontSize: 28,
+                        baseColor: AquinasTheme.Colors.primaryReadable,
+                        keywordColor: AquinasTheme.Colors.lightGreen
+                    ))
+                        .lineSpacing(8)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .opacity(showsTitle ? 1 : 0)
+                        .offset(x: showsTitle ? 0 : -24)
+
+                    VStack(alignment: .leading, spacing: 24) {
+                        SearchRow(isPresented: isPresented, delay: 0.15)
+
+                        VStack(alignment: .leading, spacing: 0) {
+                            SideMenuRow(icon: "house", title: "Home", isPresented: isPresented, delay: 0.20, action: {})
+                            SideMenuRow(
+                                icon: "bubble.left.and.bubble.right",
+                                title: "Conversations",
+                                isActive: activePage == .openConversations,
+                                isPresented: isPresented,
+                                delay: 0.25,
+                                action: onOpenConversations
+                            )
+                            SideMenuRow(
+                                icon: "brain.head.profile",
+                                title: "Insights",
+                                badge: newInsightsCount,
+                                isActive: activePage == .insights,
+                                isPresented: isPresented,
+                                delay: 0.30,
+                                action: onOpenInsights
+                            )
+                            SideMenuRow(
+                                icon: "text.book.closed",
+                                title: "Study Topics",
+                                isActive: activePage == .studyTopics,
+                                isPresented: isPresented,
+                                delay: 0.35,
+                                action: onOpenStudyTopics
+                            )
+                        }
+                    }
+                }
+
+                FooterDivider(isPresented: isPresented, delay: 0)
+
+                if !sideMenuStudyTopics.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Study Topics")
+                            .font(.custom("Figtree-Bold", size: 18))
+                            .lineSpacing(9)
+                            .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                            .opacity(showsOpenConversationsTitle ? 1 : 0)
+                            .offset(x: showsOpenConversationsTitle ? 0 : -24)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(sideMenuStudyTopics.enumerated()), id: \.element.id) { index, topic in
+                                StudyTopicMenuRow(
+                                    topic: topic,
+                                    isPresented: isPresented,
+                                    delay: 0.20 + (Double(index) * 0.05),
+                                    onSelect: { onSelectStudyTopic(topic) },
+                                    onRename: {
+                                        topicRenameDraft = topic.title
+                                        topicBeingRenamed = topic
+                                    },
+                                    onDelete: {
+                                        deleteTopic(topic)
+                                    },
+                                    onFocusChange: { isOpen in
+                                        focusedTopicID = isOpen ? topic.id : nil
+                                    }
+                                )
+                                .zIndex(focusedTopicID == topic.id ? Double.greatestFiniteMagnitude : 0)
+                            }
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Recents")
+                        .font(.custom("Figtree-Bold", size: 18))
+                        .lineSpacing(9)
+                        .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                        .opacity(showsOpenConversationsTitle ? 1 : 0)
+                        .offset(x: showsOpenConversationsTitle ? 0 : -24)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(conversations.enumerated()), id: \.element.id) { index, conversation in
+                            ConversationMenuRow(
+                                conversation: conversation,
+                                isActive: activePage == .conversation && conversation.id == activeConversationID,
+                                isPresented: isPresented,
+                                delay: 0.20 + (Double(index) * 0.05),
+                                onSelect: {
+                                    onSelectConversation(conversation)
+                                },
+                                onRename: {
+                                    renameDraft = conversation.title
+                                    conversationBeingRenamed = conversation
+                                },
+                                onPin: {
+                                    onPinConversation(conversation)
+                                },
+                                onAddToStudyTopic: {
+                                    conversationBeingAddedToStudyTopic = conversation
+                                },
+                                onDelete: {
+                                    onDeleteConversation(conversation)
+                                },
+                                onFocusChange: { isOpen in
+                                    focusedConversationID = isOpen ? conversation.id : nil
+                                }
+                            )
+                            .zIndex(focusedConversationID == conversation.id ? Double.greatestFiniteMagnitude : 0)
+                        }
+                    }
+                }
+            }
+
+            Spacer(minLength: 0)
+            } // end scrollable content VStack
+            .padding(.horizontal, 24)
+            .padding(.top, topPadding)
+            .padding(.bottom, 88) // reserve space so the last row clears the pinned bar
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            // ── Pinned bottom bar ────────────────────────────────────────────
+            HStack(alignment: .center) {
+                Button(action: onOpenSettings) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 16, weight: .semibold))
+                        .sfSymbolDrawOn()
+                }
+                .accessibilityLabel("Settings")
+                .foregroundColor(AquinasTheme.Colors.primaryReadable)
+
+                Spacer()
+
+                Button(action: onNewChat) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 10, weight: .semibold))
+                            .sfSymbolDrawOn()
+                        Text("New Conversation")
+                            .font(.custom("Figtree-Regular", size: 14))
+                    }
+                    .foregroundColor(AquinasTheme.Colors.canvas)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 16)
+                    .background(AquinasTheme.Colors.secondaryMuted)
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 16)
+            .padding(.bottom, 24)
+            .frame(maxWidth: .infinity)
+            .background(AquinasTheme.Colors.canvasSecondary)
+            .zIndex(2)
+        } // end ZStack
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            // Visual-only shape — does NOT clip children, so popup menus can
+            // extend beyond the panel boundary without being cut off.
+            UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 0, bottomTrailingRadius: 24, topTrailingRadius: 24)
+                .fill(AquinasTheme.Colors.sideMenuSurface)
+                .overlay {
+                    UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 0, bottomTrailingRadius: 24, topTrailingRadius: 24)
+                        .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
+                }
+        }
+        .ignoresSafeArea()
+        .onAppear {
+            sideMenuStudyTopics = StudyTopicStore.load()
+            runTitleEntrance()
+        }
+        .onChange(of: isPresented) { _, newValue in
+            if newValue { sideMenuStudyTopics = StudyTopicStore.load() }
+            runTitleEntrance()
+        }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 18)
+                .onEnded { value in
+                    guard value.translation.width < -60,
+                          abs(value.translation.width) > abs(value.translation.height) else {
+                        return
+                    }
+                    onClose()
+                }
+        )
+        .alert("Rename Conversation", isPresented: renamePromptBinding) {
+            TextField("Conversation name", text: $renameDraft)
+            Button("Cancel", role: .cancel) {
+                conversationBeingRenamed = nil
+                renameDraft = ""
+            }
+            Button("Save") {
+                guard let conversationBeingRenamed else { return }
+                let title = renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !title.isEmpty {
+                    onRenameConversation(conversationBeingRenamed, title)
+                }
+                self.conversationBeingRenamed = nil
+                renameDraft = ""
+            }
+        }
+        .alert("Rename Study Topic", isPresented: topicRenamePromptBinding) {
+            TextField("Topic name", text: $topicRenameDraft)
+            Button("Cancel", role: .cancel) {
+                topicBeingRenamed = nil
+                topicRenameDraft = ""
+            }
+            Button("Save") {
+                guard let topic = topicBeingRenamed else { return }
+                let title = topicRenameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !title.isEmpty {
+                    renameTopic(topic, to: title)
+                }
+                topicBeingRenamed = nil
+                topicRenameDraft = ""
+            }
+        }
+        .sheet(item: $conversationBeingAddedToStudyTopic) { conversation in
+            SideMenuStudyTopicPickerSheet(
+                conversation: conversation,
+                onSelectTopic: { topic in
+                    onAddConversationToStudyTopic(conversation, topic.id)
+                    conversationBeingAddedToStudyTopic = nil
+                }
+            )
+            .presentationDetents([.height(420), .large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(AquinasTheme.Colors.canvas)
+        }
+        }
+    }
+
+    private var renamePromptBinding: Binding<Bool> {
+        Binding(
+            get: { conversationBeingRenamed != nil },
+            set: { isPresented in
+                if !isPresented {
+                    conversationBeingRenamed = nil
+                    renameDraft = ""
+                }
+            }
+        )
+    }
+
+    private var topicRenamePromptBinding: Binding<Bool> {
+        Binding(
+            get: { topicBeingRenamed != nil },
+            set: { isPresented in
+                if !isPresented {
+                    topicBeingRenamed = nil
+                    topicRenameDraft = ""
+                }
+            }
+        )
+    }
+
+    private func renameTopic(_ topic: StudyTopic, to newTitle: String) {
+        if let index = sideMenuStudyTopics.firstIndex(where: { $0.id == topic.id }) {
+            sideMenuStudyTopics[index].title = newTitle
+        }
+        var stored = StudyTopicStore.load()
+        if let index = stored.firstIndex(where: { $0.id == topic.id }) {
+            stored[index].title = newTitle
+            StudyTopicStore.save(stored)
+        }
+    }
+
+    private func deleteTopic(_ topic: StudyTopic) {
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+            sideMenuStudyTopics.removeAll { $0.id == topic.id }
+        }
+        var stored = StudyTopicStore.load()
+        stored.removeAll { $0.id == topic.id }
+        StudyTopicStore.save(stored)
+    }
+
+    private func runTitleEntrance() {
+        showsTitle = false
+        showsOpenConversationsTitle = false
+        guard isPresented else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            withAnimation(.easeOut(duration: 0.32)) {
+                showsTitle = true
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            withAnimation(.easeOut(duration: 0.32)) {
+                showsOpenConversationsTitle = true
+            }
+        }
+    }
+}
+
+private struct SearchRow: View {
+    let isPresented: Bool
+    let delay: TimeInterval
+    @State private var showsIcon = false
+    @State private var showsText = false
+    @State private var showsBackground = false
+    @State private var borderDrawProgress: CGFloat = 0
+    @State private var entranceRunID = UUID()
+
+    var body: some View {
+        HStack(spacing: 24) {
+            Group {
+                if showsIcon {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(AquinasTheme.Colors.lightGreen)
+                        .sfSymbolDrawOn()
+                } else {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 12, weight: .medium))
+                        .hidden()
+                }
+            }
+
+            Text("Search")
+                .font(.custom("LibreBaskerville-Regular", size: 14))
+                .lineSpacing(9)
+                .foregroundColor(AquinasTheme.Colors.placeholderText)
+                .opacity(showsText ? 1 : 0)
+                .offset(x: showsText ? 0 : -10)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(AquinasTheme.Colors.canvas.opacity(showsBackground ? 1 : 0))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .inset(by: 0.5)
+                .trim(from: 0, to: borderDrawProgress)
+                .stroke(AquinasTheme.Colors.sideMenuSearchBorder, lineWidth: 1)
+        )
+        .onAppear(perform: runEntrance)
+        .onChange(of: isPresented) { oldValue, newValue in
+            runEntrance()
+        }
+    }
+
+    private func runEntrance() {
+        let runID = UUID()
+        entranceRunID = runID
+
+        guard isPresented else {
+            withAnimation(.easeIn(duration: 0.30)) {
+                showsIcon = false
+                showsText = false
+                showsBackground = false
+                borderDrawProgress = 0
+            }
+            return
+        }
+
+        showsIcon = false
+        showsText = false
+        showsBackground = false
+        borderDrawProgress = 0
+
+        withAnimation(.easeOut(duration: 0.25)) {
+            showsBackground = true
+        }
+
+        withAnimation(.easeOut(duration: 0.55)) {
+            borderDrawProgress = 1
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard entranceRunID == runID, isPresented else { return }
+            withAnimation(.easeOut(duration: 0.35)) {
+                showsIcon = true
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.025) {
+            guard entranceRunID == runID, isPresented else { return }
+            withAnimation(.easeOut(duration: 0.30)) {
+                showsText = true
+            }
+        }
+    }
+}
+
+private struct SideMenuRow: View {
+    let icon: String
+    let title: String
+    var badge: Int = 0
+    var isActive: Bool = false
+    let isPresented: Bool
+    let delay: TimeInterval
+    var action: () -> Void
+    @State private var showsIcon = false
+    @State private var showsText = false
+    @State private var entranceRunID = UUID()
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 24) {
+                Group {
+                    if showsIcon {
+                        Image(systemName: icon)
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(AquinasTheme.Colors.lightGreen)
+                            .frame(width: 16, height: 16)
+                            .sfSymbolDrawOn()
+                    } else {
+                        Image(systemName: icon)
+                            .font(.system(size: 16, weight: .medium))
+                            .frame(width: 16, height: 16)
+                            .hidden()
+                    }
+                }
+
+                Text(title)
+                    .font(.custom("LibreBaskerville-Regular", size: 14))
+                    .lineSpacing(7)
+                    .foregroundColor(AquinasTheme.Colors.paragraphText)
+                    .opacity(showsText ? 1 : 0)
+                    .offset(x: showsText ? 0 : -10)
+
+                if badge > 0 {
+                    Text("\(badge)")
+                        .font(.custom("Figtree-Bold", size: 12))
+                        .foregroundColor(AquinasTheme.Colors.sideMenuSurface)
+                        .frame(width: 22, height: 22)
+                        .background(AquinasTheme.Colors.lightGreen)
+                        .clipShape(Circle())
+                        .opacity(showsText ? 1 : 0)
+                        .transition(.scale(scale: 0.75).combined(with: .opacity))
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isActive ? AquinasTheme.Colors.systemSelection : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onAppear(perform: runEntrance)
+        .onChange(of: isPresented) { oldValue, newValue in
+            runEntrance()
+        }
+    }
+
+    private func runEntrance() {
+        let runID = UUID()
+        entranceRunID = runID
+
+        guard isPresented else {
+            withAnimation(.easeIn(duration: 0.30)) {
+                showsIcon = false
+                showsText = false
+            }
+            return
+        }
+
+        showsIcon = false
+        showsText = false
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard entranceRunID == runID, isPresented else { return }
+            withAnimation(.easeOut(duration: 0.35)) {
+                showsIcon = true
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.025) {
+            guard entranceRunID == runID, isPresented else { return }
+            withAnimation(.easeOut(duration: 0.30)) {
+                showsText = true
+            }
+        }
+    }
+}
+
+private struct ConversationMenuRow: View {
+    let conversation: InquiryConversation
+    let isActive: Bool
+    let isPresented: Bool
+    let delay: TimeInterval
+    var onSelect: () -> Void
+    var onRename: () -> Void
+    var onPin: () -> Void
+    var onAddToStudyTopic: () -> Void
+    var onDelete: () -> Void
+    /// Called with `true` when the options menu opens and `false` when it closes.
+    var onFocusChange: ((Bool) -> Void)? = nil
+    @State private var isVisible = false
+    @State private var isOptionsMenuOpen = false
+    @State private var isShowingLongPressFeedback = false
+    @State private var entranceRunID = UUID()
+
+    private let longPressDuration: TimeInterval = 0.25
+    private let optionsMenuZIndex: Double = 10_000
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(conversation.title)
+                .font(.custom("LibreBaskerville-Regular", size: 14))
+                .lineSpacing(7)
+                .foregroundColor(AquinasTheme.Colors.paragraphText)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .scaleEffect(isShowingLongPressFeedback ? 1.05 : 1, anchor: .leading)
+
+            if isActive {
+                Button(action: {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
+                        isOptionsMenuOpen.toggle()
+                    }
+                }) {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(AquinasTheme.Colors.paragraphText)
+                        .sfSymbolDrawOn(delay: delay + 0.08)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .padding(11)
+                .contentShape(Rectangle())
+                .padding(-11)
+                .accessibilityLabel("Conversation options")
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isActive ? AquinasTheme.Colors.systemSelection : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .onTapGesture(perform: onSelect)
+        .onLongPressGesture(
+            minimumDuration: longPressDuration,
+            maximumDistance: 18,
+            pressing: { isPressing in
+                updateLongPressFeedback(isPressing)
+            },
+            perform: {
+                openOptionsMenu()
+            }
+        )
+        .opacity(isVisible ? 1 : 0)
+        .offset(x: isVisible ? 0 : -10)
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .trim(from: 0, to: isShowingLongPressFeedback ? 1 : 0)
+                .stroke(
+                    AquinasTheme.Colors.border,
+                    style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round)
+                )
+                .opacity(isShowingLongPressFeedback ? 1 : 0)
+                .padding(1)
+                .allowsHitTesting(false)
+        }
+        .overlay(alignment: .topTrailing) {
+            if isOptionsMenuOpen {
+                ZStack(alignment: .topTrailing) {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .frame(width: 325, height: 700)
+                        .offset(x: 24, y: -260)
+                        .onTapGesture {
+                            closeOptionsMenu()
+                        }
+                        .zIndex(0)
+
+                    ConversationOptionsMenu(
+                        onRename: {
+                            closeOptionsMenu()
+                            onRename()
+                        },
+                        onPin: {
+                            closeOptionsMenu()
+                            onPin()
+                        },
+                        onAddToStudyTopic: {
+                            closeOptionsMenu()
+                            onAddToStudyTopic()
+                        },
+                        onDelete: {
+                            closeOptionsMenu()
+                            onDelete()
+                        }
+                    )
+                    .offset(x: 0, y: 52)
+                    .zIndex(optionsMenuZIndex)
+                }
+                .zIndex(optionsMenuZIndex)
+            }
+        }
+        .onAppear(perform: runEntrance)
+        .onChange(of: isPresented) { oldValue, newValue in
+            isOptionsMenuOpen = false
+            isShowingLongPressFeedback = false
+            runEntrance()
+        }
+        .onChange(of: isOptionsMenuOpen) { _, isOpen in
+            onFocusChange?(isOpen)
+        }
+    }
+
+    private func runEntrance() {
+        let runID = UUID()
+        entranceRunID = runID
+
+        guard isPresented else {
+            withAnimation(.easeIn(duration: 0.30)) {
+                isVisible = false
+            }
+            return
+        }
+
+        isVisible = false
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard entranceRunID == runID, isPresented else { return }
+            withAnimation(.easeOut(duration: 0.30)) {
+                isVisible = true
+            }
+        }
+    }
+
+    private func closeOptionsMenu() {
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
+            isOptionsMenuOpen = false
+        }
+    }
+
+    private func openOptionsMenu() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+
+        withAnimation(.easeOut(duration: 0.12)) {
+            isShowingLongPressFeedback = false
+        }
+
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
+            isOptionsMenuOpen = true
+        }
+    }
+
+    private func updateLongPressFeedback(_ isPressing: Bool) {
+        withAnimation(.linear(duration: isPressing ? longPressDuration : 0.12)) {
+            isShowingLongPressFeedback = isPressing
+        }
+    }
+}
+
+private struct StudyTopicMenuRow: View {
+    let topic: StudyTopic
+    let isPresented: Bool
+    let delay: TimeInterval
+    var onSelect: () -> Void
+    var onRename: () -> Void = {}
+    var onDelete: () -> Void = {}
+    var onFocusChange: ((Bool) -> Void)? = nil
+    @State private var isVisible = false
+    @State private var isOptionsMenuOpen = false
+    @State private var isShowingLongPressFeedback = false
+    @State private var entranceRunID = UUID()
+
+    private let longPressDuration: TimeInterval = 0.25
+    private let optionsMenuZIndex: Double = 10_000
+
+    private var displayTitle: String {
+        let trimmed = topic.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Untitled Study Topic" : trimmed
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "text.book.closed")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundColor(AquinasTheme.Colors.accent)
+                .frame(width: 16, height: 16)
+                .sfSymbolDrawOn()
+
+            Text(displayTitle)
+                .font(.custom("LibreBaskerville-Regular", size: 14))
+                .lineSpacing(7)
+                .foregroundColor(AquinasTheme.Colors.paragraphText)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .scaleEffect(isShowingLongPressFeedback ? 1.05 : 1, anchor: .leading)
+
+            Button(action: {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
+                    isOptionsMenuOpen.toggle()
+                }
+            }) {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(AquinasTheme.Colors.paragraphText)
+                    .sfSymbolDrawOn(delay: delay + 0.08)
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .padding(11)
+            .contentShape(Rectangle())
+            .padding(-11)
+            .accessibilityLabel("Topic options")
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .onTapGesture(perform: onSelect)
+        .onLongPressGesture(
+            minimumDuration: longPressDuration,
+            maximumDistance: 18,
+            pressing: { isPressing in updateLongPressFeedback(isPressing) },
+            perform: { openOptionsMenu() }
+        )
+        .opacity(isVisible ? 1 : 0)
+        .offset(x: isVisible ? 0 : -10)
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .trim(from: 0, to: isShowingLongPressFeedback ? 1 : 0)
+                .stroke(
+                    AquinasTheme.Colors.border,
+                    style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round)
+                )
+                .opacity(isShowingLongPressFeedback ? 1 : 0)
+                .padding(1)
+                .allowsHitTesting(false)
+        }
+        .overlay(alignment: .topTrailing) {
+            if isOptionsMenuOpen {
+                ZStack(alignment: .topTrailing) {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .frame(width: 325, height: 700)
+                        .offset(x: 24, y: -260)
+                        .onTapGesture { closeOptionsMenu() }
+                        .zIndex(0)
+
+                    ConversationOptionsMenu(
+                        onRename: {
+                            closeOptionsMenu()
+                            onRename()
+                        },
+                        onPin: { closeOptionsMenu() },
+                        onDelete: {
+                            closeOptionsMenu()
+                            onDelete()
+                        },
+                        showAddToStudyTopic: false
+                    )
+                    .offset(x: 0, y: 52)
+                    .zIndex(optionsMenuZIndex)
+                }
+                .zIndex(optionsMenuZIndex)
+            }
+        }
+        .onChange(of: isOptionsMenuOpen) { _, isOpen in
+            onFocusChange?(isOpen)
+        }
+        .onAppear(perform: runEntrance)
+        .onChange(of: isPresented) { _, newValue in
+            isOptionsMenuOpen = false
+            isShowingLongPressFeedback = false
+            runEntrance()
+        }
+        .zIndex(isOptionsMenuOpen ? optionsMenuZIndex : 0)
+    }
+
+    private func closeOptionsMenu() {
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
+            isOptionsMenuOpen = false
+        }
+    }
+
+    private func openOptionsMenu() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        withAnimation(.easeOut(duration: 0.12)) { isShowingLongPressFeedback = false }
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) { isOptionsMenuOpen = true }
+    }
+
+    private func updateLongPressFeedback(_ isPressing: Bool) {
+        withAnimation(.linear(duration: isPressing ? longPressDuration : 0.12)) {
+            isShowingLongPressFeedback = isPressing
+        }
+    }
+
+    private func runEntrance() {
+        let runID = UUID()
+        entranceRunID = runID
+        guard isPresented else {
+            withAnimation(.easeIn(duration: 0.30)) { isVisible = false }
+            return
+        }
+        isVisible = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard entranceRunID == runID, isPresented else { return }
+            withAnimation(.easeOut(duration: 0.30)) { isVisible = true }
+        }
+    }
+}
+
+struct ConversationOptionsMenu: View {
+    var onRename: () -> Void
+    var onPin: () -> Void
+    var onAddToStudyTopic: () -> Void = {}
+    var onDelete: () -> Void
+    /// Pass `false` when showing the menu on a study topic card itself,
+    /// where "Add to Study Topic" doesn't apply.
+    var showAddToStudyTopic: Bool = true
+    /// Pass `true` on a study-topic detail header to expose Upload Image / Upload File rows.
+    var showUploadOptions: Bool = false
+    var onUploadImage: () -> Void = {}
+    var onUploadFile: () -> Void = {}
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            MenuOptionRow(icon: "pencil",      title: "Rename",             delay: 0,    action: onRename)
+            MenuOptionRow(icon: "pin",         title: "Pin",                delay: 0.05, action: onPin)
+            if showAddToStudyTopic {
+                MenuOptionRow(icon: "book.closed", title: "Add to Study Topic", delay: 0.10, action: onAddToStudyTopic)
+            }
+            if showUploadOptions {
+                MenuOptionRow(icon: "photo",   title: "Upload Image",       delay: showAddToStudyTopic ? 0.15 : 0.10, action: onUploadImage)
+                MenuOptionRow(icon: "doc",     title: "Upload File",        delay: showAddToStudyTopic ? 0.20 : 0.15, action: onUploadFile)
+            }
+            MenuOptionRow(icon: "trash",       title: "Delete",             delay: deleteDelay, action: onDelete)
+        }
+        .menuPanelStyle(anchor: .topTrailing)
+    }
+
+    private var deleteDelay: Double {
+        var d = 0.10
+        if showAddToStudyTopic { d += 0.05 }
+        if showUploadOptions   { d += 0.10 }
+        return d
+    }
+}
+
+private struct SideMenuStudyTopicPickerSheet: View {
+    let conversation: InquiryConversation
+    var onSelectTopic: (StudyTopic) -> Void
+
+    @State private var searchText = ""
+    @State private var topics: [StudyTopic] = []
+
+    private var normalizedSearchText: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private var filteredTopics: [StudyTopic] {
+        topics.filter { topic in
+            guard !normalizedSearchText.isEmpty else { return true }
+            return [displayTitle(for: topic), topic.description]
+                .joined(separator: " ")
+                .lowercased()
+                .contains(normalizedSearchText)
+        }
+    }
+
+    var body: some View {
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Add to Study Topic")
+                    .font(.custom("LibreBaskerville-Regular", size: 24))
+                    .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.top, 28)
+
+                Text(conversation.title)
+                    .font(.custom("Figtree-Regular", size: 14))
+                    .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.5))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.top, 8)
+
+                StudyTopicsSearchField(searchText: $searchText)
+                    .padding(.top, 24)
+
+                if topics.isEmpty {
+                    // No topics exist at all — offer to create one.
+                    VStack(spacing: 0) {
+                        Button(action: createStudyTopic) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 12, weight: .bold))
+                                    .sfSymbolDrawOn()
+                                Text("New Study Topic")
+                                    .font(.custom("Figtree-Regular", size: 14))
+                            }
+                            .foregroundColor(AquinasTheme.Colors.canvas)
+                            .padding(.horizontal, 22)
+                            .frame(height: 52)
+                            .background(AquinasTheme.Colors.secondaryMuted)
+                            .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .shadow(color: AquinasTheme.Colors.dropShadow.opacity(0.16), radius: 16, x: 0, y: 10)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 48)
+                } else if filteredTopics.isEmpty {
+                    Text("No matching study topics.")
+                        .font(.custom("Figtree-Regular", size: 14))
+                        .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.5))
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 48)
+                } else {
+                    LazyVStack(spacing: 16) {
+                        ForEach(filteredTopics) { topic in
+                            SideMenuStudyTopicPickerCard(
+                                topic: topic,
+                                onSelect: { onSelectTopic(topic) }
+                            )
+                        }
+                    }
+                    .padding(.top, 32)
+                }
+
+                Color.clear.frame(height: 32)
+            }
+            .padding(.horizontal, 24)
+        }
+        .background(AquinasTheme.Colors.canvas)
+        .onAppear {
+            topics = StudyTopicStore.load()
+        }
+    }
+
+    private func createStudyTopic() {
+        let topic = StudyTopic()
+        topics.insert(topic, at: 0)
+        StudyTopicStore.save(topics)
+    }
+
+    private func displayTitle(for topic: StudyTopic) -> String {
+        let trimmed = topic.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Untitled Study Topic" : trimmed
+    }
+}
+
+private struct SideMenuStudyTopicPickerCard: View {
+    let topic: StudyTopic
+    var onSelect: () -> Void
+
+    private var displayTitle: String {
+        let trimmed = topic.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Untitled Study Topic" : trimmed
+    }
+
+    private var displayDescription: String {
+        topic.description.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(displayTitle)
+                .font(.custom("LibreBaskerville-Regular", size: 18))
+                .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !displayDescription.isEmpty {
+                Text(displayDescription)
+                    .font(.custom("Figtree-Regular", size: 14))
+                    .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+                    .lineSpacing(4)
+                    .lineLimit(3)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(AquinasTheme.Colors.componentBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .onTapGesture(perform: onSelect)
+    }
+}
+
+private struct FooterDivider: View {
+    let isPresented: Bool
+    let delay: TimeInterval
+    @State private var showsDivider = false
+    @State private var entranceRunID = UUID()
+
+    var body: some View {
+        HStack(spacing: 16) {
+            Rectangle()
+                .fill(AquinasTheme.Colors.controlBorder)
+                .frame(height: 1)
+                .scaleEffect(x: showsDivider ? 1 : 0.75, y: 1, anchor: .trailing)
+                .opacity(showsDivider ? 1 : 0)
+
+            Image("cross-1")
+                .renderingMode(.template)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 16, height: 16)
+                .foregroundColor(AquinasTheme.Colors.accent)
+                .rotationEffect(.degrees(showsDivider ? 0 : -45))
+                .opacity(showsDivider ? 1 : 0)
+
+            Rectangle()
+                .fill(AquinasTheme.Colors.controlBorder)
+                .frame(height: 1)
+                .scaleEffect(x: showsDivider ? 1 : 0.75, y: 1, anchor: .leading)
+                .opacity(showsDivider ? 1 : 0)
+        }
+        .onAppear(perform: runEntrance)
+        .onChange(of: isPresented) { oldValue, newValue in
+            runEntrance()
+        }
+    }
+
+    private func runEntrance() {
+        let runID = UUID()
+        entranceRunID = runID
+
+        guard isPresented else {
+            withAnimation(.easeIn(duration: 0.30)) {
+                showsDivider = false
+            }
+            return
+        }
+
+        showsDivider = false
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard entranceRunID == runID, isPresented else { return }
+            withAnimation(.easeOut(duration: 0.35)) {
+                showsDivider = true
+            }
+        }
+    }
+}

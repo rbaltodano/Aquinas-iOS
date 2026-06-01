@@ -47,11 +47,28 @@ struct ChatBranch: Identifiable, Codable, Equatable {
 struct InquiryConversation: Identifiable, Codable, Equatable {
     let id: UUID
     var title: String = "New Conversation"
+    /// `true` for conversations that act as study topic containers.
+    /// Study topics are distinct from regular conversations — they don't
+    /// appear in Open Conversations and their detail view lists child
+    /// conversations tagged with `studyTopicID`.
+    /// Defaults to `false` so existing persisted data deserialises safely.
+    var isStudyTopic: Bool = false
+    /// Non-nil when this conversation lives inside a study topic.
+    /// The value is the `id` of the parent topic (`InquiryConversation`).
+    var studyTopicID: UUID? = nil
     var branches: [ChatBranch] = [ChatBranch(startingConcept: nil)]
 
-    init(id: UUID = UUID(), title: String = "New Conversation", branches: [ChatBranch] = [ChatBranch(startingConcept: nil)]) {
+    init(
+        id: UUID = UUID(),
+        title: String = "New Conversation",
+        isStudyTopic: Bool = false,
+        studyTopicID: UUID? = nil,
+        branches: [ChatBranch] = [ChatBranch(startingConcept: nil)]
+    ) {
         self.id = id
         self.title = title
+        self.isStudyTopic = isStudyTopic
+        self.studyTopicID = studyTopicID
         self.branches = branches
     }
 }

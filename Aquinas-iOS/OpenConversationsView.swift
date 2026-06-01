@@ -20,6 +20,7 @@ struct OpenConversationsView: View {
     @State private var activeInsight: ConceptDefinition? = nil
     @State private var conversationBeingRenamed: InquiryConversation? = nil
     @State private var renameDraft = ""
+    @State private var focusedCardID: UUID? = nil
 
     private var normalizedSearchText: String {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -61,6 +62,9 @@ struct OpenConversationsView: View {
                                     onRename: { conversation in
                                         renameDraft = conversation.title
                                         conversationBeingRenamed = conversation
+                                    },
+                                    onMenuFocusChange: { isOpen in
+                                        focusedCardID = isOpen ? conversation.id : nil
                                     }
                                 )
                                 .transition(
@@ -69,6 +73,7 @@ struct OpenConversationsView: View {
                                         removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .top))
                                     )
                                 )
+                                .zIndex(focusedCardID == conversation.id ? Double.greatestFiniteMagnitude : 0)
                             }
                         }
                     }
@@ -83,7 +88,7 @@ struct OpenConversationsView: View {
             // Sticky side-menu trigger — floats above the scroll content.
             VStack {
                 HStack {
-                    SideMenuTriggerButton(action: onOpenMenu)
+                    AquinasNavButton(onMenuTap: onOpenMenu)
                     Spacer()
                 }
                 .padding(.horizontal, 24)
@@ -100,7 +105,7 @@ struct OpenConversationsView: View {
                         .font(.system(size: 12, weight: .bold))
                         .sfSymbolDrawOn()
 
-                    Text("New Chat")
+                    Text("New Conversation")
                         .font(.custom("Figtree-Regular", size: 14))
                 }
                 .foregroundColor(AquinasTheme.Colors.canvas)
@@ -258,7 +263,7 @@ private struct OpenConversationsSearchField: View {
     }
 }
 
-private struct OpenConversationCard: View {
+struct OpenConversationCard: View {
     let conversation: InquiryConversation
     let isActive: Bool
     let latestAnswer: String
@@ -266,9 +271,17 @@ private struct OpenConversationCard: View {
     var onSelect: () -> Void
     var onOpenInsight: (ConceptDefinition) -> Void
     var onRename: (InquiryConversation) -> Void
+    /// Called with `true` when the options menu opens and `false` when it closes.
+    var onMenuFocusChange: ((Bool) -> Void)? = nil
+    /// When provided the card skips its own internal menu and delegates to the
+    /// parent instead — use this inside containers where the card's overflow
+    /// can't escape the local stacking context (e.g. a LazyVStack in a ZStack).
+    var onMenuOpen: (() -> Void)? = nil
 
     @State private var isExpanded = false
     @State private var isOptionsMenuOpen = false
+
+    private let optionsMenuZIndex: Double = 10_000
 
     private var visibleInsights: [ConceptDefinition] {
         isExpanded ? insights : Array(insights.prefix(3))
@@ -286,8 +299,12 @@ private struct OpenConversationCard: View {
                 Spacer(minLength: 8)
 
                 Button(action: {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-                        isOptionsMenuOpen.toggle()
+                    if let onMenuOpen {
+                        onMenuOpen()
+                    } else {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
+                            isOptionsMenuOpen.toggle()
+                        }
                     }
                 }) {
                     Image(systemName: "ellipsis")
@@ -296,6 +313,9 @@ private struct OpenConversationCard: View {
                         .frame(width: 22, height: 22)
                 }
                 .buttonStyle(.plain)
+                .padding(11)
+                .contentShape(Rectangle())
+                .padding(-11)
                 .accessibilityLabel("Conversation options")
             }
 
@@ -352,16 +372,18 @@ private struct OpenConversationCard: View {
         )
         .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .onTapGesture(perform: onSelect)
+        .onChange(of: isOptionsMenuOpen) { _, isOpen in
+            onMenuFocusChange?(isOpen)
+        }
+        // Only render the internal overlay when no external menu handler is set.
         .overlay(alignment: .topTrailing) {
-            if isOptionsMenuOpen {
+            if onMenuOpen == nil && isOptionsMenuOpen {
                 ZStack(alignment: .topTrailing) {
                     Color.clear
                         .contentShape(Rectangle())
                         .frame(width: 345, height: 700)
                         .offset(x: 24, y: -260)
-                        .onTapGesture {
-                            closeOptionsMenu()
-                        }
+                        .onTapGesture { closeOptionsMenu() }
                         .zIndex(0)
 
                     ConversationOptionsMenu(
@@ -369,20 +391,16 @@ private struct OpenConversationCard: View {
                             closeOptionsMenu()
                             onRename(conversation)
                         },
-                        onPin: {
-                            closeOptionsMenu()
-                        },
-                        onDelete: {
-                            closeOptionsMenu()
-                        }
+                        onPin: { closeOptionsMenu() },
+                        onDelete: { closeOptionsMenu() }
                     )
                     .offset(x: -24, y: 52)
-                    .zIndex(1)
+                    .zIndex(optionsMenuZIndex)
                 }
-                .zIndex(120)
+                .zIndex(optionsMenuZIndex)
             }
         }
-        .zIndex(isOptionsMenuOpen ? 120 : 0)
+        .zIndex(isOptionsMenuOpen ? optionsMenuZIndex : 0)
     }
 
     private func closeOptionsMenu() {
@@ -392,7 +410,7 @@ private struct OpenConversationCard: View {
     }
 }
 
-private struct InsightLine: View {
+struct InsightLine: View {
     let word: String
 
     var body: some View {

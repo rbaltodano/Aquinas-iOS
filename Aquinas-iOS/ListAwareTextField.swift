@@ -1,0 +1,267 @@
+//
+//  ListAwareTextField.swift
+//  Aquinas-iOS
+//
+//  Created by Ryan on 5/25/26.
+//
+
+import Foundation
+import SwiftUI
+import UIKit
+
+// MARK: - TextInputRelay
+
+/// A lightweight reference-type bridge that lets submit logic synchronously read
+/// the UITextView's current text without requiring per-keystroke binding writes.
+/// Assign a `TextInputRelay` instance to `ListAwareTextField.relay`; call
+/// `relay.currentText()` just before submitting to get the latest typed value.
+final class TextInputRelay {
+    var currentText: () -> String = { "" }
+}
+
+// MARK: - ListAwareTextField
+
+/// A UITextView-backed text input that:
+/// 1. Does NOT write to the SwiftUI binding on every keystroke — text stays in the
+///    UITextView's own buffer, so `onChange(of: activeBranches)` never fires while
+///    typing (eliminating the primary source of typing lag).
+/// 2. Intercepts the Return key (via UITextViewDelegate.shouldChangeTextIn) to
+///    auto-continue ordered lists ("1. ") and unordered lists ("- ") at UIKit speed,
+///    with zero SwiftUI overhead.
+/// 3. Flushes text → binding when `submitTrigger` increments (the dock arrow button).
+/// 4. Flushes text → binding on blur (textViewDidEndEditing).
+struct ListAwareTextField: UIViewRepresentable {
+
+    // MARK: - Public API
+
+    @Binding var text: String
+    var placeholder: String = ""
+    var font: UIFont = UIFont(name: "LibreBaskerville-Regular", size: 16) ?? .systemFont(ofSize: 16)
+    var isLocked: Bool = false
+    var textColor: UIColor = .aquinasPrimaryReadable
+    var textAlignment: NSTextAlignment = .natural
+    var onFocusChange: (Bool) -> Void = { _ in }
+    /// Optional relay that exposes the UITextView's live text for synchronous
+    /// reads at submit time (avoids per-keystroke binding writes).
+    var relay: TextInputRelay? = nil
+    /// Called every time the text changes (for placeholder visibility etc.).
+    var onTextChange: ((String) -> Void)? = nil
+
+    // MARK: - UIViewRepresentable
+
+    func makeUIView(context: Context) -> UITextView {
+        let tv = UITextView()
+        tv.delegate = context.coordinator
+        tv.font = font
+        tv.textColor = textColor
+        tv.textAlignment = textAlignment
+        tv.backgroundColor = .clear
+        tv.isScrollEnabled = false
+        tv.showsVerticalScrollIndicator = false
+        tv.showsHorizontalScrollIndicator = false
+        tv.textContainerInset = .zero
+        tv.textContainer.lineFragmentPadding = 0
+        tv.autocorrectionType = .yes
+        tv.autocapitalizationType = .sentences
+        tv.returnKeyType = .default     // "return" label on keyboard
+        tv.text = text.isEmpty ? nil : text
+        // Allow SwiftUI to compress the view horizontally — without this the
+        // UITextView demands its ideal (unbounded) width and stretches the layout.
+        tv.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        tv.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        // Wire the relay so callers can read live text synchronously at submit time.
+        relay?.currentText = { [weak tv] in tv?.text ?? "" }
+        return tv
+    }
+
+    /// Tell SwiftUI exactly how tall the view needs to be for the available width.
+    /// Without this, SwiftUI never constrains the width and the text never wraps.
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
+        let width = proposal.width ?? uiView.bounds.width
+        guard width > 0 else { return nil }
+        let fittingSize = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+        return CGSize(width: width, height: max(fittingSize.height, uiView.font?.lineHeight ?? 20))
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        // Keep coordinator's parent reference current every render.
+        context.coordinator.parent = self
+
+        // Always safe to update visual properties
+        if uiView.font != font { uiView.font = font }
+        if uiView.textColor != textColor { uiView.textColor = textColor }
+        // iOS can restore a system background on trait-collection changes; keep it clear
+        // so the SwiftUI placeholder Text in the parent ZStack always shows through.
+        if uiView.backgroundColor != .clear { uiView.backgroundColor = .clear }
+        if uiView.textAlignment != textAlignment { uiView.textAlignment = textAlignment }
+        if uiView.isEditable == isLocked {
+            uiView.isEditable   = !isLocked
+            uiView.isSelectable = !isLocked
+        }
+
+        // Sync binding → UITextView only when NOT focused.
+        // While focused the UITextView is authoritative (textViewDidChange
+        // writes every keystroke to the binding directly).
+        if !uiView.isFirstResponder {
+            let bindingText = text
+            if (uiView.text ?? "") != bindingText {
+                uiView.text = bindingText.isEmpty ? nil : bindingText
+            }
+        }
+        // Refresh relay so it always points at the live UITextView.
+        relay?.currentText = { [weak uiView] in uiView?.text ?? "" }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    // MARK: - Coordinator
+
+    class Coordinator: NSObject, UITextViewDelegate {
+        var parent: ListAwareTextField
+
+        // Compiled once per Coordinator instance (effectively once per field lifetime)
+        private let orderedListPattern  = try! NSRegularExpression(pattern: #"^(\d+)\.\s+\S"#)
+        private let orderedEmptyPattern = try! NSRegularExpression(pattern: #"^(\d+)\.\s*$"#)
+        private let unorderedListPattern  = try! NSRegularExpression(pattern: #"^-\s+\S"#)
+        private let unorderedEmptyPattern = try! NSRegularExpression(pattern: #"^-\s*$"#)
+
+        init(parent: ListAwareTextField) {
+            self.parent = parent
+        }
+
+        // MARK: - Return-key list interception
+
+        func textView(_ tv: UITextView, shouldChangeTextIn range: NSRange, replacementText text: String) -> Bool {
+            guard text == "\n" else { return true }
+            guard let fullText = tv.text else { return true }
+
+            let nsText = fullText as NSString
+            let cursorPos = range.location
+
+            // Find the current line (from its start up to the cursor)
+            let lineRange = nsText.lineRange(for: NSRange(location: cursorPos, length: 0))
+            let lineEnd = min(cursorPos, lineRange.location + lineRange.length)
+            let currentLine = nsText.substring(with: NSRange(location: lineRange.location,
+                                                              length: lineEnd - lineRange.location))
+
+            let fullRange = NSRange(currentLine.startIndex..., in: currentLine)
+
+            // ── Ordered list ──────────────────────────────────────────────────
+            if let m = orderedListPattern.firstMatch(in: currentLine, range: fullRange),
+               let numRange = Range(m.range(at: 1), in: currentLine),
+               let num = Int(currentLine[numRange]) {
+                let insertion = "\n\(num + 1). "
+                insertText(tv, in: range, text: insertion)
+                return false
+            }
+
+            // ── Ordered empty item (exit list) ────────────────────────────────
+            if orderedEmptyPattern.firstMatch(in: currentLine, range: fullRange) != nil {
+                // Strip "N. " from the current line up to cursor, insert plain newline
+                let strippedPrefixLen = lineEnd - lineRange.location
+                let stripRange = NSRange(location: lineRange.location, length: strippedPrefixLen)
+                replaceText(tv, in: stripRange, with: "")
+                return false
+            }
+
+            // ── Unordered list ────────────────────────────────────────────────
+            if unorderedListPattern.firstMatch(in: currentLine, range: fullRange) != nil {
+                insertText(tv, in: range, text: "\n- ")
+                return false
+            }
+
+            // ── Unordered empty item (exit list) ──────────────────────────────
+            if unorderedEmptyPattern.firstMatch(in: currentLine, range: fullRange) != nil {
+                let stripRange = NSRange(location: lineRange.location, length: lineEnd - lineRange.location)
+                replaceText(tv, in: stripRange, with: "\n")
+                return false
+            }
+
+            return true
+        }
+
+        // MARK: - Helpers
+
+        private func insertText(_ tv: UITextView, in range: NSRange, text: String) {
+            guard let textRange = tv.textRange(from: range, in: tv) else {
+                // Fallback: just append
+                tv.insertText(text)
+                return
+            }
+            tv.replace(textRange, withText: text)
+            notifyChange(tv)
+        }
+
+        private func replaceText(_ tv: UITextView, in range: NSRange, with text: String) {
+            guard let textRange = tv.textRange(from: range, in: tv) else { return }
+            tv.replace(textRange, withText: text)
+            notifyChange(tv)
+        }
+
+        private func notifyChange(_ tv: UITextView) {
+            parent.onTextChange?(tv.text ?? "")
+        }
+
+        // MARK: - UITextViewDelegate
+
+        func textViewDidChange(_ tv: UITextView) {
+            let current = tv.text ?? ""
+            // Do NOT write to parent.text here — doing so mutates activeBranches on
+            // every keystroke, which triggers an ActiveInquiryView re-render, which
+            // re-creates every StreamingMessageView (parseSegments + regex) per character.
+            // Text is flushed to the binding in textViewDidEndEditing (blur) and via
+            // the relay at submit time, so nothing is lost.
+            parent.onTextChange?(current)
+            // Invalidate SwiftUI's size cache so sizeThatFits is re-evaluated
+            // and the view grows/shrinks vertically as lines wrap.
+            tv.invalidateIntrinsicContentSize()
+        }
+
+        func textViewDidEndEditing(_ tv: UITextView) {
+            // Flush once when focus leaves
+            parent.text = tv.text ?? ""
+            parent.onFocusChange(false)
+        }
+
+        func textViewDidBeginEditing(_ tv: UITextView) {
+            parent.onFocusChange(true)
+        }
+    }
+}
+
+// MARK: - Convenience extensions for Aquinas types
+
+extension ConversationFontOption {
+    var uiFont: UIFont {
+        uiFont(size: .large)
+    }
+
+    func uiFont(size: ConversationFontSizeOption) -> UIFont {
+        switch self {
+        case .serif:
+            return UIFont(name: "LibreBaskerville-Regular", size: size.pointSize) ?? .systemFont(ofSize: size.pointSize)
+        case .sans:
+            return UIFont(name: "Figtree-Regular", size: size.pointSize) ?? .systemFont(ofSize: size.pointSize)
+        }
+    }
+}
+
+extension InputTextAlignmentOption {
+    var nsTextAlignment: NSTextAlignment {
+        switch self {
+        case .center: return .center
+        case .left:   return .natural
+        }
+    }
+}
+
+// MARK: - NSRange ↔ UITextRange helper
+
+private extension UITextView {
+    /// Converts an NSRange in the text view's string to a UITextRange.
+    func textRange(from nsRange: NSRange, in textView: UITextView) -> UITextRange? {
+        guard let start = textView.position(from: textView.beginningOfDocument, offset: nsRange.location),
+              let end   = textView.position(from: start, offset: nsRange.length) else { return nil }
+        return textView.textRange(from: start, to: end)
+    }
+}

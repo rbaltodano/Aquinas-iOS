@@ -180,6 +180,8 @@ struct InsightLibraryCard: View {
     var onToggleSaved: () -> Void
     @State private var isConfirmingUnbookmark = false
 
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .center, spacing: 8) {
@@ -190,7 +192,7 @@ struct InsightLibraryCard: View {
 
                 Text(insight.word.capitalized)
                     .font(.custom("Figtree-Bold", size: 18))
-                    .foregroundColor(AquinasTheme.Colors.darkGreen)
+                    .foregroundColor(AquinasTheme.Colors.primaryReadable)
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
 
@@ -200,6 +202,8 @@ struct InsightLibraryCard: View {
                     isSaved: isSaved,
                     canQuote: true,
                     canFork: true,
+                    tintColor: AquinasTheme.Colors.placeholderText,
+                    saveTintColor: AquinasTheme.Colors.accentRed,
                     onSave: handleSaveTapped,
                     onQuote: onQuote,
                     onFork: onFork
@@ -209,18 +213,18 @@ struct InsightLibraryCard: View {
             Text(insight.meaning)
                 .font(.figtreeParagraph)
                 .lineSpacing(12)
-                .foregroundColor(AquinasTheme.Colors.bodyText)
+                .foregroundColor(AquinasTheme.Colors.paragraphText)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.horizontal, 28)
-        .padding(.vertical, 34)
+        .padding(24)
         .frame(maxWidth: maxWidth)
-        .background(AquinasTheme.Colors.componentBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .background(AquinasTheme.Colors.canvas)
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 28, style: .continuous)
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
                 .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
         )
+        .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 16)
         .alert("Remove bookmark?", isPresented: $isConfirmingUnbookmark) {
             Button("Cancel", role: .cancel) {}
             Button("Remove", role: .destructive) {

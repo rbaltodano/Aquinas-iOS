@@ -375,6 +375,7 @@ private struct BranchMapPreviewView: View {
     let labelOpacity: Double
     let questionOpacity: Double
     let responseTitleOpacity: Double
+    @Environment(\.colorScheme) private var colorScheme
 
     private var previewBlocks: ArraySlice<ChatBlock> { branch.activeChatBlocks.prefix(5) }
 
@@ -433,7 +434,7 @@ private struct BranchMapPreviewView: View {
     private func contextChip(title: String, icon: String) -> some View {
         HStack(spacing: 8) {
             Image(systemName: icon).font(.system(size: 12, weight: .semibold))
-            Text(title).font(.baskervilleSmall).lineLimit(1)
+            Text(title).font(.figtreeChipLabel).lineLimit(1)
         }
         .foregroundColor(AquinasTheme.Colors.darkGreen)
         .padding(.horizontal, 20).padding(.vertical, 16)
@@ -449,7 +450,7 @@ private struct BranchMapPreviewView: View {
             .font(.custom("LibreBaskerville-Regular", size: 16))
             .foregroundColor(submitted
                              ? AquinasTheme.Colors.primaryReadable
-                             : AquinasTheme.Colors.placeholderText)
+                             : (colorScheme == .dark ? Color(hex: 0xFFFAF0, alpha: 0.50) : Color(hex: 0x4A321C, alpha: 0.50)))
             .lineLimit(lineLimit).multilineTextAlignment(.center).padding(.horizontal, 26)
     }
 
@@ -509,7 +510,7 @@ private struct BranchMapPreviewView: View {
                     Image(systemName: "text.bubble.fill")
                     Text(concept.word.capitalized)
                 }
-                .font(.baskervilleSmall)
+                .font(.figtreeChipLabel)
                 .foregroundColor(AquinasTheme.Colors.darkGreen).lineLimit(1)
                 .opacity(labelOpacity)
             }
@@ -560,7 +561,7 @@ private struct BranchIconPreviewView: View {
                 HStack(spacing: 8) {
                     Image(systemName: contextIcon); Text(ctx)
                 }
-                .font(.baskervilleSmall).foregroundColor(AquinasTheme.Colors.darkGreen)
+                .font(.figtreeChipLabel).foregroundColor(AquinasTheme.Colors.darkGreen)
                 .lineLimit(1).padding(.horizontal, 16).padding(.vertical, 12)
                 .background(AquinasTheme.Colors.canvas)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
