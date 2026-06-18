@@ -5,6 +5,7 @@
 
 import Combine
 import CoreGraphics
+import CryptoKit
 import Foundation
 import NaturalLanguage
 import SpriteKit
@@ -21,10 +22,13 @@ final class InsightTreeViewModel: ObservableObject {
 
     let scene: InsightTreeScene
     private var insights: [InsightModel]
+    private var promotedInsightIDs: [UUID]
+    private var renderedNodeIDs: Set<UUID> = []
     private let positionStoreKey = "aquinas.insight-tree.positions.v1"
 
-    init(insights: [ConceptDefinition]) {
+    init(insights: [ConceptDefinition], promotedInsightIDs: [UUID] = []) {
         self.insights = insights.map { InsightModel(concept: $0) }
+        self.promotedInsightIDs = promotedInsightIDs
         scene = InsightTreeScene(size: CGSize(width: 390, height: 844))
         scene.scaleMode = .resizeFill
         scene.backgroundColor = UIColor(AquinasTheme.Colors.canvas)
@@ -38,8 +42,11 @@ final class InsightTreeViewModel: ObservableObject {
         rebuildTree()
     }
 
-    func updateInsights(_ concepts: [ConceptDefinition]) {
+    func updateInsights(_ concepts: [ConceptDefinition], promotedInsightIDs: [UUID]? = nil) {
         insights = concepts.map { InsightModel(concept: $0) }
+        if let promotedInsightIDs {
+            self.promotedInsightIDs = promotedInsightIDs
+        }
         rebuildTree()
     }
 
@@ -143,11 +150,15 @@ final class InsightTreeViewModel: ObservableObject {
         insights = embeddedInsights
 
         guard embeddedInsights.count >= 5 else {
+            let nextNodes = makeEarlyNodes(from: embeddedInsights)
+            let nextIDs = Set(nextNodes.map(\.id))
+            let hasNew = !nextIDs.isSubset(of: renderedNodeIDs)
+            renderedNodeIDs = nextIDs
             withAnimation(.spring(response: 0.55, dampingFraction: 0.78)) {
-                nodes = makeEarlyNodes(from: embeddedInsights)
+                nodes = nextNodes
                 edges = []
             }
-            scene.render(nodes: nodes, edges: edges, animated: true)
+            scene.render(nodes: nodes, edges: edges, animated: hasNew)
             return
         }
 
@@ -188,11 +199,16 @@ final class InsightTreeViewModel: ObservableObject {
             persistPositions(nextNodes)
         }
 
+        appendPromotedNodes(to: &nextNodes, edges: &nextEdges, from: embeddedInsights)
+
+        let nextIDs = Set(nextNodes.map(\.id))
+        let hasNew = !nextIDs.isSubset(of: renderedNodeIDs)
+        renderedNodeIDs = nextIDs
         withAnimation(.spring(response: 0.55, dampingFraction: 0.78)) {
             nodes = nextNodes
             edges = nextEdges
         }
-        scene.render(nodes: nodes, edges: edges, animated: true)
+        scene.render(nodes: nodes, edges: edges, animated: hasNew)
     }
 
     private func makeEarlyNodes(from insights: [InsightModel]) -> [NodeModel] {
@@ -226,6 +242,68 @@ final class InsightTreeViewModel: ObservableObject {
         }
 
         return grouped.values.sorted { $0.count > $1.count }
+    }
+
+    private func appendPromotedNodes(
+        to nodes: inout [NodeModel],
+        edges: inout [EdgeModel],
+        from embeddedInsights: [InsightModel]
+    ) {
+        guard !promotedInsightIDs.isEmpty else { return }
+
+        let promotedSet = Set(promotedInsightIDs)
+        let pinnedInsights = embeddedInsights.filter { promotedSet.contains($0.id) }
+        guard !pinnedInsights.isEmpty else { return }
+
+        for (index, insight) in pinnedInsights.enumerated() {
+            guard let sourceNode = nodes.first(where: { $0.insights.contains(where: { $0.id == insight.id }) }) else {
+                continue
+            }
+
+            let promotedNodeID = promotedNodeID(for: insight.id)
+            guard !nodes.contains(where: { $0.id == promotedNodeID }) else { continue }
+
+            let defaultOffsetX: CGFloat = index.isMultiple(of: 2) ? 210 : -210
+            let defaultOffsetY: CGFloat = 170 + (CGFloat(index / 2) * 120)
+            let promotedNode = NodeModel(
+                id: promotedNodeID,
+                conceptLabel: insight.title,
+                insights: [insight],
+                embedding: insight.embedding ?? [],
+                position: restoredPosition(for: promotedNodeID) ?? CGPoint(
+                    x: sourceNode.position.x + defaultOffsetX,
+                    y: sourceNode.position.y + defaultOffsetY
+                ),
+                isSuggested: false,
+                suggestedInsights: nil
+            )
+
+            nodes.append(promotedNode)
+            edges.append(
+                EdgeModel(
+                    id: UUID(),
+                    fromNodeID: sourceNode.id,
+                    toNodeID: promotedNodeID,
+                    distance: 0.18,
+                    isSuggested: false,
+                    showSuggestButton: false
+                )
+            )
+        }
+    }
+
+    private func promotedNodeID(for insightID: UUID) -> UUID {
+        let digest = SHA256.hash(data: Data("promoted:\(insightID.uuidString)".utf8))
+        let bytes = Array(digest.prefix(16))
+        let uuidString = String(
+            format: "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5],
+            bytes[6], bytes[7],
+            bytes[8], bytes[9],
+            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        )
+        return UUID(uuidString: uuidString) ?? UUID()
     }
 
     private func runForceLayout(nodes: [NodeModel], edges: [EdgeModel]) -> [NodeModel] {

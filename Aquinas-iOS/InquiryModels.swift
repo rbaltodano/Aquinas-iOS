@@ -57,19 +57,22 @@ struct InquiryConversation: Identifiable, Codable, Equatable {
     /// The value is the `id` of the parent topic (`InquiryConversation`).
     var studyTopicID: UUID? = nil
     var branches: [ChatBranch] = [ChatBranch(startingConcept: nil)]
+    var promotedInsightIDs: [UUID] = []
 
     init(
         id: UUID = UUID(),
         title: String = "New Conversation",
         isStudyTopic: Bool = false,
         studyTopicID: UUID? = nil,
-        branches: [ChatBranch] = [ChatBranch(startingConcept: nil)]
+        branches: [ChatBranch] = [ChatBranch(startingConcept: nil)],
+        promotedInsightIDs: [UUID] = []
     ) {
         self.id = id
         self.title = title
         self.isStudyTopic = isStudyTopic
         self.studyTopicID = studyTopicID
         self.branches = branches
+        self.promotedInsightIDs = promotedInsightIDs
     }
 }
 

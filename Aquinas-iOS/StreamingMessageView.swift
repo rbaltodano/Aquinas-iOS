@@ -76,6 +76,10 @@ struct FlowLayout: Layout {
             var currentX: CGFloat = 0
             var currentY: CGFloat = 0
             var lineHeight: CGFloat = 0
+            // Track each row's subview range and packed width so we can center
+            // every row horizontally once the full row is known.
+            var rowRanges: [(range: Range<Int>, width: CGFloat)] = []
+            var rowStart = 0
 
             for (idx, subview) in subviews.enumerated() {
                 let wordSize: CGSize
@@ -87,6 +91,9 @@ struct FlowLayout: Layout {
                 }
 
                 if currentX + wordSize.width > maxWidth && currentX > 0 {
+                    // Close the row that just ended (drop the trailing spacing).
+                    rowRanges.append((rowStart..<idx, max(0, currentX - spacing)))
+                    rowStart = idx
                     currentX = 0
                     currentY += lineHeight + 8
                     lineHeight = 0
@@ -95,6 +102,17 @@ struct FlowLayout: Layout {
                 lineHeight = max(lineHeight, wordSize.height)
                 currentX += wordSize.width + spacing
             }
+            // Close the final row.
+            rowRanges.append((rowStart..<subviews.count, max(0, currentX - spacing)))
+
+            // Center each row within the available width.
+            for (range, width) in rowRanges {
+                let offset = max(0, (maxWidth - width) / 2)
+                for i in range {
+                    points[i].x += offset
+                }
+            }
+
             size = CGSize(width: maxWidth, height: currentY + lineHeight)
         }
     }
@@ -102,6 +120,10 @@ struct FlowLayout: Layout {
 
 // Shared transition shorthand.
 extension AnyTransition {
+    static var streamedTextFade: AnyTransition {
+        .opacity.animation(.easeInOut(duration: 0.55))
+    }
+
     static var glideFadeUp: AnyTransition {
         .modifier(active: GlideFadeModifier(isActive: true), identity: GlideFadeModifier(isActive: false))
         .animation(.easeOut(duration: 0.22))
@@ -202,17 +224,17 @@ struct StreamingMessageView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .center, spacing: 12) {
 
             // Reserve the final response height up front so the card doesn't jump,
             // then reveal content on top of the ghost via streaming progress.
-            ZStack(alignment: .topLeading) {
+            ZStack(alignment: .top) {
                 segmentsView(displayedCount: responseWords.count)
                     .hidden()
 
                 segmentsView(displayedCount: displayedWords.count)
             }
-            .animation(.easeOut(duration: 0.18), value: displayedWords.count)
+            .animation(.easeOut(duration: 0.55), value: displayedWords.count)
 
             if isFinished {
                 ResponseButtons(
@@ -231,7 +253,7 @@ struct StreamingMessageView: View {
                 )
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .center)
         .task {
             if shouldStream { await streamText() }
         }
@@ -241,7 +263,7 @@ struct StreamingMessageView: View {
 
     @ViewBuilder
     private func segmentsView(displayedCount: Int) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .center, spacing: 16) {
             ForEach(segments) { segment in
                 segmentView(segment: segment, displayedCount: displayedCount)
             }
@@ -254,7 +276,10 @@ struct StreamingMessageView: View {
         if available > 0 {
             switch segment.kind {
             case .paragraph:
-                wordFlow(words: Array(segment.words.prefix(available)))
+                // Lay out the FULL paragraph so word positions are final from the
+                // start; reveal up to `available` via opacity instead of inserting
+                // words (which would re-center each row and slide text sideways).
+                wordFlow(words: segment.words, visibleCount: available)
 
             case .orderedList(let items):
                 orderedListBubble(
@@ -280,27 +305,23 @@ struct StreamingMessageView: View {
             ForEach(Array(items.enumerated()), id: \.offset) { index, _ in
                 let itemStart = itemOffsets[index]
                 let itemEnd   = index + 1 < itemOffsets.count ? itemOffsets[index + 1] : allWords.count
+                let itemWords = Array(allWords[itemStart..<itemEnd])
 
-                if available > itemStart {
-                    let count = min(available - itemStart, itemEnd - itemStart)
-                    let safeEnd = min(itemStart + count, allWords.count)
-                    let itemWords = Array(allWords[itemStart..<safeEnd])
+                HStack(alignment: .top, spacing: 10) {
+                    Text("\(index + 1).")
+                        .font(responseFont.textFont(size: conversationFontSize))
+                        .foregroundColor(AquinasTheme.Colors.bodyText)
+                        .frame(minWidth: 22, alignment: .trailing)
+                        .opacity(available > itemStart ? 1 : 0)
 
-                    HStack(alignment: .top, spacing: 10) {
-                        Text("\(index + 1).")
-                            .font(responseFont.textFont(size: conversationFontSize))
-                            .foregroundColor(AquinasTheme.Colors.bodyText)
-                            .frame(minWidth: 22, alignment: .trailing)
-
-                        wordFlow(words: itemWords)
-                    }
-                    .transition(.glideFadeUp)
+                    // Full item is laid out immediately; words reveal in place.
+                    wordFlow(words: itemWords, visibleCount: max(0, available - itemStart))
                 }
             }
         }
         .padding(24)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(AquinasTheme.Colors.background)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .background(AquinasTheme.Colors.card)
         .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 24, style: .continuous)
@@ -311,28 +332,34 @@ struct StreamingMessageView: View {
     // MARK: - Word flow (unchanged)
 
     @ViewBuilder
-    private func wordFlow(words: [String]) -> some View {
+    private func wordFlow(words: [String], visibleCount: Int) -> some View {
         FlowLayout {
-            ForEach(Array(words.enumerated()), id: \.offset) { _, word in
-                if let link = insightLink(from: word) {
-                    Button(action: { openURL(link.url) }) {
-                        HStack(spacing: 0) {
-                            Text(link.title).underline().bold()
-                            Text(link.trailingPunctuation)
+            ForEach(Array(words.enumerated()), id: \.offset) { idx, word in
+                Group {
+                    if let link = insightLink(from: word) {
+                        Button(action: { openURL(link.url) }) {
+                            HStack(spacing: 0) {
+                                Text(link.title).underline().bold()
+                                Text(link.trailingPunctuation)
+                            }
+                            .font(responseFont.textFont(size: conversationFontSize))
+                            .foregroundColor(AquinasTheme.Colors.secondaryMuted)
+                            .padding(.horizontal, 2)
+                            .contentShape(Rectangle())
                         }
-                        .font(responseFont.textFont(size: conversationFontSize))
-                        .foregroundColor(AquinasTheme.Colors.secondaryMuted)
-                        .padding(.horizontal, 2)
-                        .contentShape(Rectangle())
+                        .buttonStyle(.plain)
+                    } else {
+                        Text(word)
+                            .font(responseFont.textFont(size: conversationFontSize))
+                            .foregroundColor(AquinasTheme.Colors.bodyText)
                     }
-                    .buttonStyle(.plain)
-                    .transition(.glideFadeUp)
-                } else {
-                    Text(word)
-                        .font(responseFont.textFont(size: conversationFontSize))
-                        .foregroundColor(AquinasTheme.Colors.bodyText)
-                        .transition(.glideFadeUp)
                 }
+                // All words are laid out up front, so positions are final; reveal
+                // each word with a slow fade + upward drift. The offset is purely
+                // visual (doesn't affect layout), so positions never shift.
+                .opacity(idx < visibleCount ? 1 : 0)
+                .offset(y: idx < visibleCount ? 0 : 10)
+                .blur(radius: idx < visibleCount ? 0 : 3)
             }
         }
     }

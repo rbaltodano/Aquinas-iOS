@@ -20,7 +20,6 @@ struct OpenConversationsView: View {
     @State private var activeInsight: ConceptDefinition? = nil
     @State private var conversationBeingRenamed: InquiryConversation? = nil
     @State private var renameDraft = ""
-    @State private var focusedCardID: UUID? = nil
 
     private var normalizedSearchText: String {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -63,9 +62,6 @@ struct OpenConversationsView: View {
                                         renameDraft = conversation.title
                                         conversationBeingRenamed = conversation
                                     },
-                                    onMenuFocusChange: { isOpen in
-                                        focusedCardID = isOpen ? conversation.id : nil
-                                    }
                                 )
                                 .transition(
                                     .asymmetric(
@@ -73,7 +69,6 @@ struct OpenConversationsView: View {
                                         removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .top))
                                     )
                                 )
-                                .zIndex(focusedCardID == conversation.id ? Double.greatestFiniteMagnitude : 0)
                             }
                         }
                     }
@@ -271,17 +266,8 @@ struct OpenConversationCard: View {
     var onSelect: () -> Void
     var onOpenInsight: (ConceptDefinition) -> Void
     var onRename: (InquiryConversation) -> Void
-    /// Called with `true` when the options menu opens and `false` when it closes.
-    var onMenuFocusChange: ((Bool) -> Void)? = nil
-    /// When provided the card skips its own internal menu and delegates to the
-    /// parent instead — use this inside containers where the card's overflow
-    /// can't escape the local stacking context (e.g. a LazyVStack in a ZStack).
-    var onMenuOpen: (() -> Void)? = nil
 
     @State private var isExpanded = false
-    @State private var isOptionsMenuOpen = false
-
-    private let optionsMenuZIndex: Double = 10_000
 
     private var visibleInsights: [ConceptDefinition] {
         isExpanded ? insights : Array(insights.prefix(3))
@@ -298,15 +284,9 @@ struct OpenConversationCard: View {
 
                 Spacer(minLength: 8)
 
-                Button(action: {
-                    if let onMenuOpen {
-                        onMenuOpen()
-                    } else {
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-                            isOptionsMenuOpen.toggle()
-                        }
-                    }
-                }) {
+                Menu {
+                    Button("Rename", systemImage: "pencil.line") { onRename(conversation) }
+                } label: {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 13, weight: .bold))
                         .foregroundColor(AquinasTheme.Colors.paragraphText)
@@ -372,41 +352,6 @@ struct OpenConversationCard: View {
         )
         .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .onTapGesture(perform: onSelect)
-        .onChange(of: isOptionsMenuOpen) { _, isOpen in
-            onMenuFocusChange?(isOpen)
-        }
-        // Only render the internal overlay when no external menu handler is set.
-        .overlay(alignment: .topTrailing) {
-            if onMenuOpen == nil && isOptionsMenuOpen {
-                ZStack(alignment: .topTrailing) {
-                    Color.clear
-                        .contentShape(Rectangle())
-                        .frame(width: 345, height: 700)
-                        .offset(x: 24, y: -260)
-                        .onTapGesture { closeOptionsMenu() }
-                        .zIndex(0)
-
-                    ConversationOptionsMenu(
-                        onRename: {
-                            closeOptionsMenu()
-                            onRename(conversation)
-                        },
-                        onPin: { closeOptionsMenu() },
-                        onDelete: { closeOptionsMenu() }
-                    )
-                    .offset(x: -24, y: 52)
-                    .zIndex(optionsMenuZIndex)
-                }
-                .zIndex(optionsMenuZIndex)
-            }
-        }
-        .zIndex(isOptionsMenuOpen ? optionsMenuZIndex : 0)
-    }
-
-    private func closeOptionsMenu() {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-            isOptionsMenuOpen = false
-        }
     }
 }
 

@@ -8,17 +8,27 @@ import UIKit
 
 // MARK: - Insight Tree View
 
-private let insightTreeCanvasColor = Color(hex: 0x130F0C)
+private let insightTreeCanvasColor = AquinasTheme.Colors.canvas
 private let insightTreeInsightColor = AquinasTheme.Colors.canvasSecondary
 
 struct InsightTreeView: View {
     let insights: [ConceptDefinition]
+    var selectionRequest: Int = 0
+    var clearSelectionRequest: Int = 0
+    var createConceptRequest: Int = 0
+    var promotedInsightIDs: [UUID] = []
     var onClose: (() -> Void)?
     var onRemoveInsight:  ((ConceptDefinition) -> Void)? = nil
     var onRestoreInsight: ((ConceptDefinition) -> Void)? = nil
     var onForkInsight:    ((ConceptDefinition) -> Void)? = nil
+    var onQuoteInsight:   ((ConceptDefinition?) -> Void)? = nil
+    var onSelectionStateChange: ((Bool) -> Void)? = nil
+    var onInsightSelectionStateChange: ((Bool) -> Void)? = nil
+    var onSelectedCanvasItemCountChange: ((Int) -> Void)? = nil
+    var onPromotedInsightIDsChange: (([UUID]) -> Void)? = nil
     var inputFont: ConversationFontOption = .serif
     var conversationFontSize: ConversationFontSizeOption = .small
+    var showQuestionBar: Bool = true
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -36,24 +46,46 @@ struct InsightTreeView: View {
     @State private var cardShouldHide: Bool = false
     @State private var chipShouldShow: Bool = false
     @State private var questionBarFocusTrigger: Int = 0
+    @State private var selectedCanvasTargets: [CanvasSelectionTarget] = []
+    @State private var selectionPulseRequest: Int = 0
 
     init(
         insights: [ConceptDefinition],
+        selectionRequest: Int = 0,
+        clearSelectionRequest: Int = 0,
+        createConceptRequest: Int = 0,
+        promotedInsightIDs: [UUID] = [],
         onClose: (() -> Void)? = nil,
         onRemoveInsight:  ((ConceptDefinition) -> Void)? = nil,
         onRestoreInsight: ((ConceptDefinition) -> Void)? = nil,
         onForkInsight:    ((ConceptDefinition) -> Void)? = nil,
+        onQuoteInsight:   ((ConceptDefinition?) -> Void)? = nil,
+        onSelectionStateChange: ((Bool) -> Void)? = nil,
+        onInsightSelectionStateChange: ((Bool) -> Void)? = nil,
+        onSelectedCanvasItemCountChange: ((Int) -> Void)? = nil,
+        onPromotedInsightIDsChange: (([UUID]) -> Void)? = nil,
         inputFont: ConversationFontOption = .serif,
-        conversationFontSize: ConversationFontSizeOption = .small
+        conversationFontSize: ConversationFontSizeOption = .small,
+        showQuestionBar: Bool = true
     ) {
         self.insights              = insights
+        self.selectionRequest      = selectionRequest
+        self.clearSelectionRequest = clearSelectionRequest
+        self.createConceptRequest  = createConceptRequest
+        self.promotedInsightIDs    = promotedInsightIDs
         self.onClose               = onClose
         self.onRemoveInsight       = onRemoveInsight
         self.onRestoreInsight      = onRestoreInsight
         self.onForkInsight         = onForkInsight
+        self.onQuoteInsight        = onQuoteInsight
+        self.onSelectionStateChange = onSelectionStateChange
+        self.onInsightSelectionStateChange = onInsightSelectionStateChange
+        self.onSelectedCanvasItemCountChange = onSelectedCanvasItemCountChange
+        self.onPromotedInsightIDsChange = onPromotedInsightIDsChange
         self.inputFont             = inputFont
         self.conversationFontSize  = conversationFontSize
-        _viewModel = StateObject(wrappedValue: InsightTreeViewModel(insights: insights))
+        self.showQuestionBar       = showQuestionBar
+        _viewModel = StateObject(wrappedValue: InsightTreeViewModel(insights: insights, promotedInsightIDs: promotedInsightIDs))
     }
 
     private var canvasTertiary: Color {
@@ -102,6 +134,8 @@ struct InsightTreeView: View {
                 focusedInsightID: focusedInsightID,
                 pulsingInsightID: questionBarContextInsight?.id,
                 pulsingNodeID: selectedNode?.id,
+                selectedCanvasTargets: selectedCanvasTargets,
+                selectionPulseRequest: selectionPulseRequest,
                 onNodeTapped: { node in
                     showNodeCard(node)
                 },
@@ -148,7 +182,7 @@ struct InsightTreeView: View {
         }
         // safeAreaInset moves with the keyboard automatically — no manual observation needed.
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            VStack(spacing: 12) {
+            VStack(spacing: 8) {
                 if undoInsight != nil {
                     undoButtonView
                         .transition(.scale(scale: 0.88).combined(with: .opacity))
@@ -181,7 +215,7 @@ struct InsightTreeView: View {
                 }
 
                 // Insight chip — appears above the bar when keyboard is open, mirrors card dismiss animation
-                if chipShouldShow, let insight = questionBarContextInsight {
+                if showQuestionBar, chipShouldShow, let insight = questionBarContextInsight {
                     BranchContextChip(
                         title: insight.title,
                         icon: "text.bubble.fill",
@@ -213,53 +247,50 @@ struct InsightTreeView: View {
                     )
                 }
 
-                InsightQuestionBar(
-                    contextInsight: $questionBarContextInsight,
-                    inputFont: inputFont,
-                    conversationFontSize: conversationFontSize,
-                    onOpen: {},
-                    onKeyboardActiveChange: { active in
-                        questionBarKeyboardActive = active
-                        if active {
-                            if let insight = selectedInsight {
+                if showQuestionBar {
+                    InsightQuestionBar(
+                        contextInsight: $questionBarContextInsight,
+                        inputFont: inputFont,
+                        conversationFontSize: conversationFontSize,
+                        onOpen: {},
+                        onKeyboardActiveChange: { active in
+                            questionBarKeyboardActive = active
+                            if active {
+                                if let insight = selectedInsight {
+                                    withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
+                                        questionBarContextInsight = insight
+                                    }
+                                }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                                    guard questionBarKeyboardActive else { return }
+                                    withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
+                                        cardShouldHide = true
+                                        chipShouldShow = true
+                                    }
+                                }
+                            } else {
                                 withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
-                                    questionBarContextInsight = insight
+                                    chipShouldShow = false
+                                }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                                    guard !questionBarKeyboardActive else { return }
+                                    withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
+                                        cardShouldHide = false
+                                    }
                                 }
                             }
-                            // Card hides and chip appears simultaneously after 0.15s.
-                            // Guard prevents stale blocks from firing if keyboard already closed.
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                                guard questionBarKeyboardActive else { return }
-                                withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
-                                    cardShouldHide = true
-                                    chipShouldShow = true
-                                }
-                            }
-                        } else {
-                            // Chip disappears immediately; card waits 0.2s then scales back in.
-                            // Guard prevents stale blocks from firing if keyboard already reopened.
-                            withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
+                        },
+                        onCollapse: {
+                            questionBarKeyboardActive = false
+                            withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
+                                cardShouldHide = false
                                 chipShouldShow = false
                             }
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                                guard !questionBarKeyboardActive else { return }
-                                withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
-                                    cardShouldHide = false
-                                }
-                            }
-                        }
-                    },
-                    onCollapse: {
-                        // Drawer closed — force all card/chip/keyboard state clean
-                        questionBarKeyboardActive = false
-                        withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
-                            cardShouldHide = false
-                            chipShouldShow = false
-                        }
-                    },
-                    focusTrigger: questionBarFocusTrigger
-                )
-                .padding(.horizontal, 16)
+                        },
+                        focusTrigger: questionBarFocusTrigger
+                    )
+                    .padding(.horizontal, 16)
+                }
             }
             .padding(.bottom, 16)
             .animation(.spring(response: 0.42, dampingFraction: 0.86), value: selectedInsight?.id)
@@ -267,11 +298,23 @@ struct InsightTreeView: View {
             .animation(.spring(response: 0.34, dampingFraction: 0.86), value: undoInsight != nil)
         }
         .onChange(of: insights) { oldValue, newValue in
-            viewModel.updateInsights(newValue)
+            viewModel.updateInsights(newValue, promotedInsightIDs: promotedInsightIDs)
             if let selectedInsight,
                !newValue.contains(where: { $0.id == selectedInsight.id }) {
                 dismissDockedInsight()
             }
+        }
+        .onChange(of: promotedInsightIDs) { _, newValue in
+            viewModel.updateInsights(insights, promotedInsightIDs: newValue)
+        }
+        .onChange(of: selectionRequest) { _, _ in
+            selectHoveredCanvasTarget()
+        }
+        .onChange(of: clearSelectionRequest) { _, _ in
+            clearSelectedCanvasTargets()
+        }
+        .onChange(of: createConceptRequest) { _, _ in
+            promoteHoveredInsightToConcept()
         }
         .alert("Remove bookmark?", isPresented: Binding(
             get: { pendingRemoveInsight != nil },
@@ -308,6 +351,10 @@ struct InsightTreeView: View {
         }
 
         playDockedCardHaptic()
+        onSelectionStateChange?(true)
+        onInsightSelectionStateChange?(true)
+        focusedInsightID = insight.id
+        onQuoteInsight?(concept(for: insight))
 
         withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
             dockedCardDragY = 0
@@ -319,6 +366,9 @@ struct InsightTreeView: View {
 
     private func showNodeCard(_ node: NodeModel) {
         playDockedCardHaptic()
+        onSelectionStateChange?(true)
+        onInsightSelectionStateChange?(false)
+        onQuoteInsight?(quoteTarget(for: node))
 
         withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
             dockedCardDragY = 0
@@ -379,6 +429,9 @@ struct InsightTreeView: View {
         guard selectedInsight != nil || selectedNode != nil else { return }
 
         playDockedCardHaptic()
+        onSelectionStateChange?(false)
+        onInsightSelectionStateChange?(false)
+        onQuoteInsight?(nil)
 
         withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
             dockedCardDragY = 0
@@ -395,6 +448,9 @@ struct InsightTreeView: View {
         guard selectedInsight != nil || selectedNode != nil else { return }
 
         playDockedCardHaptic()
+        onSelectionStateChange?(false)
+        onInsightSelectionStateChange?(false)
+        onQuoteInsight?(nil)
 
         withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
             dockedCardDragY = 0
@@ -403,14 +459,80 @@ struct InsightTreeView: View {
         }
     }
 
+    private func clearCanvasSelectionSilently() {
+        guard selectedInsight != nil || selectedNode != nil || questionBarContextInsight != nil else { return }
+
+        onSelectionStateChange?(false)
+        onInsightSelectionStateChange?(false)
+        onQuoteInsight?(nil)
+
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+            dockedCardDragY = 0
+            selectedInsight = nil
+            selectedNode = nil
+            questionBarContextInsight = nil
+        }
+    }
+
+    private func clearSelectedCanvasTargets() {
+        guard !selectedCanvasTargets.isEmpty else { return }
+        selectedCanvasTargets.removeAll()
+        onSelectedCanvasItemCountChange?(0)
+    }
+
     private func playDockedCardHaptic() {
         let generator = UIImpactFeedbackGenerator(style: .light)
         generator.prepare()
         generator.impactOccurred(intensity: 0.65)
     }
+
+    private func selectHoveredCanvasTarget() {
+        let target: CanvasSelectionTarget?
+        if let selectedInsight {
+            target = .insight(selectedInsight.id)
+        } else if let selectedNode {
+            target = .node(selectedNode.id)
+        } else {
+            target = nil
+        }
+
+        guard let target else { return }
+
+        guard !selectedCanvasTargets.contains(target) else { return }
+
+        selectedCanvasTargets.append(target)
+        if selectedCanvasTargets.count > 1 {
+            selectionPulseRequest += 1
+        }
+        onSelectedCanvasItemCountChange?(selectedCanvasTargets.count)
+    }
+
+    private func promoteHoveredInsightToConcept() {
+        guard let selectedInsight else { return }
+        guard !promotedInsightIDs.contains(selectedInsight.id) else { return }
+        onPromotedInsightIDsChange?(promotedInsightIDs + [selectedInsight.id])
+    }
+
+    private func concept(for insight: InsightModel) -> ConceptDefinition? {
+        insights.first(where: { $0.id == insight.id })
+    }
+
+    private func quoteTarget(for node: NodeModel) -> ConceptDefinition? {
+        for insight in node.insights {
+            if let concept = concept(for: insight) {
+                return concept
+            }
+        }
+        return nil
+    }
 }
 
-private struct DockedInsightTreeCard: View {
+enum CanvasSelectionTarget: Equatable {
+    case node(UUID)
+    case insight(UUID)
+}
+
+struct DockedInsightTreeCard: View {
     let insight: InsightModel
 
     var onRemove: (() -> Void)? = nil
@@ -449,7 +571,8 @@ private struct DockedInsightTreeCard: View {
                 .foregroundColor(AquinasTheme.Colors.paragraphText)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(24)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(insightTreeInsightColor)
         .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))

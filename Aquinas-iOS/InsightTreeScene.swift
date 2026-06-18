@@ -79,7 +79,21 @@ final class InsightTreeScene: SKScene {
         }
     }
 
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        cancelNodeAnimations()
+        super.touchesBegan(touches, with: event)
+    }
+
+    private func cancelNodeAnimations() {
+        for (_, sprite) in nodeSprites {
+            sprite.removeAllActions()
+            sprite.alpha = 1
+            sprite.setScale(1)
+        }
+    }
+
     @objc private func handlePan(_ recognizer: UIPanGestureRecognizer) {
+        if recognizer.state == .began { cancelNodeAnimations() }
         guard let view, let camera else { return }
         dismissSuggestButton()
         let translation = recognizer.translation(in: view)

@@ -11,7 +11,7 @@ extension Notification.Name {
 
 // MARK: - Bottom Control Dock
 
-/// Swaps between the Branch-mode controls and the Canvas-mode controls.
+/// A single persistent control surface whose contents adapt to Branch and Canvas mode.
 struct InquiryControlDock: View {
     let isCanvasMode: Bool
     @Binding var showFilePicker: Bool
@@ -22,209 +22,295 @@ struct InquiryControlDock: View {
     @Binding var isPersonalityMenuOpen: Bool
     @Binding var areResponsesCollapsed: Bool
     let isAtBottom: Bool
+    var isKeyboardOpen: Bool = false
+    var showsSendButton: Bool = false
+    var hasCanvasHover: Bool = false
+    var hasCanvasInsightHover: Bool = false
+    var hasSelectedCanvasItems: Bool = false
+    var selectedCanvasItemCount: Int = 0
     var onScrollToBottom: () -> Void
     var onViewEntireCanvas: () -> Void
     var onOpenInsights: () -> Void
     var onSend: () -> Void = {}
+    var onSelectCanvasItem: () -> Void = {}
+    var onCreateCanvasConcept: () -> Void = {}
+    var onInquireConnection: () -> Void = {}
+    var onQuoteCanvasItem: () -> Void = {}
+    var onClearCanvasSelection: () -> Void = {}
 
-    var body: some View {
-        ZStack {
-            BranchControlBar(
-                showFilePicker: $showFilePicker,
-                showPhotoPicker: $showPhotoPicker,
-                showCamera: $showCamera,
-                isThinkingEnabled: $isThinkingEnabled,
-                selectedPersonality: $selectedPersonality,
-                isPersonalityMenuOpen: $isPersonalityMenuOpen,
-                isAtBottom: isAtBottom,
-                onScrollToBottom: onScrollToBottom,
-                onOpenInsights: onOpenInsights,
-                onSend: onSend
-            )
-            .offset(y: isCanvasMode ? 96 : 0)
-            .opacity(isCanvasMode ? 0 : 1)
-
-            CanvasControlBar(
-                areResponsesCollapsed: $areResponsesCollapsed,
-                onViewEntireCanvas: onViewEntireCanvas
-            )
-            .offset(y: isCanvasMode ? 0 : 96)
-            .opacity(isCanvasMode ? 1 : 0)
-        }
-        .frame(maxWidth: .infinity)
-        .frame(height: 76)
-        .animation(.spring(response: 0.42, dampingFraction: 0.82), value: isCanvasMode)
-    }
-}
-
-struct BranchControlBar: View {
-    @Binding var showFilePicker: Bool
-    @Binding var showPhotoPicker: Bool
-    @Binding var showCamera: Bool
-    @Binding var isThinkingEnabled: Bool
-    @Binding var selectedPersonality: String
-    @Binding var isPersonalityMenuOpen: Bool
-    let isAtBottom: Bool
-    var onScrollToBottom: () -> Void
-    var onOpenInsights: () -> Void
-    var onSend: () -> Void = {}
-    @State private var isAttachmentMenuOpen: Bool = false
+    @State private var isAttachmentMenuOpen = false
     @State private var thinkingIconDrawID = UUID()
-    @State private var personalityIconDrawID = UUID()
-    @State private var isScrollButtonVisible: Bool = false
+    @State private var canvasActionDrawID = UUID()
+    @State private var isScrollButtonVisible = false
+    @State private var controlScale: CGFloat = 1
+
+    private var controlCount: Int {
+        let attachmentCount = isCanvasMode ? 0 : 1
+        let thinkingCount = isCanvasMode && hasCanvasInsightHover ? 0 : 1
+        let canvasActionCount: Int
+        if !isCanvasMode {
+            canvasActionCount = 0
+        } else if hasSelectedCanvasItems {
+            canvasActionCount = selectedCanvasItemCount >= 2 ? 1 : 0
+        } else if hasCanvasInsightHover {
+            canvasActionCount = 3
+        } else if hasCanvasHover {
+            canvasActionCount = 2
+        } else {
+            canvasActionCount = 0
+        }
+        return attachmentCount + thinkingCount + canvasActionCount + 1 + (showsSendButton ? 1 : 0)
+    }
 
     var body: some View {
         ZStack(alignment: .top) {
-            HStack(spacing: 8) {
-                // Attachment menu: photo library, document upload, camera.
-                Button(action: {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
-                        isAttachmentMenuOpen.toggle()
-                    }
-                }) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 18, weight: .regular))
-                        .sfSymbolDrawOn()
-                        .aquinasIconControl()
+            HStack(alignment: .center, spacing: 24) {
+                if !isCanvasMode {
+                    attachmentButton
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
-                .overlay(alignment: .bottomLeading) {
-                    if isAttachmentMenuOpen {
-                        AttachmentMenu(
-                            isAttachmentMenuOpen: $isAttachmentMenuOpen,
-                            showPhotoPicker: $showPhotoPicker,
-                            showFilePicker: $showFilePicker,
-                            showCamera: $showCamera,
-                            onOpenInsights: onOpenInsights
-                        )
-                        .offset(y: -56)
+
+                if !isCanvasMode || !hasCanvasInsightHover {
+                    thinkingButton
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                }
+
+                if isCanvasMode {
+                    selectCanvasActionButton
+
+                    if hasSelectedCanvasItems && selectedCanvasItemCount >= 2 {
+                        canvasActionButton(title: "Inquire Connection", icon: "arrow.left.and.right", action: onInquireConnection)
+                            .transition(.scale(scale: 0.4).combined(with: .opacity))
+                    } else if hasCanvasInsightHover && !hasSelectedCanvasItems {
+                        canvasActionButton(title: "Create Concept", icon: "move.3d", action: onCreateCanvasConcept)
+                            .transition(.scale(scale: 0.4).combined(with: .opacity))
+                        canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
+                            .transition(.scale(scale: 0.4).combined(with: .opacity))
+                    } else if hasCanvasHover && !hasSelectedCanvasItems {
+                        canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
+                            .transition(.scale(scale: 0.4).combined(with: .opacity))
                     }
                 }
 
-                // Thinking toggle: visual only for now, ready to connect to model settings.
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        let isTurningOn = !isThinkingEnabled
-                        isThinkingEnabled.toggle()
-                        if isTurningOn {
-                            thinkingIconDrawID = UUID()
-                        }
-                    }
-                }) {
-                    HStack(spacing: 10) {
-                        if isThinkingEnabled {
-                            Image(systemName: "globe")
-                                .font(.system(size: 18, weight: .semibold))
-                                .foregroundColor(AquinasTheme.Colors.canvas)
-                                .id(thinkingIconDrawID)
-                                .sfSymbolDrawOn()
-                        } else {
-                            Image(systemName: "globe")
-                                .font(.system(size: 18, weight: .semibold))
-                                .foregroundColor(AquinasTheme.Colors.secondaryMuted)
-                        }
-                        Text("Thinking")
-                            .font(.custom("Figtree-Bold", size: 12))
-                            .foregroundColor(isThinkingEnabled ? AquinasTheme.Colors.canvas : AquinasTheme.Colors.secondaryMuted)
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 12)
-                    .frame(minHeight: AquinasTheme.Spacing.controlHeight)
-                    .background(isThinkingEnabled ? AquinasTheme.Colors.secondaryMuted : AquinasTheme.Colors.surface)
-                    .clipShape(Capsule())
-                    .overlay(
-                        Capsule()
-                            .stroke(AquinasTheme.Colors.controlBorder, lineWidth: isThinkingEnabled ? 0 : 1)
-                    )
-                }
+                contextButton
 
-                // Personality selector: currently toggles between Friendly and Scholarly.
-                Button(action: {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
-                        isPersonalityMenuOpen.toggle()
-                    }
-                }) {
-                    HStack(spacing: 10) {
-                        Image(systemName: selectedPersonality == "Friendly" ? "brain.head.profile.fill" : "book.pages.fill")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundColor(AquinasTheme.Colors.linkGreen)
-                            .frame(width: 16, height: 16)
-                            .id(personalityIconDrawID)
-                            .sfSymbolDrawOn()
-                        Text(selectedPersonality)
-                            .font(.custom("Figtree-Bold", size: 12))
-                            .foregroundColor(AquinasTheme.Colors.lightGreen)
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(AquinasTheme.Colors.linkGreen)
-                            .sfSymbolDrawOn()
-                    }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 12)
-                    .aquinasCapsuleControl()
-                }
-                .overlay(alignment: .bottomLeading) {
-                    if isPersonalityMenuOpen {
-                        PersonalityMenu(
-                            selectedPersonality: $selectedPersonality,
-                            isPersonalityMenuOpen: $isPersonalityMenuOpen
-                        )
-                        .offset(y: -56)
-                    }
-                }
-
-                // Send button — always trailing; submits the active question.
-                Button(action: onSend) {
-                    Image(systemName: "paperplane.fill")
-                        .font(.system(size: 16, weight: .semibold))
-                        .sfSymbolDrawOn()
-                        .aquinasIconControl(isPrimary: true)
+                if showsSendButton {
+                    sendButton
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
             }
-            .padding(.horizontal, 12)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .background {
-                ControlBarGlow()
-            }
+            .padding(.horizontal, 32)
+            .padding(.vertical, 24)
+            .fixedSize(horizontal: true, vertical: true)
+            .background(AquinasTheme.Colors.canvasSecondary)
+            .clipShape(Capsule())
+            .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
+            .scaleEffect(controlScale)
+            .animation(.spring(response: 0.38, dampingFraction: 0.78), value: controlCount)
 
-            // Appears only when the current branch is scrolled away from the bottom.
-                Button(action: onScrollToBottom) {
-                    Image(systemName: "arrow.down")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundColor(Color(hex: 0xFFFAF0))
-                        .frame(width: 24, height: 24)
-                        .background(AquinasTheme.Colors.lightBrown)
-                        .clipShape(Circle())
-                        .overlay(
-                            Circle()
-                                .stroke(AquinasTheme.Colors.lightBrown.opacity(0.05), lineWidth: 1)
-                        )
-                }
-            .buttonStyle(.plain)
-            .offset(y: isScrollButtonVisible ? -40 : -32)
-            .opacity(isScrollButtonVisible ? 1 : 0)
-            .allowsHitTesting(isScrollButtonVisible)
-            .zIndex(2)
-            .animation(.easeInOut(duration: 0.16), value: isScrollButtonVisible)
+            if !isCanvasMode {
+                scrollToBottomButton
+            }
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.bottom, isKeyboardOpen ? 8 : 24)
+        .background(alignment: .bottom) {
+            LinearGradient(
+                stops: [
+                    .init(color: AquinasTheme.Colors.canvas.opacity(0.95), location: 0),
+                    .init(color: AquinasTheme.Colors.canvas.opacity(0), location: 1)
+                ],
+                startPoint: UnitPoint(x: 0.5, y: 0.52),
+                endPoint: UnitPoint(x: 0.5, y: 0)
+            )
+            .ignoresSafeArea(edges: .bottom)
+            .allowsHitTesting(false)
+        }
         .onAppear {
-            if isAtBottom {
-                isScrollButtonVisible = false
-            }
+            isScrollButtonVisible = !isAtBottom
         }
-        .onReceive(NotificationCenter.default.publisher(
-            for: .aquinasMiniScrollButtonVisibilityChanged
-        )) { notification in
+        .onReceive(NotificationCenter.default.publisher(for: .aquinasMiniScrollButtonVisibilityChanged)) { notification in
             guard let isVisible = notification.userInfo?["isVisible"] as? Bool else { return }
             isScrollButtonVisible = isVisible
         }
-        .onChange(of: selectedPersonality) { oldValue, newValue in
-            personalityIconDrawID = UUID()
+        .onChange(of: controlCount) { _, _ in
+            controlScale = 1.05
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
+                controlScale = 1
+            }
         }
+        .onChange(of: hasCanvasHover) { _, selected in
+            if selected { canvasActionDrawID = UUID() }
+        }
+    }
+
+    private var attachmentButton: some View {
+        Button {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                isAttachmentMenuOpen.toggle()
+            }
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(AquinasTheme.Colors.lightGreen)
+                .frame(width: 16, height: 16)
+        }
+        .buttonStyle(.plain)
+        .overlay(alignment: .bottomLeading) {
+            if isAttachmentMenuOpen {
+                AttachmentMenu(
+                    isAttachmentMenuOpen: $isAttachmentMenuOpen,
+                    showPhotoPicker: $showPhotoPicker,
+                    showFilePicker: $showFilePicker,
+                    showCamera: $showCamera,
+                    onOpenInsights: onOpenInsights
+                )
+                .offset(y: -56)
+            }
+        }
+    }
+
+    private var thinkingButton: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                isThinkingEnabled.toggle()
+                if isThinkingEnabled { thinkingIconDrawID = UUID() }
+            }
+        } label: {
+            let inactiveThinkingColor = AquinasTheme.Colors.paragraphText.opacity(0.75)
+            HStack(spacing: 8) {
+                Image(systemName: "globe")
+                    .font(.system(size: 14, weight: .semibold))
+                    .id(thinkingIconDrawID)
+                    .sfSymbolDrawOn()
+                Text("Thinking")
+                    .font(.custom("Figtree-Bold", size: 14))
+            }
+            .frame(height: 16, alignment: .center)
+            .foregroundColor(isThinkingEnabled ? AquinasTheme.Colors.lightGreen : inactiveThinkingColor)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var contextButton: some View {
+        Button {
+            if hasSelectedCanvasItems {
+                onClearCanvasSelection()
+            }
+        } label: {
+            let contextColor = AquinasTheme.Colors.paragraphText.opacity(0.75)
+            HStack(spacing: 8) {
+                if hasSelectedCanvasItems {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 14, weight: .semibold))
+                } else {
+                    ContextUsageIcon(progress: 0.36, color: contextColor)
+                }
+                if !hasCanvasHover && !hasSelectedCanvasItems {
+                    Text("Context")
+                        .font(.custom("Figtree-Bold", size: 14))
+                        .transition(.offset(x: -12).combined(with: .opacity))
+                }
+            }
+            .frame(height: 16, alignment: .center)
+            .foregroundColor(contextColor)
+            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: hasCanvasHover)
+            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: hasSelectedCanvasItems)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func canvasActionButton(title: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 14, weight: .semibold))
+                    .id("\(title)-\(canvasActionDrawID)")
+                    .sfSymbolDrawOn()
+                Text(title)
+                    .font(.custom("Figtree-Bold", size: 14))
+            }
+            .frame(height: 16, alignment: .center)
+            .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var selectCanvasActionButton: some View {
+        Button(action: onSelectCanvasItem) {
+            HStack(spacing: 8) {
+                selectionCountIcon
+                Text("Add")
+                    .font(.custom("Figtree-Bold", size: 14))
+            }
+            .frame(height: 16, alignment: .center)
+            .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var selectionCountIcon: some View {
+        let selectionColor = AquinasTheme.Colors.paragraphText.opacity(0.75)
+        if selectedCanvasItemCount > 0 {
+            ZStack {
+                Circle()
+                    .fill(selectionColor)
+                Text("\(min(selectedCanvasItemCount, 99))")
+                    .font(.custom("Figtree-Bold", size: selectedCanvasItemCount > 9 ? 7 : 8))
+                    .foregroundColor(AquinasTheme.Colors.canvasSecondary)
+            }
+            .frame(width: 14, height: 14)
+            .transition(.scale(scale: 0.5).combined(with: .opacity))
+        } else {
+            Image(systemName: "circle.dashed")
+                .font(.system(size: 14, weight: .semibold))
+                .id("select-\(canvasActionDrawID)")
+                .sfSymbolDrawOn()
+        }
+    }
+
+    private var sendButton: some View {
+        Button(action: onSend) {
+            Image(systemName: "paperplane.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundColor(AquinasTheme.Colors.lightGreen)
+                .frame(width: 16, height: 16)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var scrollToBottomButton: some View {
+        Button(action: onScrollToBottom) {
+            Image(systemName: "arrow.down")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundColor(Color(hex: 0xFFFAF0))
+                .frame(width: 24, height: 24)
+                .background(AquinasTheme.Colors.lightBrown)
+                .clipShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .offset(y: isScrollButtonVisible ? -36 : -28)
+        .opacity(isScrollButtonVisible ? 1 : 0)
+        .allowsHitTesting(isScrollButtonVisible)
+        .animation(.easeInOut(duration: 0.16), value: isScrollButtonVisible)
+    }
+}
+
+private struct ContextUsageIcon: View {
+    let progress: CGFloat
+    let color: Color
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(color.opacity(0.35), lineWidth: 1.5)
+            Circle()
+                .trim(from: 0, to: min(max(progress, 0), 1))
+                .stroke(color, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+        }
+        .frame(width: 14, height: 14)
     }
 }
 
@@ -237,59 +323,16 @@ struct AttachmentMenu: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
-            MenuOptionRow(icon: "camera", title: "Camera", delay: 0) {
-                closeMenu()
-                showCamera = true
-            }
-
-            MenuOptionRow(icon: "photo", title: "Photo", delay: 0.05) {
-                closeMenu()
-                showPhotoPicker = true
-            }
-
-            MenuOptionRow(icon: "doc", title: "File", delay: 0.10) {
-                closeMenu()
-                showFilePicker = true
-            }
-
-            MenuOptionRow(icon: "text.bubble", title: "Insights", delay: 0.15) {
-                closeMenu()
-                onOpenInsights()
-            }
+            MenuOptionRow(icon: "camera", title: "Camera", delay: 0) { closeMenu(); showCamera = true }
+            MenuOptionRow(icon: "photo", title: "Photo", delay: 0.05) { closeMenu(); showPhotoPicker = true }
+            MenuOptionRow(icon: "doc", title: "File", delay: 0.10) { closeMenu(); showFilePicker = true }
+            MenuOptionRow(icon: "text.bubble", title: "Insights", delay: 0.15) { closeMenu(); onOpenInsights() }
         }
         .menuPanelStyle(anchor: .bottomLeading)
     }
 
     private func closeMenu() {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
-            isAttachmentMenuOpen = false
-        }
-    }
-}
-
-struct PersonalityMenu: View {
-    @Binding var selectedPersonality: String
-    @Binding var isPersonalityMenuOpen: Bool
-
-    var body: some View {
-        // Replace these two rows when the real personality picker grows beyond two options.
-        VStack(alignment: .leading, spacing: 24) {
-            MenuOptionRow(icon: "book.pages", title: "Scholarly", delay: 0) {
-                selectPersonality("Scholarly")
-            }
-
-            MenuOptionRow(icon: "brain.head.profile.fill", title: "Friendly", delay: 0.05) {
-                selectPersonality("Friendly")
-            }
-        }
-        .menuPanelStyle(anchor: .bottomLeading)
-    }
-
-    private func selectPersonality(_ personality: String) {
-        selectedPersonality = personality
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
-            isPersonalityMenuOpen = false
-        }
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) { isAttachmentMenuOpen = false }
     }
 }
 
@@ -304,53 +347,30 @@ struct MenuOptionRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 12) {
-                Group {
-                    if showsIcon {
-                        Image(systemName: icon)
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundColor(AquinasTheme.Colors.lightGreen)
-                            .frame(width: 16, height: 16)
-                            .sfSymbolDrawOn()
-                    } else {
-                        Image(systemName: icon)
-                            .font(.system(size: 16, weight: .semibold))
-                            .frame(width: 16, height: 16)
-                            .hidden()
-                    }
-                }
-
+                Image(systemName: icon)
+                    .font(.system(size: 16, weight: .semibold))
+                    .frame(width: 16, height: 16)
+                    .foregroundColor(AquinasTheme.Colors.lightGreen)
+                    .opacity(showsIcon ? 1 : 0)
+                    .sfSymbolDrawOn(delay: delay)
                 Text(title)
                     .font(.custom("LibreBaskerville-Bold", size: 12))
                     .foregroundColor(AquinasTheme.Colors.lightGreen)
-                    .lineLimit(1)
                     .opacity(showsText ? 1 : 0)
                     .offset(x: showsText ? 0 : -10)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .buttonStyle(.plain)
-        .onAppear(perform: runEntrance)
-    }
-
-    private func runEntrance() {
-        showsIcon = false
-        showsText = false
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            withAnimation(.easeOut(duration: 0.35)) {
+        .onAppear {
+            withAnimation(.easeOut(duration: 0.3).delay(delay)) {
                 showsIcon = true
-            }
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.025) {
-            withAnimation(.easeOut(duration: 0.30)) {
                 showsText = true
             }
         }
     }
 }
 
-struct MenuPanelStyle: ViewModifier {
+private struct MenuPanelStyle: ViewModifier {
     let anchor: UnitPoint
 
     func body(content: Content) -> some View {
@@ -358,86 +378,14 @@ struct MenuPanelStyle: ViewModifier {
             .fixedSize()
             .padding(.horizontal, 36)
             .padding(.vertical, 24)
-            .background(
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .fill(AquinasTheme.Colors.surface)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
-            )
+            .background(RoundedRectangle(cornerRadius: 24, style: .continuous).fill(AquinasTheme.Colors.canvasSecondary))
+            .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
             .transition(.scale(scale: 0.92, anchor: anchor).combined(with: .opacity))
     }
 }
 
-extension View {
+private extension View {
     func menuPanelStyle(anchor: UnitPoint) -> some View {
         modifier(MenuPanelStyle(anchor: anchor))
-    }
-}
-
-struct CanvasControlBar: View {
-    @Binding var areResponsesCollapsed: Bool
-    var onViewEntireCanvas: () -> Void
-
-    var body: some View {
-        HStack(spacing: 12) {
-            // Max-fit overview toggle.
-            Button(action: onViewEntireCanvas) {
-                HStack(spacing: 10) {
-                    Image(systemName: "square.grid.2x2")
-                        .sfSymbolDrawOn()
-                    Text("View Entire Canvas")
-                        .font(.figtreeHeading2)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.78)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.horizontal, 14)
-                .aquinasCapsuleControl()
-            }
-            .frame(maxWidth: .infinity)
-
-            // Global response visibility toggle.
-            Button(action: {
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                    areResponsesCollapsed.toggle()
-                }
-            }) {
-                HStack(spacing: 10) {
-                    Image(systemName: areResponsesCollapsed ? "arrow.up.left.and.arrow.down.right" : "arrow.down.right.and.arrow.up.left")
-                        .sfSymbolDrawOn()
-                    Text(areResponsesCollapsed ? "Expand Responses" : "Collapse Responses")
-                        .font(.figtreeHeading2)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.78)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.horizontal, 14)
-                .aquinasCapsuleControl(isSelected: areResponsesCollapsed)
-            }
-            .frame(maxWidth: .infinity)
-        }
-        .padding(.horizontal, 16)
-        .frame(maxWidth: .infinity, alignment: .center)
-        .background {
-            ControlBarGlow()
-        }
-    }
-}
-
-private struct ControlBarGlow: View {
-    private let glowColor = AquinasTheme.Colors.controlGlow
-
-    var body: some View {
-        // Floating glow behind the dock. Increase blur/radius for a softer fade.
-        Rectangle()
-            .fill(glowColor)
-            .frame(height: 170)
-            .frame(maxWidth: .infinity)
-            .blur(radius: 72)
-            .offset(y: 46)
-            .shadow(color: glowColor, radius: 72, x: 0, y: 48)
-        .allowsHitTesting(false)
     }
 }

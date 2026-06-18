@@ -71,7 +71,8 @@ struct InsightTreeInsightCard: View {
                 .buttonStyle(.plain)
             }
         }
-        .padding(24)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 16)
         .background(AquinasTheme.Colors.canvas)
         .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
         .overlay(

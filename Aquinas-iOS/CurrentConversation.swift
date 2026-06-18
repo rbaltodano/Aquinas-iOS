@@ -5,12 +5,13 @@
 //  Conversation tab — horizontal branch layout.
 //  Each branch is a full-screen vertical ScrollView of ChatThreadColumn.
 //  Swipe left / right to move between branches (TabView pager).
-//  No canvas mode — branch mode only for now.
+//  Swipe left from anywhere to enter Canvas Mode (InsightTreeView).
 //
 
 import SwiftUI
 import UIKit
 import PhotosUI
+import CryptoKit
 
 private final class MiniScrollButtonVisibilityRelay {
     var isAtBottom: Bool = true
@@ -18,6 +19,7 @@ private final class MiniScrollButtonVisibilityRelay {
 
 struct CurrentConversationView: View {
     var onOpenMenu: () -> Void = {}
+    var onCanvasModeChange: (Bool) -> Void = { _ in }
     @Binding var collectedDefinitions:         [ConceptDefinition]
     @Binding var sideMenuConversations:        [InquiryConversation]
     @Binding var sideMenuCurrentTitle:         String
@@ -60,12 +62,26 @@ struct CurrentConversationView: View {
     @State private var lastFocusedAnchor: String? = nil
     @State private var miniScrollButtonVisibilityRelay = MiniScrollButtonVisibilityRelay()
     @State private var isKeyboardOpen: Bool = false
+    @State private var hasTextToSubmit: Bool = false
     @Binding var uploadedFiles: [UploadedFile]
     @State private var targetSpawnY: CGFloat = 300
     @State private var targetSpawnResponseIndex: Int? = nil
     @State private var viewportSize: CGSize = .zero
 
     @State private var persistenceTask: Task<Void, Never>? = nil
+
+    // MARK: Canvas mode
+    @State private var isTopicCanvasVisible: Bool = false
+    @State private var hasCanvasHover: Bool = false
+    @State private var hasHoveredCanvasInsight: Bool = false
+    @State private var canvasQuoteTarget: ConceptDefinition? = nil
+    @State private var canvasSelectedItemCount: Int = 0
+    @State private var canvasSelectionRequest: Int = 0
+    @State private var canvasClearSelectionRequest: Int = 0
+    @State private var canvasCreateConceptRequest: Int = 0
+    @State private var promotedCanvasInsightIDs: [UUID] = []
+    @State private var isEditingTitle: Bool = false
+    @State private var titleEditDraft: String = ""
 
     // MARK: Model controls
     @State private var areResponsesCollapsed: Bool = false
@@ -87,6 +103,68 @@ struct CurrentConversationView: View {
     @State private var dynamicDefinition: ConceptDefinition? = nil
     @State private var insightSheetContentHeight: CGFloat = 178
 
+    // MARK: Canvas helpers
+    private var activeTitle: String {
+        conversations.first { $0.id == activeConversationID }?.title ?? "New Conversation"
+    }
+
+    private func stableQuestionInsightID(for text: String) -> UUID {
+        let digest = SHA256.hash(data: Data(text.utf8))
+        let bytes = Array(digest.prefix(16))
+        let uuidString = String(
+            format: "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5],
+            bytes[6], bytes[7],
+            bytes[8], bytes[9],
+            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        )
+        return UUID(uuidString: uuidString) ?? UUID()
+    }
+
+    private var conversationInsights: [ConceptDefinition] {
+        var seen = Set<String>()
+        var result: [ConceptDefinition] = []
+        for branch in activeBranches {
+            for concept in [branch.startingConcept, branch.attachedConcept, branch.branchContextConcept].compactMap({ $0 }) {
+                let key = concept.word.lowercased()
+                if seen.insert(key).inserted { result.append(concept) }
+            }
+            for block in branch.activeChatBlocks {
+                switch block {
+                case .user(let text, let concept?, _):
+                    let chipKey = concept.word.lowercased()
+                    if seen.insert(chipKey).inserted { result.append(concept) }
+                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        let label = trimmed.split(separator: " ").prefix(6).joined(separator: " ")
+                        let nodeKey = "q:\(trimmed.lowercased().prefix(80))"
+                        if seen.insert(nodeKey).inserted {
+                            result.append(ConceptDefinition(id: stableQuestionInsightID(for: nodeKey), word: label, partOfSpeech: "question",
+                                pronunciation: "", meaning: trimmed, example: ""))
+                        }
+                    }
+                case .user(let text, nil, _):
+                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        let label = trimmed.split(separator: " ").prefix(6).joined(separator: " ")
+                        let nodeKey = "q:\(trimmed.lowercased().prefix(80))"
+                        if seen.insert(nodeKey).inserted {
+                            result.append(ConceptDefinition(id: stableQuestionInsightID(for: nodeKey), word: label, partOfSpeech: "question",
+                                pronunciation: "", meaning: trimmed, example: ""))
+                        }
+                    }
+                case .text: break
+                }
+            }
+        }
+        return result
+    }
+
+    private var hasSelectedCanvasItems: Bool {
+        canvasSelectedItemCount > 0
+    }
+
     // MARK: Helpers
     private var effectiveFocusedID: UUID? {
         focusedBranchID ?? activeBranches.first?.id
@@ -98,6 +176,129 @@ struct CurrentConversationView: View {
         return min(measured + 24, available * 0.82)
     }
 
+    private func pendingFocusBranchTarget() -> ChatBranch? {
+        if let pendingFocusBranchID,
+           let branch = activeBranches.first(where: { $0.id == pendingFocusBranchID }) {
+            return branch
+        }
+
+        return activeBranches.last
+    }
+
+    private var focusedBranchSelection: Binding<UUID?> {
+        Binding(
+            get: { effectiveFocusedID },
+            set: { newID in
+                if let newID {
+                    focusedBranchID = newID
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func branchPager(in geo: GeometryProxy) -> some View {
+        TabView(selection: focusedBranchSelection) {
+            ForEach($activeBranches) { branch in
+                let branchID = branch.wrappedValue.id
+                branchPage(branch: branch, geo: geo)
+                    .tag(Optional(branchID))
+            }
+        }
+        .tabViewStyle(.page(indexDisplayMode: .never))
+        .ignoresSafeArea(edges: .bottom)
+    }
+
+    private func closeTopicCanvas() {
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+            isTopicCanvasVisible = false
+        }
+    }
+
+    private func forkCanvasInsight(_ concept: ConceptDefinition) {
+        closeTopicCanvas()
+        requestedForkConcept = concept
+    }
+
+    @ViewBuilder
+    private var topicCanvasLayer: some View {
+        InsightTreeView(
+            insights: conversationInsights,
+            selectionRequest: canvasSelectionRequest,
+            clearSelectionRequest: canvasClearSelectionRequest,
+            createConceptRequest: canvasCreateConceptRequest,
+            promotedInsightIDs: promotedCanvasInsightIDs,
+            onClose: closeTopicCanvas,
+            onForkInsight: forkCanvasInsight,
+            onQuoteInsight: { canvasQuoteTarget = $0 },
+            onSelectionStateChange: { hasCanvasHover = $0 },
+            onInsightSelectionStateChange: { hasHoveredCanvasInsight = $0 },
+            onSelectedCanvasItemCountChange: { canvasSelectedItemCount = $0 },
+            onPromotedInsightIDsChange: { promotedCanvasInsightIDs = $0 },
+            inputFont: inputFont,
+            conversationFontSize: conversationFontSize,
+            showQuestionBar: false
+        )
+        .transition(.move(edge: .trailing).combined(with: .opacity))
+        .zIndex(1)
+    }
+
+    private func quoteConceptIntoCurrentConversation(_ concept: ConceptDefinition) {
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
+            attachedConcept = concept
+            if focusedBranchID == nil {
+                focusedBranchID = activeBranches.first?.id
+            }
+            isTopicCanvasVisible = false
+            hasCanvasHover = false
+            hasHoveredCanvasInsight = false
+            canvasQuoteTarget = nil
+            canvasSelectedItemCount = 0
+        }
+
+        Task {
+            try? await Task.sleep(for: .milliseconds(180))
+            scrollToBottomRequest += 1
+        }
+    }
+
+    @ViewBuilder
+    private var bottomInquiryControlDock: some View {
+        InquiryControlDock(
+            isCanvasMode: isTopicCanvasVisible,
+            showFilePicker: $showFilePicker,
+            showPhotoPicker: $showPhotoPicker,
+            showCamera: $showCamera,
+            isThinkingEnabled: $isThinkingEnabled,
+            selectedPersonality: $selectedPersonality,
+            isPersonalityMenuOpen: $isPersonalityMenuOpen,
+            areResponsesCollapsed: $areResponsesCollapsed,
+            isAtBottom: true,
+            isKeyboardOpen: isKeyboardOpen,
+            showsSendButton: isKeyboardOpen && hasTextToSubmit,
+            hasCanvasHover: hasCanvasHover,
+            hasCanvasInsightHover: hasHoveredCanvasInsight,
+            hasSelectedCanvasItems: hasSelectedCanvasItems,
+            selectedCanvasItemCount: canvasSelectedItemCount,
+            onScrollToBottom: { scrollToBottomRequest += 1 },
+            onViewEntireCanvas: { },
+            onOpenInsights: {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+                    isInsightLibraryOpen = true
+                }
+            },
+            onSend: { externalSubmitTrigger += 1 },
+            onSelectCanvasItem: { canvasSelectionRequest += 1 },
+            onCreateCanvasConcept: { canvasCreateConceptRequest += 1 },
+            onInquireConnection: { },
+            onQuoteCanvasItem: {
+                guard let canvasQuoteTarget else { return }
+                quoteConceptIntoCurrentConversation(canvasQuoteTarget)
+            },
+            onClearCanvasSelection: { canvasClearSelectionRequest += 1 }
+        )
+    }
+
     // MARK: Body
     var body: some View {
         GeometryReader { geo in
@@ -105,25 +306,68 @@ struct CurrentConversationView: View {
                 AquinasTheme.Colors.canvas.ignoresSafeArea()
 
                 // Horizontal branch pager
-                TabView(selection: Binding(
-                    get: { effectiveFocusedID },
-                    set: { id in if let id { focusedBranchID = id } }
-                )) {
-                    ForEach($activeBranches) { $branch in
-                        branchPage(branch: $branch, geo: geo)
-                            .tag(branch.id as UUID?)
-                    }
-                }
-                .tabViewStyle(.page(indexDisplayMode: .never))
-                .ignoresSafeArea(edges: .bottom)
+                branchPager(in: geo)
 
-                // Menu button (top-left)
-                HStack {
-                    AquinasNavButton(onMenuTap: { onOpenMenu() })
-                    Spacer()
+                // Bottom fade gradient (hidden in canvas mode)
+                if !isTopicCanvasVisible {
+                    LinearGradient(
+                        stops: [
+                            .init(color: AquinasTheme.Colors.canvas.opacity(0), location: 0),
+                            .init(color: AquinasTheme.Colors.canvas, location: 1),
+                        ],
+                        startPoint: UnitPoint(x: 0.5, y: 0),
+                        endPoint: UnitPoint(x: 0.5, y: 0.84)
+                    )
+                    .frame(height: geo.size.height * 0.4)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
                 }
-                .padding(.horizontal, 24)
-                .padding(.top, 24)
+
+                // Canvas Mode: per-conversation Insight Tree
+                if isTopicCanvasVisible {
+                    topicCanvasLayer
+                }
+
+                // Left-swipe trigger (UIKit-backed, passthrough)
+                if !isTopicCanvasVisible {
+                    RightEdgeCanvasSwipeTrigger {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                            isTopicCanvasVisible = true
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .zIndex(1)
+                }
+
+                // Top bar (replaces simple AquinasNavButton HStack)
+                BranchModeTopBar(
+                    isCanvasMode: isTopicCanvasVisible,
+                    title: activeTitle,
+                    isEditingTitle: $isEditingTitle,
+                    titleDraft: $titleEditDraft,
+                    conversationFontSize: conversationFontSize,
+                    onMenuTap: onOpenMenu,
+                    onCanvasTap: {
+                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                            isTopicCanvasVisible = true
+                        }
+                    },
+                    onBackTap: {
+                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                            isTopicCanvasVisible = false
+                        }
+                    },
+                    onCommitTitle: { newTitle in
+                        guard !newTitle.trimmingCharacters(in: .whitespaces).isEmpty,
+                              let idx = conversations.firstIndex(where: { $0.id == activeConversationID }) else { return }
+                        conversations[idx].title = newTitle
+                        publishShellMenuState()
+                        persistConversations()
+                    }
+                )
+                .zIndex(2)
             }
             .onAppear {
                 viewportSize = geo.size
@@ -134,25 +378,19 @@ struct CurrentConversationView: View {
             .onChange(of: geo.size) { _, s in viewportSize = s }
         }
         .safeAreaInset(edge: .bottom) {
-            InquiryControlDock(
-                isCanvasMode: false,
-                showFilePicker: $showFilePicker,
-                showPhotoPicker: $showPhotoPicker,
-                showCamera: $showCamera,
-                isThinkingEnabled: $isThinkingEnabled,
-                selectedPersonality: $selectedPersonality,
-                isPersonalityMenuOpen: $isPersonalityMenuOpen,
-                areResponsesCollapsed: $areResponsesCollapsed,
-                isAtBottom: true,
-                onScrollToBottom: { scrollToBottomRequest += 1 },
-                onViewEntireCanvas: { },
-                onOpenInsights: {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
-                        isInsightLibraryOpen = true
-                    }
-                },
-                onSend: { externalSubmitTrigger += 1 }
-            )
+            bottomInquiryControlDock
+        }
+        .onChange(of: isTopicCanvasVisible) { _, isVisible in
+            onCanvasModeChange(isVisible)
+            if !isVisible {
+                hasCanvasHover = false
+                hasHoveredCanvasInsight = false
+                canvasQuoteTarget = nil
+                canvasSelectedItemCount = 0
+            }
+        }
+        .onDisappear {
+            onCanvasModeChange(false)
         }
         .scrollDismissesKeyboard(.interactively)
         .onReceive(NotificationCenter.default.publisher(
@@ -215,9 +453,7 @@ struct CurrentConversationView: View {
         }
         .onChange(of: activeBranches.count) { oldCount, newCount in
             guard newCount > oldCount else { return }
-            let target = pendingFocusBranchID
-                .flatMap { id in activeBranches.first { $0.id == id } }
-                ?? activeBranches.last
+            let target = pendingFocusBranchTarget()
             pendingFocusBranchID = nil
             guard let target else { return }
             let targetID = target.id
@@ -236,15 +472,18 @@ struct CurrentConversationView: View {
                 if let id = targetID, let convo = snapshot.conversations.first(where: { $0.id == id }) {
                     activeConversationID = id
                     activeBranches = convo.branches.isEmpty ? [ChatBranch(startingConcept: nil)] : convo.branches
+                    promotedCanvasInsightIDs = convo.promotedInsightIDs
                 } else if let first = snapshot.conversations.first {
                     activeConversationID = first.id
                     activeBranches = first.branches.isEmpty ? [ChatBranch(startingConcept: nil)] : first.branches
+                    promotedCanvasInsightIDs = first.promotedInsightIDs
                 }
             } else {
                 let initial = InquiryConversation()
                 conversations = [initial]
                 activeConversationID = initial.id
                 activeBranches = [ChatBranch(startingConcept: nil)]
+                promotedCanvasInsightIDs = []
             }
             focusedBranchID = activeBranches.first?.id
             publishShellMenuState()
@@ -462,6 +701,10 @@ struct CurrentConversationView: View {
                     onBottomInputFocused: {
                         lastFocusedAnchor = "bottom-input-anchor-\(b.id)"
                     },
+	                onActiveInputTextChange: { text in
+	                    guard b.id == effectiveFocusedID else { return }
+	                    hasTextToSubmit = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+	                },
 	                    onQuoteHandled: { attachedConcept = nil }
 	                )
 	                .padding(.horizontal, 16)
@@ -623,6 +866,7 @@ struct CurrentConversationView: View {
         guard let id = activeConversationID,
               let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[idx].branches = activeBranches
+        conversations[idx].promotedInsightIDs = promotedCanvasInsightIDs
     }
 
     /// Update the sideMenu bindings from the current conversations list.
@@ -639,6 +883,7 @@ struct CurrentConversationView: View {
         activeBranches = conversation.branches.isEmpty
             ? [ChatBranch(startingConcept: nil)]
             : conversation.branches
+        promotedCanvasInsightIDs = conversation.promotedInsightIDs
         focusedBranchID = activeBranches.first?.id
         publishShellMenuState()
         persistConversations()
@@ -658,6 +903,7 @@ struct CurrentConversationView: View {
         conversations.insert(fresh, at: 0)
         activeConversationID = fresh.id
         activeBranches = [ChatBranch(startingConcept: nil)]
+        promotedCanvasInsightIDs = []
         focusedBranchID = activeBranches.first?.id
         publishShellMenuState()
         persistConversations()
@@ -689,6 +935,175 @@ struct CurrentConversationView: View {
             meaning: "This concept appears in the response as a key theological or philosophical term. A full definition will be generated by the model in the connected version of the app.",
             example: "Tap 'Inquire Further' to explore \(word.capitalized) in a new conversation."
         )
+    }
+}
+
+// MARK: - BranchModeTopBar
+
+private struct BranchModeTopBar: View {
+    let isCanvasMode: Bool
+    let title: String
+    @Binding var isEditingTitle: Bool
+    @Binding var titleDraft: String
+    let conversationFontSize: ConversationFontSizeOption
+    var onMenuTap: () -> Void
+    var onCanvasTap: () -> Void
+    var onBackTap: () -> Void
+    var onCommitTitle: (String) -> Void = { _ in }
+    @Namespace private var titleNamespace
+    @FocusState private var titleFieldFocused: Bool
+
+    private var titleFontSize: CGFloat {
+        switch conversationFontSize {
+        case .large:  return 17
+        case .medium: return 16
+        case .small:  return 15
+        }
+    }
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            LinearGradient(
+                stops: [
+                    .init(color: AquinasTheme.Colors.canvas, location: 0),
+                    .init(color: AquinasTheme.Colors.canvas.opacity(0), location: 1),
+                ],
+                startPoint: .top, endPoint: .bottom
+            )
+            .frame(height: 100)
+            .allowsHitTesting(false)
+
+            // Normal mode layout
+            HStack(spacing: 0) {
+                AquinasNavButton(onMenuTap: onMenuTap)
+                    .frame(width: 72, alignment: .leading)
+                Spacer(minLength: 8)
+                Group {
+                    if isEditingTitle {
+                        TextField("Conversation title", text: $titleDraft)
+                            .font(.custom("LibreBaskerville-Regular", size: titleFontSize))
+                            .multilineTextAlignment(.center)
+                            .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                            .focused($titleFieldFocused)
+                            .submitLabel(.done)
+                            .onSubmit {
+                                isEditingTitle = false
+                                onCommitTitle(titleDraft)
+                            }
+                    } else {
+                        Text(title)
+                            .font(.custom("LibreBaskerville-Regular", size: titleFontSize))
+                            .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                            .lineLimit(1)
+                            .matchedGeometryEffect(id: "conversationTitle", in: titleNamespace, isSource: !isCanvasMode)
+                            .onTapGesture {
+                                titleDraft = title
+                                isEditingTitle = true
+                                titleFieldFocused = true
+                            }
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                Spacer(minLength: 8)
+                CanvasModeToggleButton(isActive: false, action: onCanvasTap)
+                    .frame(width: 72, alignment: .trailing)
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 24)
+            .opacity(isCanvasMode ? 0 : 1)
+
+            // Canvas mode layout
+            HStack {
+                Button(action: onBackTap) {
+                    HStack(alignment: .center, spacing: 16) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: titleFontSize * 0.8, weight: .semibold))
+                            .opacity(isCanvasMode ? 1 : 0)
+                        Text(title)
+                            .font(.custom("LibreBaskerville-Regular", size: titleFontSize * 0.8))
+                            .lineLimit(1)
+                            .matchedGeometryEffect(id: "conversationTitle", in: titleNamespace, isSource: isCanvasMode)
+                    }
+                    .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 18)
+                    .background(
+                        AquinasTheme.Colors.canvasSecondary
+                            .cornerRadius(48)
+                            .opacity(isCanvasMode ? 1 : 0)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 48)
+                            .inset(by: 0.5)
+                            .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
+                            .opacity(isCanvasMode ? 1 : 0)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 48))
+                }
+                .buttonStyle(.plain)
+                .opacity(isCanvasMode ? 1 : 0)
+                Spacer()
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 24)
+        }
+        .frame(maxWidth: .infinity, alignment: .top)
+    }
+}
+
+// MARK: - Canvas swipe gesture (UIKit-backed)
+
+private final class CanvasSwipeView: UIView {
+    var onTriggered: (() -> Void)?
+    fileprivate var windowPan: UIPanGestureRecognizer?
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        windowPan?.view?.removeGestureRecognizer(windowPan!)
+        windowPan = nil
+        guard let window else { return }
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        pan.delegate = self
+        pan.cancelsTouchesInView = false
+        window.addGestureRecognizer(pan)
+        windowPan = pan
+    }
+
+    deinit { windowPan?.view?.removeGestureRecognizer(windowPan!) }
+
+    @objc private func handlePan(_ pan: UIPanGestureRecognizer) {
+        guard pan.state == .ended else { return }
+        let t = pan.translation(in: pan.view)
+        let v = pan.velocity(in: pan.view)
+        guard (t.x < -80 && abs(t.x) > abs(t.y) * 1.5) ||
+              (v.x < -500 && abs(v.x) > abs(v.y) * 1.5) else { return }
+        onTriggered?()
+    }
+}
+
+extension CanvasSwipeView: UIGestureRecognizerDelegate {
+    func gestureRecognizer(_ gr: UIGestureRecognizer,
+                           shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool { false }
+    func gestureRecognizer(_ gr: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+}
+
+private struct RightEdgeCanvasSwipeTrigger: UIViewRepresentable {
+    var onTriggered: () -> Void
+    func makeUIView(context: Context) -> CanvasSwipeView {
+        let v = CanvasSwipeView()
+        v.backgroundColor = .clear
+        v.onTriggered = onTriggered
+        return v
+    }
+    func updateUIView(_ uiView: CanvasSwipeView, context: Context) {
+        uiView.onTriggered = onTriggered
+    }
+    static func dismantleUIView(_ uiView: CanvasSwipeView, coordinator: ()) {
+        uiView.windowPan?.view?.removeGestureRecognizer(uiView.windowPan!)
+        uiView.windowPan = nil
     }
 }
 

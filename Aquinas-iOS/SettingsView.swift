@@ -277,7 +277,7 @@ enum InputTextAlignmentOption: CaseIterable, Identifiable {
     }
 
     var inputContainerPadding: EdgeInsets {
-        EdgeInsets(top: 24, leading: 24, bottom: 24, trailing: 24)
+        EdgeInsets(top: 16, leading: 16, bottom: 16, trailing: 16)
     }
 
     var inputContainerRadius: CGFloat {

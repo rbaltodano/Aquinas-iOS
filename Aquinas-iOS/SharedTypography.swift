@@ -7,15 +7,18 @@
 
 import Foundation
 import SwiftUI
+import UIKit
 
 enum AquinasTheme {
     // MARK: Colors
     // Canonical visual tokens mirrored from the Figma paint styles.
     enum Colors {
-        static let canvas = Color(light: 0xFFFAF0, dark: 0x0A0602)
+        static let canvas = Color(light: 0xF4EFE4, lightAlpha: 1.0, dark: 0x120F0C, darkAlpha: 1.0)
+        static let insightTreeCanvas = canvasSecondary
         /// The canvas colour of the *opposite* mode — dark in light-mode, light in dark-mode.
-        static let canvasInverse = Color(light: 0x0A0602, dark: 0xFFFAF0)
-        static let canvasSecondary = Color(light: 0xFBF4E7, dark: 0x110D09)
+        static let canvasInverse = Color(light: 0x14110F, dark: 0xF2E7D4)
+        static let canvasSecondary = Color(light: 0xFFFAF0, dark: 0x24201C)
+        static let canvasTertiary = Color(light: 0xFBF4E7, dark: 0x110D09)
         static let componentBackground = Color(
             light: 0x6F6844,
             lightAlpha: 0.05,
@@ -29,8 +32,10 @@ enum AquinasTheme {
             darkAlpha: 0.25
         )
         static let lightGreen = Color(light: 0x867E4F, dark: 0xB7AE78)
+        static let accentGreen = Color(light: 0xA28F1E, dark: 0xB7AE78)
         static let darkGreen = Color(light: 0x6F6844, dark: 0xB7AE78)
         static let primaryBrown = Color(light: 0x4A321C, dark: 0xFFFAF0)
+        static let headingText = Color(light: 0x614C40, dark: 0xFFFAF0)
         // Light Brown: floating scroll control fill.
         static let lightBrown = Color(light: 0x614C40, dark: 0x2B2521)
         static let paragraphText = Color(
@@ -50,6 +55,7 @@ enum AquinasTheme {
         static let primaryReadableDarkMode = Color(hex: 0xFFFAF0)
         static let darkGreenDarkMode = Color(hex: 0xB7AE78)
         static let darkBrown = Color(light: 0x220F01, dark: 0xFFFAF0)
+        static let branchConnector = Color(light: 0x220F01, dark: 0xFFFAF0)
         static let brownBorder = Color(
             light: 0x220F01,
             lightAlpha: 0.10,
@@ -211,6 +217,10 @@ extension Font {
     static let baskervilleParagraph = Font.custom("LibreBaskerville-Regular", size: 14)
     static let baskervilleQuote = AquinasTheme.Typography.quote
     static let baskervilleSmall = AquinasTheme.Typography.baskervilleSmall
+
+    // MARK: Display scale (24 pt)
+    static let baskervilleDisplay = Font.custom("LibreBaskerville-Regular", size: 24)
+    static let figtreeDisplay = Font.custom("Figtree-Bold", size: 24)
 }
 
 struct ParchmentCardStyle: ViewModifier {

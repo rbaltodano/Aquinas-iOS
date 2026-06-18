@@ -66,8 +66,6 @@ struct StudyTopicsView: View {
     @State private var selectedTopicID: UUID? = nil
     @State private var topicBeingRenamed: StudyTopic? = nil
     @State private var topicRenameDraft: String = ""
-    /// ID of the topic card whose "…" menu is currently open.
-    @State private var cardMenuTopicID: UUID? = nil
     /// Set to a newly-created topic's ID so the detail view can auto-focus its title field.
     @State private var autoFocusTopicID: UUID? = nil
     // File/photo pickers live here (not on the conditionally-shown detail view)
@@ -122,36 +120,6 @@ struct StudyTopicsView: View {
                 )
                 .transition(.move(edge: .trailing))
                 .zIndex(1)
-            }
-
-            // Card-level options menu — rendered above everything in the list layer.
-            if let menuTopicID = cardMenuTopicID,
-               let menuTopic = topics.first(where: { $0.id == menuTopicID }) {
-                // Full-screen backdrop — tap anywhere to dismiss.
-                Color.clear
-                    .contentShape(Rectangle())
-                    .ignoresSafeArea()
-                    .onTapGesture { closeCardMenu() }
-                    .zIndex(8)
-
-                ConversationOptionsMenu(
-                    onRename: {
-                        closeCardMenu()
-                        topicRenameDraft = menuTopic.title
-                        topicBeingRenamed = menuTopic
-                    },
-                    onPin: { closeCardMenu() },
-                    onDelete: {
-                        closeCardMenu()
-                        deleteTopic(menuTopic)
-                    },
-                    showAddToStudyTopic: false
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                .padding(.top, 80)
-                .padding(.trailing, 24)
-                .transition(.scale(scale: 0.92, anchor: .topTrailing).combined(with: .opacity))
-                .zIndex(9)
             }
 
             // Single morphing nav button that floats above both layers.
@@ -260,12 +228,6 @@ struct StudyTopicsView: View {
         }
     }
 
-    private func closeCardMenu() {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-            cardMenuTopicID = nil
-        }
-    }
-
     private var topicRenameAlertBinding: Binding<Bool> {
         Binding(
             get: { topicBeingRenamed != nil },
@@ -306,11 +268,11 @@ struct StudyTopicsView: View {
                                         selectedTopicID = topic.id
                                     }
                                 },
-                                onMenuOpen: {
-                                    withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-                                        cardMenuTopicID = topic.id
-                                    }
-                                }
+                                onRename: {
+                                    topicRenameDraft = topic.title
+                                    topicBeingRenamed = topic
+                                },
+                                onDelete: { deleteTopic(topic) }
                             )
                             .transition(
                                 .asymmetric(
@@ -437,17 +399,11 @@ struct StudyTopicDetailView: View {
     @State private var pickerActiveInsight: ConceptDefinition? = nil
     @State private var conversationBeingRenamed: InquiryConversation? = nil
     @State private var renameDraft = ""
-    @State private var isTopicOptionsOpen = false
     @State private var isExistingConversationPickerOpen = false
-    /// ID of the conversation card whose "…" menu is currently open (hoisted here
-    /// so the menu renders above all other cards in the ZStack).
-    @State private var conversationCardMenuID: UUID? = nil
     @State private var titleDraft: String
     @State private var descriptionDraft: String
     @State private var localFiles: [UploadedFile]
     @FocusState private var isTitleFocused: Bool
-
-    private let optionsMenuZIndex: Double = 10_000
 
     init(
         topic: StudyTopic,
@@ -517,11 +473,21 @@ struct StudyTopicDetailView: View {
 
                                 Spacer(minLength: 8)
 
-                                Button(action: {
-                                    withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-                                        isTopicOptionsOpen.toggle()
+                                Menu {
+                                    Button("Rename", systemImage: "pencil.line") {
+                                        isTitleFocused = true
                                     }
-                                }) {
+                                    Button("Upload Image", systemImage: "photo") {
+                                        onRequestPhotoPicker()
+                                    }
+                                    Button("Upload File", systemImage: "doc") {
+                                        onRequestFilePicker()
+                                    }
+                                    Divider()
+                                    Button("Delete Topic", systemImage: "trash", role: .destructive) {
+                                        onDeleteTopic()
+                                    }
+                                } label: {
                                     Image(systemName: "ellipsis")
                                         .font(.system(size: 13, weight: .bold))
                                         .foregroundColor(AquinasTheme.Colors.paragraphText)
@@ -572,11 +538,6 @@ struct StudyTopicDetailView: View {
                                         onRename: { conv in
                                             renameDraft = conv.title
                                             conversationBeingRenamed = conv
-                                        },
-                                        onMenuOpen: {
-                                            withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-                                                conversationCardMenuID = conversation.id
-                                            }
                                         }
                                     )
                                 }
@@ -643,72 +604,7 @@ struct StudyTopicDetailView: View {
             }
             .zIndex(6)
 
-            // Topic options overlay (rename / pin / delete the topic itself).
-            if isTopicOptionsOpen {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .ignoresSafeArea()
-                    .onTapGesture { closeTopicOptions() }
-                    .zIndex(optionsMenuZIndex - 1)
-
-                ConversationOptionsMenu(
-                    onRename: {
-                        // The title is editable inline — just close the menu;
-                        // the user can tap the title field directly to rename.
-                        closeTopicOptions()
-                    },
-                    onPin: { closeTopicOptions() },
-                    onDelete: {
-                        closeTopicOptions()
-                        onDeleteTopic()
-                    },
-                    showAddToStudyTopic: false,
-                    showUploadOptions: true,
-                    onUploadImage: {
-                        closeTopicOptions()
-                        onRequestPhotoPicker()
-                    },
-                    onUploadFile: {
-                        closeTopicOptions()
-                        onRequestFilePicker()
-                    }
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                .padding(.top, 120)
-                .padding(.trailing, 24)
-                .zIndex(optionsMenuZIndex)
-                .transition(.scale(scale: 0.9, anchor: .topTrailing).combined(with: .opacity))
-            }
-
-            // Conversation card options menu — hoisted here so it renders above all
-            // sibling cards in the ZStack, not clipped by the LazyVStack.
-            if let menuID = conversationCardMenuID,
-               let menuConversation = conversations.first(where: { $0.id == menuID }) {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .ignoresSafeArea()
-                    .onTapGesture { closeConversationCardMenu() }
-                    .zIndex(optionsMenuZIndex - 1)
-
-                ConversationOptionsMenu(
-                    onRename: {
-                        closeConversationCardMenu()
-                        renameDraft = menuConversation.title
-                        conversationBeingRenamed = menuConversation
-                    },
-                    onPin: { closeConversationCardMenu() },
-                    onDelete: { closeConversationCardMenu() },
-                    showAddToStudyTopic: false
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                .padding(.top, 120)
-                .padding(.trailing, 24)
-                .zIndex(optionsMenuZIndex)
-                .transition(.scale(scale: 0.9, anchor: .topTrailing).combined(with: .opacity))
-            }
         }
-        .animation(.spring(response: 0.35, dampingFraction: 0.76), value: isTopicOptionsOpen)
-        .animation(.spring(response: 0.35, dampingFraction: 0.76), value: conversationCardMenuID)
         .task(id: autoFocusTitle) {
             guard autoFocusTitle else { return }
             // Wait for the slide-in transition to finish before stealing first responder.
@@ -843,18 +739,6 @@ struct StudyTopicDetailView: View {
                         )
                     }
             }
-        }
-    }
-
-    private func closeTopicOptions() {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-            isTopicOptionsOpen = false
-        }
-    }
-
-    private func closeConversationCardMenu() {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-            conversationCardMenuID = nil
         }
     }
 
@@ -1116,9 +1000,13 @@ private struct StudyTopicCard: View {
     let topic: StudyTopic
     let subItems: [String]
     var onSelect: () -> Void
-    var onMenuOpen: () -> Void = {}
+    var onRename: () -> Void = {}
+    var onDelete: () -> Void = {}
 
     @State private var isExpanded = false
+    @State private var isShowingLongPressFeedback = false
+
+    private let longPressDuration: TimeInterval = 0.25
 
     private var visibleSubItems: [String] {
         isExpanded ? subItems : Array(subItems.prefix(3))
@@ -1135,10 +1023,15 @@ private struct StudyTopicCard: View {
                         .foregroundColor(AquinasTheme.Colors.primaryReadable)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
+                        .scaleEffect(isShowingLongPressFeedback ? 1.02 : 1, anchor: .leading)
 
                     Spacer(minLength: 8)
 
-                    Button(action: onMenuOpen) {
+                    Menu {
+                        Button("Rename", systemImage: "pencil.line") { onRename() }
+                        Divider()
+                        Button("Delete", systemImage: "trash", role: .destructive) { onDelete() }
+                    } label: {
                         Image(systemName: "ellipsis")
                             .font(.system(size: 13, weight: .bold))
                             .foregroundColor(AquinasTheme.Colors.paragraphText)
@@ -1203,8 +1096,29 @@ private struct StudyTopicCard: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
         )
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .trim(from: 0, to: isShowingLongPressFeedback ? 1 : 0)
+                .stroke(
+                    AquinasTheme.Colors.border,
+                    style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round)
+                )
+                .opacity(isShowingLongPressFeedback ? 1 : 0)
+                .padding(1)
+                .allowsHitTesting(false)
+        }
         .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .onTapGesture(perform: onSelect)
+        .onLongPressGesture(
+            minimumDuration: longPressDuration,
+            maximumDistance: 18,
+            pressing: { isPressing in
+                withAnimation(.linear(duration: isPressing ? longPressDuration : 0.12)) {
+                    isShowingLongPressFeedback = isPressing
+                }
+            },
+            perform: {}
+        )
     }
 
     private var displayTitle: String {

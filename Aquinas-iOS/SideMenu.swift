@@ -56,6 +56,8 @@ struct CanvasModeToggleButton: View {
 
 /// Slide-out navigation panel mirrored from Figma's "03 - User Screen Flow" side-panel frames.
 struct AquinasSideMenu: View {
+    @Environment(\.colorScheme) private var colorScheme
+
     let currentTitle: String
     let conversations: [InquiryConversation]
     let activeConversationID: UUID?
@@ -80,8 +82,6 @@ struct AquinasSideMenu: View {
     @State private var conversationBeingRenamed: InquiryConversation? = nil
     @State private var conversationBeingAddedToStudyTopic: InquiryConversation? = nil
     @State private var renameDraft = ""
-    @State private var focusedConversationID: UUID? = nil
-    @State private var focusedTopicID: UUID? = nil
     @State private var sideMenuStudyTopics: [StudyTopic] = []
     @State private var topicBeingRenamed: StudyTopic? = nil
     @State private var topicRenameDraft = ""
@@ -92,7 +92,7 @@ struct AquinasSideMenu: View {
 
         ZStack(alignment: .bottom) {
             // ── Scrollable content ──────────────────────────────────────────
-            VStack(alignment: .leading, spacing: 0) {
+            ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 24) {
                     Text(createEditorialTitle(
@@ -167,11 +167,8 @@ struct AquinasSideMenu: View {
                                     onDelete: {
                                         deleteTopic(topic)
                                     },
-                                    onFocusChange: { isOpen in
-                                        focusedTopicID = isOpen ? topic.id : nil
-                                    }
                                 )
-                                .zIndex(focusedTopicID == topic.id ? Double.greatestFiniteMagnitude : 0)
+
                             }
                         }
                     }
@@ -208,18 +205,14 @@ struct AquinasSideMenu: View {
                                 onDelete: {
                                     onDeleteConversation(conversation)
                                 },
-                                onFocusChange: { isOpen in
-                                    focusedConversationID = isOpen ? conversation.id : nil
-                                }
                             )
-                            .zIndex(focusedConversationID == conversation.id ? Double.greatestFiniteMagnitude : 0)
+
                         }
                     }
                 }
             }
 
-            Spacer(minLength: 0)
-            } // end scrollable content VStack
+            } // end scrollable content
             .padding(.horizontal, 24)
             .padding(.top, topPadding)
             .padding(.bottom, 88) // reserve space so the last row clears the pinned bar
@@ -257,7 +250,26 @@ struct AquinasSideMenu: View {
             .padding(.top, 16)
             .padding(.bottom, 24)
             .frame(maxWidth: .infinity)
-            .background(AquinasTheme.Colors.canvasSecondary)
+            .background(
+                LinearGradient(
+                    stops: [
+                        Gradient.Stop(
+                            color: colorScheme == .dark
+                                ? Color(red: 0.08, green: 0.07, blue: 0.06)
+                                : Color(red: 0.98, green: 0.96, blue: 0.91),
+                            location: 0.00
+                        ),
+                        Gradient.Stop(
+                            color: colorScheme == .dark
+                                ? Color(red: 0.08, green: 0.07, blue: 0.06).opacity(0)
+                                : Color(red: 0.98, green: 0.96, blue: 0.91).opacity(0),
+                            location: 1.00
+                        ),
+                    ],
+                    startPoint: UnitPoint(x: 0.5, y: 1),
+                    endPoint: UnitPoint(x: 0.5, y: 0)
+                )
+            )
             .zIndex(2)
         } // end ZStack
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -593,15 +605,8 @@ private struct ConversationMenuRow: View {
     var onPin: () -> Void
     var onAddToStudyTopic: () -> Void
     var onDelete: () -> Void
-    /// Called with `true` when the options menu opens and `false` when it closes.
-    var onFocusChange: ((Bool) -> Void)? = nil
     @State private var isVisible = false
-    @State private var isOptionsMenuOpen = false
-    @State private var isShowingLongPressFeedback = false
     @State private var entranceRunID = UUID()
-
-    private let longPressDuration: TimeInterval = 0.25
-    private let optionsMenuZIndex: Double = 10_000
 
     var body: some View {
         HStack(spacing: 12) {
@@ -613,14 +618,15 @@ private struct ConversationMenuRow: View {
                 .truncationMode(.tail)
                 .multilineTextAlignment(.leading)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .scaleEffect(isShowingLongPressFeedback ? 1.05 : 1, anchor: .leading)
 
             if isActive {
-                Button(action: {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-                        isOptionsMenuOpen.toggle()
-                    }
-                }) {
+                Menu {
+                    Button("Rename", systemImage: "pencil.line") { onRename() }
+                    Button("Pin", systemImage: "pin") { onPin() }
+                    Button("Add to Study Topic", systemImage: "book.closed") { onAddToStudyTopic() }
+                    Divider()
+                    Button("Delete", systemImage: "trash", role: .destructive) { onDelete() }
+                } label: {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 14, weight: .bold))
                         .foregroundColor(AquinasTheme.Colors.paragraphText)
@@ -641,73 +647,18 @@ private struct ConversationMenuRow: View {
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .onTapGesture(perform: onSelect)
-        .onLongPressGesture(
-            minimumDuration: longPressDuration,
-            maximumDistance: 18,
-            pressing: { isPressing in
-                updateLongPressFeedback(isPressing)
-            },
-            perform: {
-                openOptionsMenu()
-            }
-        )
+        .contextMenu {
+            Button("Rename", systemImage: "pencil.line") { onRename() }
+            Button("Pin", systemImage: "pin") { onPin() }
+            Button("Add to Study Topic", systemImage: "book.closed") { onAddToStudyTopic() }
+            Divider()
+            Button("Delete", systemImage: "trash", role: .destructive) { onDelete() }
+        }
         .opacity(isVisible ? 1 : 0)
         .offset(x: isVisible ? 0 : -10)
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .trim(from: 0, to: isShowingLongPressFeedback ? 1 : 0)
-                .stroke(
-                    AquinasTheme.Colors.border,
-                    style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round)
-                )
-                .opacity(isShowingLongPressFeedback ? 1 : 0)
-                .padding(1)
-                .allowsHitTesting(false)
-        }
-        .overlay(alignment: .topTrailing) {
-            if isOptionsMenuOpen {
-                ZStack(alignment: .topTrailing) {
-                    Color.clear
-                        .contentShape(Rectangle())
-                        .frame(width: 325, height: 700)
-                        .offset(x: 24, y: -260)
-                        .onTapGesture {
-                            closeOptionsMenu()
-                        }
-                        .zIndex(0)
-
-                    ConversationOptionsMenu(
-                        onRename: {
-                            closeOptionsMenu()
-                            onRename()
-                        },
-                        onPin: {
-                            closeOptionsMenu()
-                            onPin()
-                        },
-                        onAddToStudyTopic: {
-                            closeOptionsMenu()
-                            onAddToStudyTopic()
-                        },
-                        onDelete: {
-                            closeOptionsMenu()
-                            onDelete()
-                        }
-                    )
-                    .offset(x: 0, y: 52)
-                    .zIndex(optionsMenuZIndex)
-                }
-                .zIndex(optionsMenuZIndex)
-            }
-        }
         .onAppear(perform: runEntrance)
-        .onChange(of: isPresented) { oldValue, newValue in
-            isOptionsMenuOpen = false
-            isShowingLongPressFeedback = false
+        .onChange(of: isPresented) { _, _ in
             runEntrance()
-        }
-        .onChange(of: isOptionsMenuOpen) { _, isOpen in
-            onFocusChange?(isOpen)
         }
     }
 
@@ -731,30 +682,6 @@ private struct ConversationMenuRow: View {
             }
         }
     }
-
-    private func closeOptionsMenu() {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-            isOptionsMenuOpen = false
-        }
-    }
-
-    private func openOptionsMenu() {
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-
-        withAnimation(.easeOut(duration: 0.12)) {
-            isShowingLongPressFeedback = false
-        }
-
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-            isOptionsMenuOpen = true
-        }
-    }
-
-    private func updateLongPressFeedback(_ isPressing: Bool) {
-        withAnimation(.linear(duration: isPressing ? longPressDuration : 0.12)) {
-            isShowingLongPressFeedback = isPressing
-        }
-    }
 }
 
 private struct StudyTopicMenuRow: View {
@@ -764,14 +691,11 @@ private struct StudyTopicMenuRow: View {
     var onSelect: () -> Void
     var onRename: () -> Void = {}
     var onDelete: () -> Void = {}
-    var onFocusChange: ((Bool) -> Void)? = nil
     @State private var isVisible = false
-    @State private var isOptionsMenuOpen = false
     @State private var isShowingLongPressFeedback = false
     @State private var entranceRunID = UUID()
 
     private let longPressDuration: TimeInterval = 0.25
-    private let optionsMenuZIndex: Double = 10_000
 
     private var displayTitle: String {
         let trimmed = topic.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -796,11 +720,11 @@ private struct StudyTopicMenuRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .scaleEffect(isShowingLongPressFeedback ? 1.05 : 1, anchor: .leading)
 
-            Button(action: {
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-                    isOptionsMenuOpen.toggle()
-                }
-            }) {
+            Menu {
+                Button("Rename", systemImage: "pencil.line") { onRename() }
+                Divider()
+                Button("Delete", systemImage: "trash", role: .destructive) { onDelete() }
+            } label: {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 14, weight: .bold))
                     .foregroundColor(AquinasTheme.Colors.paragraphText)
@@ -823,7 +747,7 @@ private struct StudyTopicMenuRow: View {
             minimumDuration: longPressDuration,
             maximumDistance: 18,
             pressing: { isPressing in updateLongPressFeedback(isPressing) },
-            perform: { openOptionsMenu() }
+            perform: {}
         )
         .opacity(isVisible ? 1 : 0)
         .offset(x: isVisible ? 0 : -10)
@@ -838,56 +762,11 @@ private struct StudyTopicMenuRow: View {
                 .padding(1)
                 .allowsHitTesting(false)
         }
-        .overlay(alignment: .topTrailing) {
-            if isOptionsMenuOpen {
-                ZStack(alignment: .topTrailing) {
-                    Color.clear
-                        .contentShape(Rectangle())
-                        .frame(width: 325, height: 700)
-                        .offset(x: 24, y: -260)
-                        .onTapGesture { closeOptionsMenu() }
-                        .zIndex(0)
-
-                    ConversationOptionsMenu(
-                        onRename: {
-                            closeOptionsMenu()
-                            onRename()
-                        },
-                        onPin: { closeOptionsMenu() },
-                        onDelete: {
-                            closeOptionsMenu()
-                            onDelete()
-                        },
-                        showAddToStudyTopic: false
-                    )
-                    .offset(x: 0, y: 52)
-                    .zIndex(optionsMenuZIndex)
-                }
-                .zIndex(optionsMenuZIndex)
-            }
-        }
-        .onChange(of: isOptionsMenuOpen) { _, isOpen in
-            onFocusChange?(isOpen)
-        }
         .onAppear(perform: runEntrance)
-        .onChange(of: isPresented) { _, newValue in
-            isOptionsMenuOpen = false
+        .onChange(of: isPresented) { _, _ in
             isShowingLongPressFeedback = false
             runEntrance()
         }
-        .zIndex(isOptionsMenuOpen ? optionsMenuZIndex : 0)
-    }
-
-    private func closeOptionsMenu() {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) {
-            isOptionsMenuOpen = false
-        }
-    }
-
-    private func openOptionsMenu() {
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        withAnimation(.easeOut(duration: 0.12)) { isShowingLongPressFeedback = false }
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.76)) { isOptionsMenuOpen = true }
     }
 
     private func updateLongPressFeedback(_ isPressing: Bool) {
@@ -908,43 +787,6 @@ private struct StudyTopicMenuRow: View {
             guard entranceRunID == runID, isPresented else { return }
             withAnimation(.easeOut(duration: 0.30)) { isVisible = true }
         }
-    }
-}
-
-struct ConversationOptionsMenu: View {
-    var onRename: () -> Void
-    var onPin: () -> Void
-    var onAddToStudyTopic: () -> Void = {}
-    var onDelete: () -> Void
-    /// Pass `false` when showing the menu on a study topic card itself,
-    /// where "Add to Study Topic" doesn't apply.
-    var showAddToStudyTopic: Bool = true
-    /// Pass `true` on a study-topic detail header to expose Upload Image / Upload File rows.
-    var showUploadOptions: Bool = false
-    var onUploadImage: () -> Void = {}
-    var onUploadFile: () -> Void = {}
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            MenuOptionRow(icon: "pencil",      title: "Rename",             delay: 0,    action: onRename)
-            MenuOptionRow(icon: "pin",         title: "Pin",                delay: 0.05, action: onPin)
-            if showAddToStudyTopic {
-                MenuOptionRow(icon: "book.closed", title: "Add to Study Topic", delay: 0.10, action: onAddToStudyTopic)
-            }
-            if showUploadOptions {
-                MenuOptionRow(icon: "photo",   title: "Upload Image",       delay: showAddToStudyTopic ? 0.15 : 0.10, action: onUploadImage)
-                MenuOptionRow(icon: "doc",     title: "Upload File",        delay: showAddToStudyTopic ? 0.20 : 0.15, action: onUploadFile)
-            }
-            MenuOptionRow(icon: "trash",       title: "Delete",             delay: deleteDelay, action: onDelete)
-        }
-        .menuPanelStyle(anchor: .topTrailing)
-    }
-
-    private var deleteDelay: Double {
-        var d = 0.10
-        if showAddToStudyTopic { d += 0.05 }
-        if showUploadOptions   { d += 0.10 }
-        return d
     }
 }
 

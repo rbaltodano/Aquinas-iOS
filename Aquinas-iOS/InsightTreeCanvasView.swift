@@ -16,6 +16,8 @@ struct InsightTreeCanvasView: View {
     let focusedInsightID: UUID?
     let pulsingInsightID: UUID?
     let pulsingNodeID: UUID?
+    let selectedCanvasTargets: [CanvasSelectionTarget]
+    let selectionPulseRequest: Int
     var onNodeTapped: (NodeModel) -> Void
     var onInsightTapped: (InsightModel) -> Void
     var onCanvasMoved: () -> Void
@@ -36,6 +38,7 @@ struct InsightTreeCanvasView: View {
     @State private var entranceTask:       Task<Void, Never>? = nil
     @State private var pulseCycleStartedAt = Date().timeIntervalSinceReferenceDate
     @State private var connectorPulseDelayUntil = Date().timeIntervalSinceReferenceDate
+    @State private var selectionPulseStartTime: TimeInterval?
     @GestureState private var dragOffset:  CGSize = .zero
 
     private var activeScale: CGFloat {
@@ -55,6 +58,10 @@ struct InsightTreeCanvasView: View {
 
     private var insightTreeInsightColor: Color {
         Color(light: 0xFFFAF0, dark: 0x0A0602)
+    }
+
+    private func focusAnchor(in size: CGSize) -> CGPoint {
+        CGPoint(x: size.width / 2, y: size.height * 0.36)
     }
 
     var body: some View {
@@ -78,6 +85,7 @@ struct InsightTreeCanvasView: View {
                 graphEdges(camera: camera, size: size)
                 insightConnectors(camera: camera, size: size, labelOpacity: labelOpacity)
                 connectorPulseOverlay(camera: camera, size: size)
+                selectionOverlay(camera: camera, size: size)
                 edgeHitTargets(camera: camera, size: size)
 
                 ForEach(nodes) { node in
@@ -109,7 +117,7 @@ struct InsightTreeCanvasView: View {
                 guard let newValue,
                       let focusTarget = insightFocusTarget(for: newValue) else { return }
 
-                focusInsight(at: focusTarget, in: size)
+                focusHoveredTarget(at: focusTarget, in: size)
             }
             .onAppear {
                 hasAppeared = true
@@ -118,6 +126,10 @@ struct InsightTreeCanvasView: View {
                 entranceTask = Task {
                     await runEntranceSequence(newInsights: newInsights, in: size)
                 }
+            }
+            .onChange(of: selectionPulseRequest) { _, newValue in
+                guard newValue > 0 else { return }
+                selectionPulseStartTime = Date().timeIntervalSinceReferenceDate
             }
             .onDisappear {
                 entranceTask?.cancel()
@@ -226,8 +238,20 @@ struct InsightTreeCanvasView: View {
 
     private func focusInsight(at worldPosition: CGPoint, in size: CGSize) {
         rememberCameraBeforeFocusIfNeeded()
+        let target = focusAnchor(in: size)
+
+        withAnimation(.spring(response: 0.58, dampingFraction: 0.64, blendDuration: 0.08)) {
+            offset = CGSize(
+                width: target.x - size.width / 2 - (worldPosition.x * scale),
+                height: target.y - size.height / 2 + (worldPosition.y * scale)
+            )
+        }
+    }
+
+    private func focusHoveredTarget(at worldPosition: CGPoint, in size: CGSize) {
+        rememberCameraBeforeFocusIfNeeded()
         let nextScale = clamp(max(scale, 1.15), lower: 0.28, upper: 2.6)
-        let target = CGPoint(x: size.width / 2, y: size.height * 0.36)
+        let target = focusAnchor(in: size)
 
         withAnimation(.spring(response: 0.58, dampingFraction: 0.64, blendDuration: 0.08)) {
             scale = nextScale
@@ -358,6 +382,59 @@ struct InsightTreeCanvasView: View {
         }
         .frame(width: size.width, height: size.height)
         .allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private func selectionOverlay(camera: InsightTreeCamera, size: CGSize) -> some View {
+        if let activeTarget = selectedCanvasTargets.last,
+           let activeWorldPosition = worldPosition(for: activeTarget) {
+            let activePosition = camera.worldToScreen(activeWorldPosition, in: size)
+            let center = focusAnchor(in: size)
+
+            ZStack {
+                ForEach(Array(selectedCanvasTargets.indices.dropFirst()), id: \.self) { index in
+                    if let previousWorldPosition = worldPosition(for: selectedCanvasTargets[index - 1]),
+                       let currentWorldPosition = worldPosition(for: selectedCanvasTargets[index]) {
+                        AnimatableLine(
+                            start: camera.worldToScreen(previousWorldPosition, in: size),
+                            end: camera.worldToScreen(currentWorldPosition, in: size)
+                        )
+                        .stroke(
+                            AquinasTheme.Colors.divider.opacity(0.72),
+                            style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
+                        )
+                        .frame(width: size.width, height: size.height)
+                    }
+                }
+
+                AnimatableLine(start: activePosition, end: center)
+                    .stroke(
+                        AquinasTheme.Colors.divider.opacity(0.72),
+                        style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
+                    )
+                    .frame(width: size.width, height: size.height)
+
+                Circle()
+                    .stroke(AquinasTheme.Colors.lightGreen.opacity(0.8), lineWidth: 1.5)
+                    .frame(width: 18, height: 18)
+                    .position(center)
+
+                if let selectionPulseStartTime,
+                   selectedCanvasTargets.count > 1,
+                   let previousTarget = selectedCanvasTargets.dropLast().last,
+                   let previousWorldPosition = worldPosition(for: previousTarget) {
+                    let previousPosition = camera.worldToScreen(previousWorldPosition, in: size)
+                    TimelineView(.animation) { timeline in
+                        let progress = min(max((timeline.date.timeIntervalSinceReferenceDate - selectionPulseStartTime) / 0.8, 0), 1)
+                        if progress < 1 {
+                            travelingPulseLine(start: previousPosition, end: activePosition, progress: progress, lineWidth: 2.4)
+                                .frame(width: size.width, height: size.height)
+                        }
+                    }
+                }
+            }
+            .allowsHitTesting(false)
+        }
     }
 
     @ViewBuilder
@@ -493,6 +570,15 @@ struct InsightTreeCanvasView: View {
         }?.id
     }
 
+    private func worldPosition(for target: CanvasSelectionTarget) -> CGPoint? {
+        switch target {
+        case .node(let nodeID):
+            return nodes.first(where: { $0.id == nodeID })?.position
+        case .insight(let insightID):
+            return insightFocusTarget(for: insightID)
+        }
+    }
+
     @ViewBuilder
     private func edgeHitTargets(camera: InsightTreeCamera, size: CGSize) -> some View {
         ForEach(edges) { edge in
@@ -552,7 +638,6 @@ struct InsightTreeCanvasView: View {
                 Image(systemName: node.isSuggested ? "sparkles" : "brain.head.profile")
                     .font(.system(size: node.isSuggested ? 20 : 24, weight: .semibold))
                     .foregroundColor(AquinasTheme.Colors.lightGreen)
-                    .sfSymbolDrawOn()
 
                 Text(node.conceptLabel)
                     .font(.custom("LibreBaskerville-Regular", size: 18))
@@ -576,7 +661,7 @@ struct InsightTreeCanvasView: View {
                     worldOrigin: node.position,
                     startTime: Date().timeIntervalSinceReferenceDate
                 )
-                focusInsight(at: node.position, in: size)
+                focusHoveredTarget(at: node.position, in: size)
                 onNodeTapped(node)
             }
 
@@ -614,12 +699,12 @@ struct InsightTreeCanvasView: View {
         let worldPosition = insightWorldPosition(for: node, index: index, count: count)
         let position      = camera.worldToScreen(worldPosition, in: size)
         let isRevealed    = revealedInsightIDs.contains(insight.id)
+        let isSelected    = selectedCanvasTargets.contains(.insight(insight.id))
 
         return HStack(spacing: 10) {
             Image(systemName: "text.bubble.fill")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundColor(AquinasTheme.Colors.lightGreen)
-                .sfSymbolDrawOn()
 
             Text(insight.title)
                 .font(.figtreeHeading2)
@@ -633,6 +718,11 @@ struct InsightTreeCanvasView: View {
         .padding(.vertical, 6)
         .background(insightTreeCanvasColor)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            if isSelected {
+                SelectedCanvasInsightBorder()
+            }
+        }
         .shadow(color: insightTreeCanvasColor, radius: 24, x: 0, y: 0)
         .contentShape(Rectangle())
         .onTapGesture {
@@ -897,6 +987,23 @@ private struct AnimatableLine: Shape {
             path.move(to: start)
             path.addLine(to: end)
         }
+    }
+}
+
+private struct SelectedCanvasInsightBorder: View {
+    @State private var drawProgress: CGFloat = 0
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .inset(by: 0.5)
+            .trim(from: 0, to: drawProgress)
+            .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
+            .onAppear {
+                drawProgress = 0
+                withAnimation(.easeOut(duration: 0.55).delay(0.05)) {
+                    drawProgress = 1
+                }
+            }
     }
 }
 

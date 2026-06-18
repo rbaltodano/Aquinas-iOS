@@ -22,12 +22,20 @@ struct ModelResponseCard: View {
     var onFinish: (() -> Void)? = nil
 
     @State private var isThinking: Bool
-    @State private var lineDrawn: Bool
+    @State private var isThinkingDocked: Bool
     @State private var showTitle: Bool
     @State private var isCollapsed: Bool
+    @State private var isThinkingExpanded: Bool = false
+    @State private var visibleThinkingLineCount: Int = 0
+    @State private var isThinkingRuleVisible: Bool = false
+    @State private var isThinkingCollapsing: Bool = false
 
     let brandBrown = AquinasTheme.Colors.primaryReadable
-    let chatBubbleColor = AquinasTheme.Colors.background
+    private let thinkingSummaryLines = [
+        "I identified the central ideas in the question,",
+        "considered the relevant historical and theological context,",
+        "and organized the response around the clearest supporting details."
+    ]
 
     init(
         title: String,
@@ -48,7 +56,7 @@ struct ModelResponseCard: View {
         self.onDuplicateBranch = onDuplicateBranch
         self.onFinish = onFinish
         _isThinking = State(initialValue: shouldAnimateOnAppear)
-        _lineDrawn = State(initialValue: !shouldAnimateOnAppear)
+        _isThinkingDocked = State(initialValue: !shouldAnimateOnAppear)
         _showTitle = State(initialValue: !shouldAnimateOnAppear)
         _isCollapsed = State(initialValue: forceCollapsed)
     }
@@ -56,43 +64,102 @@ struct ModelResponseCard: View {
     var body: some View {
         VStack(spacing: 0) {
 
-            // Vertical line connecting the previous question to this response.
-            Rectangle()
-                .fill(AquinasTheme.Colors.divider)
-                .frame(width: 1, height: 30)
-                .scaleEffect(y: lineDrawn ? 1.0 : 0.5, anchor: .top)
-                .opacity(lineDrawn ? 1.0 : 0.0)
-                .padding(.bottom, 16)
-                .onAppear {
-                    withAnimation(.easeOut(duration: 0.35)) {
-                        lineDrawn = true
-                    }
-                }
-
             // Single unified VStack — the "Thinking…" row is the SAME view instance
             // throughout. When isThinking flips false the spring carries it from the
             // centred pill position to left-aligned above the title, never disappearing.
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .center, spacing: 16) {
 
-                // ── "Thinking…" / "Show Thinking >" — always visible ──────────
-                // Same structural node in both states; position animates via the spring.
-                Button(action: { /* future: toggle thinking trace */ }) {
+                // ── "Thinking…" / expandable thinking summary ─────────────────
+                Button(action: {
+                    if isThinkingExpanded {
+                        collapseThinking()
+                    } else {
+                        isThinkingCollapsing = false
+                        visibleThinkingLineCount = 0
+                        isThinkingRuleVisible = false
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
+                            isThinkingExpanded = true
+                        }
+                    }
+                }) {
                     HStack(spacing: 6) {
                         Text(isThinking ? "Thinking..." : "Show Thinking")
                             .font(.figtreeParagraphLarge)
                             .fontWeight(.bold)
                             .modifier(ThinkingShimmer(isActive: isThinking, color: brandBrown))
+                            .contentTransition(.opacity)
+                            .animation(.easeInOut(duration: 0.2), value: isThinking)
 
                         if !isThinking {
-                            Image(systemName: "chevron.right")
+                            Image(systemName: isThinkingExpanded ? "chevron.down" : "chevron.right")
                                 .font(.system(size: 10, weight: .bold))
                                 .foregroundColor(AquinasTheme.Colors.placeholderText)
                                 .transition(.opacity.combined(with: .scale(scale: 0.8)))
                         }
                     }
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .disabled(isThinking)
+                .accessibilityLabel(isThinkingExpanded ? "Hide Thinking" : "Show Thinking")
+
+                if !isThinking && isThinkingExpanded {
+                    VStack(alignment: .leading, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(Array(thinkingSummaryLines.enumerated()), id: \.offset) { index, line in
+                                Text(line)
+                                    .font(.figtreeParagraphLarge)
+                                    .foregroundColor(AquinasTheme.Colors.placeholderText)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .opacity(index < visibleThinkingLineCount ? 1 : 0)
+                            }
+                        }
+                        .padding(.leading, 24)
+                        .overlay(alignment: .leading) {
+                            Rectangle()
+                                .fill(AquinasTheme.Colors.quietBorder)
+                                .frame(width: 2)
+                                .opacity(isThinkingRuleVisible ? 1 : 0)
+                        }
+
+                        Button(action: {
+                            collapseThinking()
+                        }) {
+                            HStack(spacing: 6) {
+                                Text("Hide Thinking")
+                                    .font(.figtreeParagraphLarge)
+                                    .fontWeight(.bold)
+
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 10, weight: .bold))
+                            }
+                            .foregroundColor(brandBrown.opacity(0.5))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.bottom, 40)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .task {
+                        try? await Task.sleep(for: .milliseconds(250))
+                        guard !Task.isCancelled, !isThinkingCollapsing else { return }
+
+                        for lineCount in 1...thinkingSummaryLines.count {
+                            withAnimation(.easeInOut(duration: 0.35)) {
+                                visibleThinkingLineCount = lineCount
+                            }
+                            try? await Task.sleep(for: .milliseconds(50))
+                            guard !Task.isCancelled, !isThinkingCollapsing else { return }
+                        }
+                    }
+                    .task {
+                        try? await Task.sleep(for: .milliseconds(425))
+                        guard !Task.isCancelled, !isThinkingCollapsing else { return }
+                        withAnimation(.easeInOut(duration: 0.3)) {
+                            isThinkingRuleVisible = true
+                        }
+                    }
+                }
 
                 // ── Title + response body (card state only) ───────────────────
                 if !isThinking {
@@ -104,7 +171,7 @@ struct ModelResponseCard: View {
                         }) {
                             HStack(alignment: .center, spacing: 6) {
                                 Text(title)
-                                    .font(.figtreeHeading1)
+                                    .font(.baskervilleDisplay)
                                     .foregroundColor(brandBrown)
 
                                 Image(systemName: isCollapsed ? "chevron.down" : "chevron.up")
@@ -115,7 +182,7 @@ struct ModelResponseCard: View {
                             }
                         }
                         .buttonStyle(.plain)
-                        .transition(.blurSlideUp)
+                        .transition(.streamedTextFade)
                     }
 
                     StreamingMessageView(
@@ -128,18 +195,16 @@ struct ModelResponseCard: View {
                     )
                     .opacity(isCollapsed ? 0 : 1)
                     .frame(height: isCollapsed ? 0 : nil)
-                    .clipped()
+                    // Only clip while collapsed (so height 0 hides the body). When
+                    // expanded, leave overflow visible so the bottom line's fade-up
+                    // drift isn't cut off at the container edge.
+                    .clipped(when: isCollapsed)
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
                 }
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, isThinking ? 14 : 24)
-            .frame(maxWidth: isThinking ? nil : .infinity, alignment: .leading)
-            .background(chatBubbleColor)
-            .clipShape(RoundedRectangle(cornerRadius: isThinking ? 40 : AquinasTheme.Spacing.cardRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: isThinking ? 40 : AquinasTheme.Spacing.cardRadius, style: .continuous)
-                    .stroke(AquinasTheme.Colors.quietBorder, lineWidth: 1)
+            .frame(
+                maxWidth: isThinking ? nil : .infinity,
+                alignment: .center
             )
             .transition(.asymmetric(
                 insertion: .opacity.combined(with: .scale(scale: 0.5)),
@@ -155,7 +220,12 @@ struct ModelResponseCard: View {
             guard shouldAnimateOnAppear else { return }
             // Prototype delay. Replace this with real model streaming state later.
             try? await Task.sleep(nanoseconds: 2_000_000_000)
-            withAnimation(.spring(response: 0.55, dampingFraction: 0.72)) {
+            withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
+                isThinkingDocked = true
+            }
+
+            try? await Task.sleep(for: .milliseconds(450))
+            withAnimation(.easeInOut(duration: 0.2)) {
                 isThinking = false
             }
         }
@@ -174,6 +244,22 @@ struct ModelResponseCard: View {
         .onChange(of: forceCollapsed) { _, newValue in
             withAnimation(.easeInOut(duration: 0.18)) {
                 isCollapsed = newValue
+            }
+        }
+    }
+
+    private func collapseThinking() {
+        isThinkingCollapsing = true
+        withAnimation(.easeOut(duration: 0.1)) {
+            visibleThinkingLineCount = 0
+            isThinkingRuleVisible = false
+        }
+
+        Task {
+            try? await Task.sleep(for: .milliseconds(110))
+            guard !Task.isCancelled else { return }
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
+                isThinkingExpanded = false
             }
         }
     }
@@ -216,6 +302,18 @@ struct ThinkingShimmer: ViewModifier {
             }
         } else {
             content.foregroundColor(color.opacity(0.5))
+        }
+    }
+}
+
+extension View {
+    /// Clips the view only when `active` is true; otherwise leaves overflow visible.
+    @ViewBuilder
+    func clipped(when active: Bool) -> some View {
+        if active {
+            self.clipped()
+        } else {
+            self
         }
     }
 }

@@ -89,6 +89,7 @@ struct InsightQuestionBar: View {
     var onKeyboardActiveChange: ((Bool) -> Void)? = nil
     var onCollapse: (() -> Void)? = nil
     var focusTrigger: Int = 0
+    var expandTrigger: Int = 0
 
     @StateObject private var viewModel = InsightQuestionBarViewModel()
     @State private var isExpanded: Bool = false
@@ -98,6 +99,8 @@ struct InsightQuestionBar: View {
     @State private var dragOffset: CGFloat = 0
     @State private var streamedMessageIDs: Set<UUID> = []
     @State private var isScrolledToBottom: Bool = true
+    @State private var swipeUpDrag: CGFloat = 0
+    @State private var swipeHapticFired: Bool = false
 
     private var expandedHeight: CGFloat {
         (UIApplication.shared.connectedScenes
@@ -114,10 +117,16 @@ struct InsightQuestionBar: View {
                     .transition(.move(edge: .bottom))
             } else {
                 collapsedBar
+                    .offset(y: -swipeUpDrag)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .animation(.spring(response: 0.42, dampingFraction: 0.82), value: isExpanded)
+        .onChange(of: expandTrigger) { _, _ in
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
+                isExpanded = true
+            }
+        }
     }
 
     // MARK: - Collapsed Bar
@@ -171,7 +180,7 @@ struct InsightQuestionBar: View {
         .frame(maxWidth: .infinity, alignment: isBarOpen ? .center : .leading)
         .padding(.horizontal, 36)
         .padding(.vertical, 24)
-        .background(AquinasTheme.Colors.canvasSecondary)
+        .background(AquinasTheme.Colors.canvas)
         .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 36, style: .continuous)
@@ -197,15 +206,35 @@ struct InsightQuestionBar: View {
         .onChange(of: focusTrigger) { _, _ in
             isInputFocused = true
         }
-        // Swipe down → dismiss keyboard; swipe up → open mini conversation
+        // Swipe down → dismiss keyboard; swipe up → open mini conversation (with live drag + haptic)
         .simultaneousGesture(
-            DragGesture(minimumDistance: 30)
+            DragGesture(minimumDistance: 10)
+                .onChanged { value in
+                    let isVertical = abs(value.translation.width) < abs(value.translation.height)
+                    guard isVertical, !viewModel.messages.isEmpty else { return }
+                    let upAmount = max(0, -value.translation.height)
+                    guard upAmount > 0 else { return }
+                    // Rubber-band the bar upward as the finger drags
+                    swipeUpDrag = upAmount * 0.45
+                    // Fire haptic exactly once when crossing the threshold
+                    if upAmount > 50 && !swipeHapticFired {
+                        swipeHapticFired = true
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    } else if upAmount <= 50 {
+                        swipeHapticFired = false
+                    }
+                }
                 .onEnded { value in
                     let isVertical = abs(value.translation.width) < abs(value.translation.height)
+                    defer {
+                        withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) { swipeUpDrag = 0 }
+                        swipeHapticFired = false
+                    }
                     guard isVertical else { return }
                     if value.translation.height > 60 {
                         isInputFocused = false
-                    } else if value.translation.height < -40 && !viewModel.messages.isEmpty {
+                    } else if swipeHapticFired {
+                        // Past threshold — open conversation thread
                         isInputFocused = false
                         withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
                             isExpanded = true
@@ -309,7 +338,7 @@ struct InsightQuestionBar: View {
                 .animation(.easeInOut(duration: 0.16), value: isScrolledToBottom)
             }
             .frame(maxWidth: .infinity)
-            .background(AquinasTheme.Colors.canvasSecondary)
+            .background(AquinasTheme.Colors.canvas)
             .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 36, style: .continuous)
@@ -382,7 +411,7 @@ struct InsightQuestionBar: View {
         var onStreamFinished: (() -> Void)? = nil
 
         private let brandBrown = AquinasTheme.Colors.primaryReadable
-        private let chatBubbleColor = AquinasTheme.Colors.background
+        private let chatBubbleColor = AquinasTheme.Colors.card
 
         var body: some View {
             VStack(spacing: 0) {
@@ -449,7 +478,7 @@ struct InsightQuestionBar: View {
                     title: insight.title,
                     icon: "text.bubble.fill",
                     isFilled: true,
-                    fillColor: AquinasTheme.Colors.canvasSecondary,
+                    fillColor: Color(light: 0xFBF4E7, dark: 0x1B1714),
                     animatesAppearance: true
                 )
                 .padding(.bottom, 12)

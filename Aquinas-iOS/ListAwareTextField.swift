@@ -63,15 +63,26 @@ struct ListAwareTextField: UIViewRepresentable {
         tv.textContainer.lineFragmentPadding = 0
         tv.autocorrectionType = .yes
         tv.autocapitalizationType = .sentences
-        tv.returnKeyType = .default     // "return" label on keyboard
+        tv.returnKeyType = .default
+        tv.typingAttributes = makeTypingAttributes()
         tv.text = text.isEmpty ? nil : text
         // Allow SwiftUI to compress the view horizontally — without this the
         // UITextView demands its ideal (unbounded) width and stretches the layout.
         tv.setContentHuggingPriority(.defaultLow, for: .horizontal)
         tv.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        // Wire the relay so callers can read live text synchronously at submit time.
         relay?.currentText = { [weak tv] in tv?.text ?? "" }
         return tv
+    }
+
+    private func makeTypingAttributes() -> [NSAttributedString.Key: Any] {
+        let style = NSMutableParagraphStyle()
+        style.lineSpacing = font.lineHeight * 0.2
+        style.alignment = textAlignment
+        return [
+            .font: font,
+            .foregroundColor: textColor,
+            .paragraphStyle: style
+        ]
     }
 
     /// Tell SwiftUI exactly how tall the view needs to be for the available width.
@@ -90,13 +101,14 @@ struct ListAwareTextField: UIViewRepresentable {
         // Always safe to update visual properties
         if uiView.font != font { uiView.font = font }
         if uiView.textColor != textColor { uiView.textColor = textColor }
-        // iOS can restore a system background on trait-collection changes; keep it clear
-        // so the SwiftUI placeholder Text in the parent ZStack always shows through.
         if uiView.backgroundColor != .clear { uiView.backgroundColor = .clear }
         if uiView.textAlignment != textAlignment { uiView.textAlignment = textAlignment }
         if uiView.isEditable == isLocked {
             uiView.isEditable   = !isLocked
             uiView.isSelectable = !isLocked
+        }
+        if !isLocked {
+            uiView.typingAttributes = makeTypingAttributes()
         }
 
         // Sync binding → UITextView only when NOT focused.
@@ -105,7 +117,11 @@ struct ListAwareTextField: UIViewRepresentable {
         if !uiView.isFirstResponder {
             let bindingText = text
             if (uiView.text ?? "") != bindingText {
-                uiView.text = bindingText.isEmpty ? nil : bindingText
+                if bindingText.isEmpty {
+                    uiView.text = nil
+                } else {
+                    uiView.attributedText = NSAttributedString(string: bindingText, attributes: makeTypingAttributes())
+                }
             }
         }
         // Refresh relay so it always points at the live UITextView.
@@ -237,11 +253,15 @@ extension ConversationFontOption {
     }
 
     func uiFont(size: ConversationFontSizeOption) -> UIFont {
+        uiFont(pointSize: size.pointSize)
+    }
+
+    func uiFont(pointSize: CGFloat) -> UIFont {
         switch self {
         case .serif:
-            return UIFont(name: "LibreBaskerville-Regular", size: size.pointSize) ?? .systemFont(ofSize: size.pointSize)
+            return UIFont(name: "LibreBaskerville-Regular", size: pointSize) ?? .systemFont(ofSize: pointSize)
         case .sans:
-            return UIFont(name: "Figtree-Regular", size: size.pointSize) ?? .systemFont(ofSize: size.pointSize)
+            return UIFont(name: "Figtree-Regular", size: pointSize) ?? .systemFont(ofSize: pointSize)
         }
     }
 }

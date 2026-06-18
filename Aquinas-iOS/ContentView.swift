@@ -84,6 +84,11 @@ struct ContentView: View {
     @State private var pageContentOffsetY: CGFloat = 0
     @State private var pendingPageTransitionWorkItem: DispatchWorkItem? = nil
     @State private var isGlobalSideMenuOpen: Bool = false
+    @State private var isConversationCanvasMode: Bool = false
+    // Live drag state for the pull-from-left-edge gesture.
+    @State private var sideMenuDragOffset: CGFloat = 0
+    @State private var isDraggingToOpenMenu: Bool = false
+    @State private var menuOpenHapticFired: Bool = false
     @State private var sideMenuConversations: [InquiryConversation] = []
     @State private var sideMenuActiveConversationID: UUID? = nil
     @State private var sideMenuCurrentTitle: String = "New Conversation"
@@ -146,6 +151,7 @@ struct ContentView: View {
                     isGlobalSideMenuOpen = true
                 }
             },
+            onCanvasModeChange: { isConversationCanvasMode = $0 },
             collectedDefinitions: $collectedDefinitions,
             sideMenuConversations: $sideMenuConversations,
             sideMenuCurrentTitle: $sideMenuCurrentTitle,
@@ -289,17 +295,21 @@ struct ContentView: View {
                     }
                 }
                 .overlay {
-                    if isGlobalSideMenuOpen {
-                        Color.black.opacity(0.16)
-                            .ignoresSafeArea()
-                            .onTapGesture {
-                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                    isGlobalSideMenuOpen = false
-                                }
+                    // Opacity scales from 0→0.16 as the menu is dragged out, so
+                    // the backdrop feels physical rather than binary snap-in.
+                    let dragProgress = min(345, max(0, sideMenuDragOffset)) / 345
+                    let progress: Double = isGlobalSideMenuOpen ? 1.0 : Double(dragProgress)
+                    Color.black.opacity(0.16 * progress)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(progress > 0.02)
+                        .onTapGesture {
+                            withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                                isGlobalSideMenuOpen = false
+                                sideMenuDragOffset = 0
                             }
-                            .transition(.opacity)
-                            .zIndex(3)
-                    }
+                        }
+                        .animation(.easeInOut(duration: 0.22), value: isGlobalSideMenuOpen)
+                        .zIndex(3)
                 }
                 .overlay(alignment: .leading) {
                     AquinasSideMenu(
@@ -373,11 +383,63 @@ struct ContentView: View {
                             }
                         )
                         .frame(width: 325)
-                        .offset(x: isGlobalSideMenuOpen ? 0 : -345)
-                        .opacity(isGlobalSideMenuOpen ? 1 : 0.96)
+                        // When closed, add the live drag offset so the panel follows
+                        // the finger.  The implicit spring animation only fires when
+                        // isGlobalSideMenuOpen changes, so drag updates are instant
+                        // (finger-tracked) while snap-open/close use the spring.
+                        .offset(x: isGlobalSideMenuOpen
+                            ? 0
+                            : (-345 + min(345, max(0, sideMenuDragOffset))))
+                        .opacity(isGlobalSideMenuOpen || isDraggingToOpenMenu ? 1 : 0.96)
                         .zIndex(4)
                         .animation(.spring(response: 0.42, dampingFraction: 0.84), value: isGlobalSideMenuOpen)
                 }
+                // ── Full-screen pull-to-open gesture ──────────────────────────
+                // Runs simultaneously with canvas/scroll gestures so it doesn't
+                // intercept taps or vertical scrolls. Horizontal-bias guard
+                // (|x| > |y|) and rightward-only check keep it from firing
+                // during normal vertical scrolling or leftward swipes.
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 10, coordinateSpace: .local)
+                        .onChanged { value in
+                            guard !isGlobalSideMenuOpen else { return }
+                            guard abs(value.translation.width) > abs(value.translation.height) else { return }
+                            if !isDraggingToOpenMenu {
+                                guard value.translation.width > 0 else { return }
+                                let needsEdgeOnly = activePage == .insights
+                                    || (activePage == .conversation && isConversationCanvasMode)
+                                if needsEdgeOnly {
+                                    guard value.startLocation.x < 30 else { return }
+                                }
+                                isDraggingToOpenMenu = true
+                                dismissKeyboard()
+                            }
+                            let clamped = min(345, max(0, value.translation.width))
+                            sideMenuDragOffset = clamped
+                            if clamped >= 175 && !menuOpenHapticFired {
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                menuOpenHapticFired = true
+                            } else if clamped < 175 {
+                                menuOpenHapticFired = false
+                            }
+                        }
+                        .onEnded { value in
+                            guard isDraggingToOpenMenu else { return }
+                            menuOpenHapticFired = false
+                            let shouldOpen = value.translation.width > 175
+                                || value.predictedEndTranslation.width > 250
+                            if shouldOpen {
+                                isDraggingToOpenMenu = false
+                                isGlobalSideMenuOpen = true
+                                sideMenuDragOffset = 0
+                            } else {
+                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                                    isDraggingToOpenMenu = false
+                                    sideMenuDragOffset = 0
+                                }
+                            }
+                        }
+                )
 
                 // Shared document picker used by the bottom plus button.
                 .fileImporter(

@@ -14,11 +14,13 @@ struct BranchContextChip: View {
     let icon: String
     var animationKey: String = "static"
     var isFilled: Bool = false
-    var fillColor: Color = AquinasTheme.Colors.componentBackground
+    var fillColor: Color = AquinasTheme.Colors.canvasSecondary
     var appearDelay: TimeInterval = 0
     var animatesAppearance: Bool = true
     var showRemove: Bool = false
     var onRemove: (() -> Void)? = nil
+    /// When true: no padding, no background, no border — just icon + text.
+    var isMinimal: Bool = false
     @State private var borderDrawProgress: CGFloat = 0
     @State private var isVisible: Bool = false
 
@@ -44,21 +46,21 @@ struct BranchContextChip: View {
                 .padding(.leading, 4)
             }
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
-        .background(isFilled ? fillColor : Color.clear)
+        .padding(.horizontal, isMinimal ? 0 : 20)
+        .padding(.vertical, isMinimal ? 0 : 16)
+        .background(isFilled && !isMinimal ? fillColor : Color.clear)
         .cornerRadius(12)
         .overlay(
             RoundedRectangle(cornerRadius: 12)
                 .inset(by: 0.5)
-                .trim(from: 0, to: borderDrawProgress)
+                .trim(from: 0, to: isMinimal ? 0 : borderDrawProgress)
                 .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
         )
         .opacity(isVisible ? 1 : 0)
         .scaleEffect(isVisible ? 1 : 0.96)
         .onAppear(perform: revealChip)
         .onChange(of: animationKey) { oldValue, newValue in
-            drawBorder()
+            if !isMinimal { drawBorder() }
         }
         .transition(.scale.combined(with: .opacity))
     }
@@ -66,7 +68,7 @@ struct BranchContextChip: View {
     private func revealChip() {
         guard animatesAppearance else {
             isVisible = true
-            borderDrawProgress = 1
+            borderDrawProgress = isMinimal ? 0 : 1
             return
         }
 
@@ -75,7 +77,7 @@ struct BranchContextChip: View {
             withAnimation(.easeOut(duration: 0.25)) {
                 isVisible = true
             }
-            drawBorder()
+            if !isMinimal { drawBorder() }
         }
     }
 

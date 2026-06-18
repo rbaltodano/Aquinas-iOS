@@ -1235,6 +1235,7 @@ struct ChatThreadColumn: View {
     var onConversationTitleChange: (String) -> Void
     var onTopInputFocused: () -> Void = {}
     var onBottomInputFocused: () -> Void
+    var onActiveInputTextChange: (String) -> Void = { _ in }
     var onQuoteHandled: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
@@ -1506,7 +1507,10 @@ struct ChatThreadColumn: View {
                                 if focused { onTopInputFocused() }
                             },
                             relay: topFieldRelay,
-                            onTextChange: { topFieldIsEmpty = $0.isEmpty }
+                            onTextChange: { text in
+                                topFieldIsEmpty = text.isEmpty
+                                onActiveInputTextChange(text)
+                            }
                         )
                         .frame(maxWidth: .infinity, alignment: inputTextAlignment.frameAlignment)
                     }
@@ -1648,7 +1652,10 @@ struct ChatThreadColumn: View {
                                         if focused { onBottomInputFocused() }
                                     },
                                     relay: bottomFieldRelay,
-                                    onTextChange: { bottomFieldIsEmpty = $0.isEmpty }
+                                    onTextChange: { text in
+                                        bottomFieldIsEmpty = text.isEmpty
+                                        onActiveInputTextChange(text)
+                                    }
                                 )
                                 .frame(maxWidth: .infinity, alignment: inputTextAlignment.frameAlignment)
                             }

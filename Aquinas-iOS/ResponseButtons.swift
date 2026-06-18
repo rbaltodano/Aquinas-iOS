@@ -148,7 +148,7 @@ private enum ResponseButtonAction: Equatable {
         case .copy(let isCopied):
             return isCopied ? "checkmark" : "square.on.square"
         case .quote:
-            return "quote.opening"
+            return "arrow.turn.down.right"
         case .fork:
             return "arrow.triangle.branch"
         }
