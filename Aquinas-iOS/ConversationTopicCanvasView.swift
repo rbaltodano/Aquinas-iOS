@@ -517,7 +517,7 @@ struct ConversationTopicCanvasView: View {
                     settledOffset: activeOffset,
                     settledScale:  activeScale,
                     dragOffset:    .zero,
-                    ripple:        rippleTrigger
+                    ripples:       rippleTrigger.map { [$0] } ?? []
                 )
                 .ignoresSafeArea()
                 .opacity(hasAppeared ? 1 : 0)

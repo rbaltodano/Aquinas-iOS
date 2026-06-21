@@ -24,7 +24,16 @@ final class InsightTreeViewModel: ObservableObject {
     private var insights: [InsightModel]
     private var promotedInsightIDs: [UUID]
     private var renderedNodeIDs: Set<UUID> = []
+    private var placedMidpoints: [PlacedMidpoint] = []
     private let positionStoreKey = "aquinas.insight-tree.positions.v1"
+
+    /// A user-placed "midpoint" insight: a permanent node pinned at an explicit
+    /// world position, connected by an edge to the nearest selected insight.
+    private struct PlacedMidpoint {
+        let concept: ConceptDefinition
+        let position: CGPoint
+        let nearestInsightID: UUID
+    }
 
     init(insights: [ConceptDefinition], promotedInsightIDs: [UUID] = []) {
         self.insights = insights.map { InsightModel(concept: $0) }
@@ -63,6 +72,13 @@ final class InsightTreeViewModel: ObservableObject {
 
     func recluster() {
         rebuildTree(forceRelayout: true)
+    }
+
+    /// Places a new permanent insight node at an explicit world position, pinned
+    /// (never moved by the force layout) and connected to the nearest selected insight.
+    func addPlacedMidpoint(concept: ConceptDefinition, at position: CGPoint, nearestInsightID: UUID) {
+        placedMidpoints.append(PlacedMidpoint(concept: concept, position: position, nearestInsightID: nearestInsightID))
+        rebuildTree()
     }
 
     func generateSuggestedNode(between nodeA: NodeModel, and nodeB: NodeModel) {
@@ -150,13 +166,15 @@ final class InsightTreeViewModel: ObservableObject {
         insights = embeddedInsights
 
         guard embeddedInsights.count >= 5 else {
-            let nextNodes = makeEarlyNodes(from: embeddedInsights)
+            var nextNodes = makeEarlyNodes(from: embeddedInsights)
+            var nextEdges: [EdgeModel] = []
+            appendPlacedMidpointNodes(to: &nextNodes, edges: &nextEdges)
             let nextIDs = Set(nextNodes.map(\.id))
             let hasNew = !nextIDs.isSubset(of: renderedNodeIDs)
             renderedNodeIDs = nextIDs
             withAnimation(.spring(response: 0.55, dampingFraction: 0.78)) {
                 nodes = nextNodes
-                edges = []
+                edges = nextEdges
             }
             scene.render(nodes: nodes, edges: edges, animated: hasNew)
             return
@@ -200,6 +218,7 @@ final class InsightTreeViewModel: ObservableObject {
         }
 
         appendPromotedNodes(to: &nextNodes, edges: &nextEdges, from: embeddedInsights)
+        appendPlacedMidpointNodes(to: &nextNodes, edges: &nextEdges)
 
         let nextIDs = Set(nextNodes.map(\.id))
         let hasNew = !nextIDs.isSubset(of: renderedNodeIDs)
@@ -289,6 +308,44 @@ final class InsightTreeViewModel: ObservableObject {
                     showSuggestButton: false
                 )
             )
+        }
+    }
+
+    /// Appends user-placed midpoint nodes at their pinned positions, each connected
+    /// by an edge to the node containing its nearest selected insight. Runs AFTER the
+    /// force layout so these nodes are never relocated.
+    private func appendPlacedMidpointNodes(to nodes: inout [NodeModel], edges: inout [EdgeModel]) {
+        guard !placedMidpoints.isEmpty else { return }
+
+        for placed in placedMidpoints {
+            let nodeID = placed.concept.id
+            guard !nodes.contains(where: { $0.id == nodeID }) else { continue }
+
+            let insight = InsightModel(concept: placed.concept)
+            let placedNode = NodeModel(
+                id: nodeID,
+                conceptLabel: placed.concept.word,
+                insights: [insight],
+                embedding: computeEmbedding(for: "\(insight.title). \(insight.definition)") ?? [],
+                position: placed.position,
+                isSuggested: false,
+                suggestedInsights: nil
+            )
+
+            if let sourceNode = nodes.first(where: { $0.insights.contains(where: { $0.id == placed.nearestInsightID }) }) {
+                edges.append(
+                    EdgeModel(
+                        id: UUID(),
+                        fromNodeID: sourceNode.id,
+                        toNodeID: nodeID,
+                        distance: 0.18,
+                        isSuggested: false,
+                        showSuggestButton: false
+                    )
+                )
+            }
+
+            nodes.append(placedNode)
         }
     }
 

@@ -89,6 +89,61 @@ struct BranchContextChip: View {
     }
 }
 
+// MARK: - Connection Context Chip (two-concept inquire connection)
+
+struct ConnectionContextChip: View {
+    let conceptA: ConceptDefinition
+    let conceptB: ConceptDefinition
+    var onRemove: (() -> Void)? = nil
+    @State private var borderDrawProgress: CGFloat = 0
+    @State private var isVisible: Bool = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(conceptA.word.capitalized)
+                .font(.figtreeChipLabel)
+                .foregroundColor(AquinasTheme.Colors.darkGreen)
+                .lineLimit(1)
+
+            Image(systemName: "arrow.left.and.right")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(AquinasTheme.Colors.darkGreen)
+
+            Text(conceptB.word.capitalized)
+                .font(.figtreeChipLabel)
+                .foregroundColor(AquinasTheme.Colors.darkGreen)
+                .lineLimit(1)
+
+            if let onRemove {
+                Button(action: onRemove) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(AquinasTheme.Colors.darkGreen)
+                        .sfSymbolDrawOn()
+                }
+                .padding(.leading, 4)
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 16)
+        .cornerRadius(12)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .inset(by: 0.5)
+                .trim(from: 0, to: borderDrawProgress)
+                .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
+        )
+        .opacity(isVisible ? 1 : 0)
+        .scaleEffect(isVisible ? 1 : 0.96)
+        .onAppear {
+            withAnimation(.easeOut(duration: 0.25)) { isVisible = true }
+            withAnimation(.easeOut(duration: 0.55).delay(0.05)) { borderDrawProgress = 1 }
+        }
+        .transition(.scale.combined(with: .opacity))
+    }
+}
+
 // MARK: - Uploaded File Thumbnails
 
 struct UploadedFileStrip: View {

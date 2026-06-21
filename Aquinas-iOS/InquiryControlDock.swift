@@ -36,6 +36,10 @@ struct InquiryControlDock: View {
     var onCreateCanvasConcept: () -> Void = {}
     var onInquireConnection: () -> Void = {}
     var onQuoteCanvasItem: () -> Void = {}
+    var onMidpointConcepts: () -> Void = {}
+    var isMidpointMode: Bool = false
+    var onMidpointCenter: () -> Void = {}
+    var onMidpointPlace: () -> Void = {}
     var onClearCanvasSelection: () -> Void = {}
 
     @State private var isAttachmentMenuOpen = false
@@ -45,17 +49,26 @@ struct InquiryControlDock: View {
     @State private var controlScale: CGFloat = 1
 
     private var controlCount: Int {
+        if isCanvasMode && isMidpointMode {
+            return 2 + 1 // Center + Place + context
+        }
         let attachmentCount = isCanvasMode ? 0 : 1
-        let thinkingCount = isCanvasMode && hasCanvasInsightHover ? 0 : 1
+        let thinkingCount = isCanvasMode ? 0 : 1
         let canvasActionCount: Int
         if !isCanvasMode {
             canvasActionCount = 0
         } else if hasSelectedCanvasItems {
-            canvasActionCount = selectedCanvasItemCount >= 2 ? 1 : 0
+            if selectedCanvasItemCount == 2 {
+                canvasActionCount = 3 // Select + Quote + Midpoint
+            } else if selectedCanvasItemCount > 2 {
+                canvasActionCount = 2 // Select + Midpoint
+            } else {
+                canvasActionCount = 1 // Select only
+            }
         } else if hasCanvasInsightHover {
-            canvasActionCount = 3
+            canvasActionCount = 3 // Select + Quote + Make Node
         } else if hasCanvasHover {
-            canvasActionCount = 2
+            canvasActionCount = 2 // Select + Quote
         } else {
             canvasActionCount = 0
         }
@@ -70,21 +83,31 @@ struct InquiryControlDock: View {
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
 
-                if !isCanvasMode || !hasCanvasInsightHover {
+                if !isCanvasMode {
                     thinkingButton
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
 
-                if isCanvasMode {
+                if isCanvasMode && isMidpointMode {
+                    canvasActionButton(title: "Center", icon: "lines.measurement.horizontal", action: onMidpointCenter)
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                    canvasActionButton(title: "Place", icon: "arrow.down", action: onMidpointPlace)
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                } else if isCanvasMode && (hasCanvasHover || hasSelectedCanvasItems) {
                     selectCanvasActionButton
 
-                    if hasSelectedCanvasItems && selectedCanvasItemCount >= 2 {
-                        canvasActionButton(title: "Inquire Connection", icon: "arrow.left.and.right", action: onInquireConnection)
+                    if hasSelectedCanvasItems && selectedCanvasItemCount == 2 {
+                        canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onInquireConnection)
+                            .transition(.scale(scale: 0.4).combined(with: .opacity))
+                        canvasActionButton(title: "Midpoint", icon: "graph.2d", action: onMidpointConcepts)
+                            .transition(.scale(scale: 0.4).combined(with: .opacity))
+                    } else if hasSelectedCanvasItems && selectedCanvasItemCount > 2 {
+                        canvasActionButton(title: "Midpoint", icon: "graph.2d", action: onMidpointConcepts)
                             .transition(.scale(scale: 0.4).combined(with: .opacity))
                     } else if hasCanvasInsightHover && !hasSelectedCanvasItems {
-                        canvasActionButton(title: "Create Concept", icon: "move.3d", action: onCreateCanvasConcept)
-                            .transition(.scale(scale: 0.4).combined(with: .opacity))
                         canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
+                            .transition(.scale(scale: 0.4).combined(with: .opacity))
+                        canvasActionButton(title: "Make Node", icon: "move.3d", action: onCreateCanvasConcept)
                             .transition(.scale(scale: 0.4).combined(with: .opacity))
                     } else if hasCanvasHover && !hasSelectedCanvasItems {
                         canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
@@ -187,7 +210,7 @@ struct InquiryControlDock: View {
                     .font(.custom("Figtree-Bold", size: 14))
             }
             .frame(height: 16, alignment: .center)
-            .foregroundColor(isThinkingEnabled ? AquinasTheme.Colors.lightGreen : inactiveThinkingColor)
+            .foregroundColor(isThinkingEnabled ? AquinasTheme.Colors.accentGreen : inactiveThinkingColor)
         }
         .buttonStyle(.plain)
     }
@@ -240,22 +263,21 @@ struct InquiryControlDock: View {
         Button(action: onSelectCanvasItem) {
             HStack(spacing: 8) {
                 selectionCountIcon
-                Text("Add")
+                Text(selectedCanvasItemCount >= 1 ? "Add" : "Select")
                     .font(.custom("Figtree-Bold", size: 14))
             }
             .frame(height: 16, alignment: .center)
-            .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+            .foregroundColor(selectedCanvasItemCount >= 1 ? AquinasTheme.Colors.accentGreen : AquinasTheme.Colors.paragraphText.opacity(0.75))
         }
         .buttonStyle(.plain)
     }
 
     @ViewBuilder
     private var selectionCountIcon: some View {
-        let selectionColor = AquinasTheme.Colors.paragraphText.opacity(0.75)
         if selectedCanvasItemCount > 0 {
             ZStack {
                 Circle()
-                    .fill(selectionColor)
+                    .fill(AquinasTheme.Colors.accentGreen)
                 Text("\(min(selectedCanvasItemCount, 99))")
                     .font(.custom("Figtree-Bold", size: selectedCanvasItemCount > 9 ? 7 : 8))
                     .foregroundColor(AquinasTheme.Colors.canvasSecondary)

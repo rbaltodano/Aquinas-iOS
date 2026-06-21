@@ -30,7 +30,7 @@ struct AnimatedDotGridBackground: View, Animatable {
     var settledOffset: CGSize
     var settledScale:  CGFloat
     var dragOffset:    CGSize = .zero
-    var ripple:        RippleTrigger? = nil
+    var ripples:       [RippleTrigger] = []
 
     // Tells SwiftUI which values to interpolate during withAnimation.
     var animatableData: AnimatablePair<AnimatablePair<CGFloat, CGFloat>, CGFloat> {
@@ -100,23 +100,19 @@ struct AnimatedDotGridBackground: View, Animatable {
                 let col = min(Int((size.width  / screenSpacing).rounded(.up)) + 2, 120)
                 let row = min(Int((size.height / screenSpacing).rounded(.up)) + 2, 120)
 
-                var rippleOX = 0.0
-                var rippleOY = 0.0
-                var rippleDt = -1.0
                 let rippleDuration = 2.4
 
-                if let ripple {
-                    rippleDt = t - ripple.startTime
-                    if rippleDt >= 0 && rippleDt < rippleDuration {
-                        rippleOX = Double(size.width / 2)
-                            + Double(ripple.worldOrigin.x) * Double(es)
-                            + Double(eo.width)
-                        rippleOY = Double(size.height / 2)
-                            - Double(ripple.worldOrigin.y) * Double(es)
-                            + Double(eo.height)
-                    } else {
-                        rippleDt = -1
-                    }
+                // Precompute the active ripples (screen origin + elapsed time) once per frame.
+                let activeRipples: [(ox: Double, oy: Double, dt: Double)] = ripples.compactMap { ripple in
+                    let dt = t - ripple.startTime
+                    guard dt >= 0 && dt < rippleDuration else { return nil }
+                    let ox = Double(size.width / 2)
+                        + Double(ripple.worldOrigin.x) * Double(es)
+                        + Double(eo.width)
+                    let oy = Double(size.height / 2)
+                        - Double(ripple.worldOrigin.y) * Double(es)
+                        + Double(eo.height)
+                    return (ox, oy, dt)
                 }
 
                 for c in 0...col {
@@ -128,9 +124,9 @@ struct AnimatedDotGridBackground: View, Animatable {
                         let wy = (sy - size.height / 2 - eo.height) / es
 
                         var boost = 0.0
-                        if rippleDt >= 0 {
-                            let distance = hypot(Double(sx) - rippleOX, Double(sy) - rippleOY)
-                            let progress = rippleDt / rippleDuration
+                        for ar in activeRipples {
+                            let distance = hypot(Double(sx) - ar.ox, Double(sy) - ar.oy)
+                            let progress = ar.dt / rippleDuration
                             let waveRadius = 400 * (1 - pow(1 - progress, 4))
                             let waveWidth = 95.0
                             let distanceFromFront = distance - waveRadius
@@ -139,7 +135,7 @@ struct AnimatedDotGridBackground: View, Animatable {
                                 let normalizedDistance = max(-1, distanceFromFront / waveWidth)
                                 let bump = cos(normalizedDistance * Double.pi / 2)
                                 let decay = 1 - pow(progress, 2.2)
-                                boost = bump * bump * decay * rippleBoostScale
+                                boost += bump * bump * decay * rippleBoostScale
                             }
                         }
 

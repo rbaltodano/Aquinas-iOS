@@ -1237,11 +1237,14 @@ struct ChatThreadColumn: View {
     var onBottomInputFocused: () -> Void
     var onActiveInputTextChange: (String) -> Void = { _ in }
     var onQuoteHandled: () -> Void
+    var connectionConcepts: (ConceptDefinition, ConceptDefinition)? = nil
+    var onConnectionHandled: (() -> Void)? = nil
 
     @Environment(\.colorScheme) private var colorScheme
 
     @State private var branchHeadHeight: CGFloat = 0
     @State private var animatedResponseIndices: Set<Int> = []
+    @State private var localConnectionConcepts: (ConceptDefinition, ConceptDefinition)?
     @Namespace private var quotedContextChipNamespace
     @FocusState private var isTopQuestionFocused: Bool
     @FocusState private var isBottomQuestionFocused: Bool
@@ -1415,6 +1418,7 @@ struct ChatThreadColumn: View {
             uploadedFiles.removeAll()
         }
         branchData.attachedConcept = nil
+        localConnectionConcepts = nil
         branchData.bottomQuestionText = ""
         appendSimulatedResponse()
     }
@@ -1632,6 +1636,19 @@ struct ChatThreadColumn: View {
                             .transition(.scale.combined(with: .opacity))
                         }
 
+                        if let (c1, c2) = localConnectionConcepts {
+                            ConnectionContextChip(
+                                conceptA: c1,
+                                conceptB: c2,
+                                onRemove: {
+                                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                                        localConnectionConcepts = nil
+                                    }
+                                }
+                            )
+                            .transition(.scale.combined(with: .opacity))
+                        }
+
                         inputContainer {
                             ZStack {
                                 if bottomFieldIsEmpty {
@@ -1694,6 +1711,14 @@ struct ChatThreadColumn: View {
                 }
                 onQuoteHandled()
             }
+        }
+        .onChange(of: connectionConcepts?.0.id) { _, _ in
+            guard let pair = connectionConcepts else { return }
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+                localConnectionConcepts = pair
+                branchData.showBottomInput = true
+            }
+            onConnectionHandled?()
         }
         // Top field focus → notify parent so it can scroll the field to the top.
         .onChange(of: isTopQuestionFocused) { _, focused in

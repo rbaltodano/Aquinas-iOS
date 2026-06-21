@@ -79,6 +79,12 @@ struct CurrentConversationView: View {
     @State private var canvasSelectionRequest: Int = 0
     @State private var canvasClearSelectionRequest: Int = 0
     @State private var canvasCreateConceptRequest: Int = 0
+    @State private var canvasInquireConnectionRequest: Int = 0
+    @State private var canvasConnectionConcepts: (ConceptDefinition, ConceptDefinition)?
+    @State private var canvasMidpointEnterRequest: Int = 0
+    @State private var canvasMidpointCenterRequest: Int = 0
+    @State private var canvasMidpointPlaceRequest: Int = 0
+    @State private var isCanvasMidpointMode: Bool = false
     @State private var promotedCanvasInsightIDs: [UUID] = []
     @State private var isEditingTitle: Bool = false
     @State private var titleEditDraft: String = ""
@@ -235,6 +241,25 @@ struct CurrentConversationView: View {
             onInsightSelectionStateChange: { hasHoveredCanvasInsight = $0 },
             onSelectedCanvasItemCountChange: { canvasSelectedItemCount = $0 },
             onPromotedInsightIDsChange: { promotedCanvasInsightIDs = $0 },
+            savedConceptIDs: Set(collectedDefinitions.map(\.id)),
+            onToggleSavedConcept: { concept in
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                    if collectedDefinitions.contains(where: { $0.id == concept.id }) {
+                        collectedDefinitions.removeAll { $0.id == concept.id }
+                    } else {
+                        collectedDefinitions.append(concept)
+                    }
+                }
+            },
+            inquireConnectionRequest: canvasInquireConnectionRequest,
+            onInquireConnectionConcepts: { c1, c2 in
+                canvasConnectionConcepts = (c1, c2)
+                closeTopicCanvas()
+            },
+            midpointEnterRequest: canvasMidpointEnterRequest,
+            midpointCenterRequest: canvasMidpointCenterRequest,
+            midpointPlaceRequest: canvasMidpointPlaceRequest,
+            onMidpointModeChange: { isCanvasMidpointMode = $0 },
             inputFont: inputFont,
             conversationFontSize: conversationFontSize,
             showQuestionBar: false
@@ -290,11 +315,15 @@ struct CurrentConversationView: View {
             onSend: { externalSubmitTrigger += 1 },
             onSelectCanvasItem: { canvasSelectionRequest += 1 },
             onCreateCanvasConcept: { canvasCreateConceptRequest += 1 },
-            onInquireConnection: { },
+            onInquireConnection: { canvasInquireConnectionRequest += 1 },
             onQuoteCanvasItem: {
                 guard let canvasQuoteTarget else { return }
                 quoteConceptIntoCurrentConversation(canvasQuoteTarget)
             },
+            onMidpointConcepts: { canvasMidpointEnterRequest += 1 },
+            isMidpointMode: isCanvasMidpointMode,
+            onMidpointCenter: { canvasMidpointCenterRequest += 1 },
+            onMidpointPlace: { canvasMidpointPlaceRequest += 1 },
             onClearCanvasSelection: { canvasClearSelectionRequest += 1 }
         )
     }
@@ -705,7 +734,9 @@ struct CurrentConversationView: View {
 	                    guard b.id == effectiveFocusedID else { return }
 	                    hasTextToSubmit = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 	                },
-	                    onQuoteHandled: { attachedConcept = nil }
+	                    onQuoteHandled: { attachedConcept = nil },
+                    connectionConcepts: b.id == effectiveFocusedID ? canvasConnectionConcepts : nil,
+                    onConnectionHandled: { canvasConnectionConcepts = nil }
 	                )
 	                .padding(.horizontal, 16)
 
