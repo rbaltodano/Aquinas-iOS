@@ -72,22 +72,7 @@ struct CurrentConversationView: View {
     @State private var persistenceTask: Task<Void, Never>? = nil
 
     // MARK: Canvas mode
-    @State private var isTopicCanvasVisible: Bool = false
-    @State private var hasCanvasHover: Bool = false
-    @State private var hasHoveredCanvasInsight: Bool = false
-    @State private var canvasQuoteTarget: ConceptDefinition? = nil
-    @State private var canvasSelectedItemCount: Int = 0
-    @State private var canvasSelectionRequest: Int = 0
-    @State private var canvasClearSelectionRequest: Int = 0
-    @State private var canvasDismissHoverRequest: Int = 0
-    @State private var canvasCreateConceptRequest: Int = 0
-    @State private var canvasInquireConnectionRequest: Int = 0
-    @State private var canvasConnectionConcepts: (ConceptDefinition, ConceptDefinition)?
-    @State private var canvasMidpointEnterRequest: Int = 0
-    @State private var canvasMidpointCenterRequest: Int = 0
-    @State private var canvasMidpointPlaceRequest: Int = 0
-    @State private var isCanvasMidpointMode: Bool = false
-    @State private var promotedCanvasInsightIDs: [UUID] = []
+    @State private var canvasMode = CanvasModeModel()
     @State private var isEditingTitle: Bool = false
     @State private var titleEditDraft: String = ""
 
@@ -172,7 +157,7 @@ struct CurrentConversationView: View {
     }
 
     private var hasSelectedCanvasItems: Bool {
-        canvasSelectedItemCount > 0
+        canvasMode.canvasSelectedItemCount > 0
     }
 
     private func contextWordCount(in branches: [ChatBranch]) -> Int {
@@ -239,7 +224,7 @@ struct CurrentConversationView: View {
 
     private func closeTopicCanvas() {
         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-            isTopicCanvasVisible = false
+            canvasMode.isTopicCanvasVisible = false
         }
     }
 
@@ -252,18 +237,18 @@ struct CurrentConversationView: View {
     private var topicCanvasLayer: some View {
         InsightTreeView(
             insights: conversationInsights,
-            selectionRequest: canvasSelectionRequest,
-            clearSelectionRequest: canvasClearSelectionRequest,
-            dismissHoverRequest: canvasDismissHoverRequest,
-            createConceptRequest: canvasCreateConceptRequest,
-            promotedInsightIDs: promotedCanvasInsightIDs,
+            selectionRequest: canvasMode.canvasSelectionRequest,
+            clearSelectionRequest: canvasMode.canvasClearSelectionRequest,
+            dismissHoverRequest: canvasMode.canvasDismissHoverRequest,
+            createConceptRequest: canvasMode.canvasCreateConceptRequest,
+            promotedInsightIDs: canvasMode.promotedCanvasInsightIDs,
             onClose: closeTopicCanvas,
             onForkInsight: forkCanvasInsight,
-            onQuoteInsight: { canvasQuoteTarget = $0 },
-            onSelectionStateChange: { hasCanvasHover = $0 },
-            onInsightSelectionStateChange: { hasHoveredCanvasInsight = $0 },
-            onSelectedCanvasItemCountChange: { canvasSelectedItemCount = $0 },
-            onPromotedInsightIDsChange: { promotedCanvasInsightIDs = $0 },
+            onQuoteInsight: { canvasMode.canvasQuoteTarget = $0 },
+            onSelectionStateChange: { canvasMode.hasCanvasHover = $0 },
+            onInsightSelectionStateChange: { canvasMode.hasHoveredCanvasInsight = $0 },
+            onSelectedCanvasItemCountChange: { canvasMode.canvasSelectedItemCount = $0 },
+            onPromotedInsightIDsChange: { canvasMode.promotedCanvasInsightIDs = $0 },
             savedConceptIDs: Set(collectedDefinitions.map(\.id)),
             onToggleSavedConcept: { concept in
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
@@ -274,15 +259,15 @@ struct CurrentConversationView: View {
                     }
                 }
             },
-            inquireConnectionRequest: canvasInquireConnectionRequest,
+            inquireConnectionRequest: canvasMode.canvasInquireConnectionRequest,
             onInquireConnectionConcepts: { c1, c2 in
-                canvasConnectionConcepts = (c1, c2)
+                canvasMode.canvasConnectionConcepts = (c1, c2)
                 closeTopicCanvas()
             },
-            midpointEnterRequest: canvasMidpointEnterRequest,
-            midpointCenterRequest: canvasMidpointCenterRequest,
-            midpointPlaceRequest: canvasMidpointPlaceRequest,
-            onMidpointModeChange: { isCanvasMidpointMode = $0 },
+            midpointEnterRequest: canvasMode.canvasMidpointEnterRequest,
+            midpointCenterRequest: canvasMode.canvasMidpointCenterRequest,
+            midpointPlaceRequest: canvasMode.canvasMidpointPlaceRequest,
+            onMidpointModeChange: { canvasMode.isCanvasMidpointMode = $0 },
             inputFont: inputFont,
             conversationFontSize: conversationFontSize,
             showQuestionBar: false
@@ -297,11 +282,11 @@ struct CurrentConversationView: View {
             if focusedBranchID == nil {
                 focusedBranchID = activeBranches.first?.id
             }
-            isTopicCanvasVisible = false
-            hasCanvasHover = false
-            hasHoveredCanvasInsight = false
-            canvasQuoteTarget = nil
-            canvasSelectedItemCount = 0
+            canvasMode.isTopicCanvasVisible = false
+            canvasMode.hasCanvasHover = false
+            canvasMode.hasHoveredCanvasInsight = false
+            canvasMode.canvasQuoteTarget = nil
+            canvasMode.canvasSelectedItemCount = 0
         }
 
         Task {
@@ -313,7 +298,7 @@ struct CurrentConversationView: View {
     @ViewBuilder
     private var bottomInquiryControlDock: some View {
         InquiryControlDock(
-            isCanvasMode: isTopicCanvasVisible,
+            isCanvasMode: canvasMode.isTopicCanvasVisible,
             showFilePicker: $showFilePicker,
             showPhotoPicker: $showPhotoPicker,
             showCamera: $showCamera,
@@ -323,10 +308,10 @@ struct CurrentConversationView: View {
             isAtBottom: true,
             isKeyboardOpen: isKeyboardOpen,
             showsSendButton: isKeyboardOpen && hasTextToSubmit,
-            hasCanvasHover: hasCanvasHover,
-            hasCanvasInsightHover: hasHoveredCanvasInsight,
+            hasCanvasHover: canvasMode.hasCanvasHover,
+            hasCanvasInsightHover: canvasMode.hasHoveredCanvasInsight,
             hasSelectedCanvasItems: hasSelectedCanvasItems,
-            selectedCanvasItemCount: canvasSelectedItemCount,
+            selectedCanvasItemCount: canvasMode.canvasSelectedItemCount,
             onScrollToBottom: { scrollToBottomRequest += 1 },
             onViewEntireCanvas: { },
             onOpenInsights: {
@@ -335,22 +320,22 @@ struct CurrentConversationView: View {
                 }
             },
             onSend: { externalSubmitTrigger += 1 },
-            onSelectCanvasItem: { canvasSelectionRequest += 1 },
-            onCreateCanvasConcept: { canvasCreateConceptRequest += 1 },
-            onInquireConnection: { canvasInquireConnectionRequest += 1 },
+            onSelectCanvasItem: { canvasMode.canvasSelectionRequest += 1 },
+            onCreateCanvasConcept: { canvasMode.canvasCreateConceptRequest += 1 },
+            onInquireConnection: { canvasMode.canvasInquireConnectionRequest += 1 },
             onQuoteCanvasItem: {
-                guard let canvasQuoteTarget else { return }
-                quoteConceptIntoCurrentConversation(canvasQuoteTarget)
+                guard let target = canvasMode.canvasQuoteTarget else { return }
+                quoteConceptIntoCurrentConversation(target)
             },
-            onMidpointConcepts: { canvasMidpointEnterRequest += 1 },
-            isMidpointMode: isCanvasMidpointMode,
-            onMidpointCenter: { canvasMidpointCenterRequest += 1 },
-            onMidpointPlace: { canvasMidpointPlaceRequest += 1 },
-            onClearCanvasSelection: { canvasClearSelectionRequest += 1 },
+            onMidpointConcepts: { canvasMode.canvasMidpointEnterRequest += 1 },
+            isMidpointMode: canvasMode.isCanvasMidpointMode,
+            onMidpointCenter: { canvasMode.canvasMidpointCenterRequest += 1 },
+            onMidpointPlace: { canvasMode.canvasMidpointPlaceRequest += 1 },
+            onClearCanvasSelection: { canvasMode.canvasClearSelectionRequest += 1 },
             contextWordCount: displayedContextWordCount,
             onClearConversation: clearCurrentConversation,
             onContextWillOpen: {
-                if isTopicCanvasVisible { canvasDismissHoverRequest += 1 }
+                if canvasMode.isTopicCanvasVisible { canvasMode.canvasDismissHoverRequest += 1 }
             }
         )
     }
@@ -378,7 +363,7 @@ struct CurrentConversationView: View {
                 .allowsHitTesting(false)
 
                 // Bottom fade gradient (hidden in canvas mode)
-                if !isTopicCanvasVisible {
+                if !canvasMode.isTopicCanvasVisible {
                     LinearGradient(
                         stops: [
                             .init(color: AquinasTheme.Colors.canvas.opacity(0), location: 0),
@@ -394,16 +379,16 @@ struct CurrentConversationView: View {
                 }
 
                 // Canvas Mode: per-conversation Insight Tree
-                if isTopicCanvasVisible {
+                if canvasMode.isTopicCanvasVisible {
                     topicCanvasLayer
                 }
 
                 // Left-swipe trigger (UIKit-backed, passthrough)
-                if !isTopicCanvasVisible {
+                if !canvasMode.isTopicCanvasVisible {
                     RightEdgeCanvasSwipeTrigger {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                            isTopicCanvasVisible = true
+                            canvasMode.isTopicCanvasVisible = true
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -412,7 +397,7 @@ struct CurrentConversationView: View {
 
                 // Top bar (replaces simple AquinasNavButton HStack)
                 BranchModeTopBar(
-                    isCanvasMode: isTopicCanvasVisible,
+                    isCanvasMode: canvasMode.isTopicCanvasVisible,
                     title: activeTitle,
                     isEditingTitle: $isEditingTitle,
                     titleDraft: $titleEditDraft,
@@ -420,12 +405,12 @@ struct CurrentConversationView: View {
                     onMenuTap: onOpenMenu,
                     onCanvasTap: {
                         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                            isTopicCanvasVisible = true
+                            canvasMode.isTopicCanvasVisible = true
                         }
                     },
                     onBackTap: {
                         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                            isTopicCanvasVisible = false
+                            canvasMode.isTopicCanvasVisible = false
                         }
                     },
                     onCommitTitle: { newTitle in
@@ -449,13 +434,13 @@ struct CurrentConversationView: View {
         .safeAreaInset(edge: .bottom) {
             bottomInquiryControlDock
         }
-        .onChange(of: isTopicCanvasVisible) { _, isVisible in
+        .onChange(of: canvasMode.isTopicCanvasVisible) { _, isVisible in
             onCanvasModeChange(isVisible)
             if !isVisible {
-                hasCanvasHover = false
-                hasHoveredCanvasInsight = false
-                canvasQuoteTarget = nil
-                canvasSelectedItemCount = 0
+                canvasMode.hasCanvasHover = false
+                canvasMode.hasHoveredCanvasInsight = false
+                canvasMode.canvasQuoteTarget = nil
+                canvasMode.canvasSelectedItemCount = 0
             }
         }
         .onDisappear {
@@ -541,18 +526,18 @@ struct CurrentConversationView: View {
                 if let id = targetID, let convo = snapshot.conversations.first(where: { $0.id == id }) {
                     activeConversationID = id
                     activeBranches = convo.branches.isEmpty ? [ChatBranch(startingConcept: nil)] : convo.branches
-                    promotedCanvasInsightIDs = convo.promotedInsightIDs
+                    canvasMode.promotedCanvasInsightIDs = convo.promotedInsightIDs
                 } else if let first = snapshot.conversations.first {
                     activeConversationID = first.id
                     activeBranches = first.branches.isEmpty ? [ChatBranch(startingConcept: nil)] : first.branches
-                    promotedCanvasInsightIDs = first.promotedInsightIDs
+                    canvasMode.promotedCanvasInsightIDs = first.promotedInsightIDs
                 }
             } else {
                 let initial = InquiryConversation()
                 conversations = [initial]
                 activeConversationID = initial.id
                 activeBranches = [ChatBranch(startingConcept: nil)]
-                promotedCanvasInsightIDs = []
+                canvasMode.promotedCanvasInsightIDs = []
             }
             displayedContextWordCount = contextWordCount(in: activeBranches)
             focusedBranchID = activeBranches.first?.id
@@ -776,8 +761,8 @@ struct CurrentConversationView: View {
 	                    hasTextToSubmit = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 	                },
                     onQuoteHandled: { attachedConcept = nil },
-                    connectionConcepts: b.id == effectiveFocusedID ? canvasConnectionConcepts : nil,
-                    onConnectionHandled: { canvasConnectionConcepts = nil },
+                    connectionConcepts: b.id == effectiveFocusedID ? canvasMode.canvasConnectionConcepts : nil,
+                    onConnectionHandled: { canvasMode.canvasConnectionConcepts = nil },
                     onResponseCompleted: {
                         displayedContextWordCount = contextWordCount(in: activeBranches)
                     }
@@ -941,7 +926,7 @@ struct CurrentConversationView: View {
         guard let id = activeConversationID,
               let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[idx].branches = activeBranches
-        conversations[idx].promotedInsightIDs = promotedCanvasInsightIDs
+        conversations[idx].promotedInsightIDs = canvasMode.promotedCanvasInsightIDs
     }
 
     /// Update the sideMenu bindings from the current conversations list.
@@ -960,7 +945,7 @@ struct CurrentConversationView: View {
             : conversation.branches
         activeBranches = nextBranches
         displayedContextWordCount = contextWordCount(in: nextBranches)
-        promotedCanvasInsightIDs = conversation.promotedInsightIDs
+        canvasMode.promotedCanvasInsightIDs = conversation.promotedInsightIDs
         focusedBranchID = activeBranches.first?.id
         publishShellMenuState()
         persistConversations()
@@ -975,13 +960,13 @@ struct CurrentConversationView: View {
         activeBranches = freshBranches
         focusedBranchID = freshBranches.first?.id
         displayedContextWordCount = 0
-        promotedCanvasInsightIDs = []
+        canvasMode.promotedCanvasInsightIDs = []
         attachedConcept = nil
         uploadedFiles.removeAll()
         hasTextToSubmit = false
-        canvasConnectionConcepts = nil
-        canvasQuoteTarget = nil
-        canvasSelectedItemCount = 0
+        canvasMode.canvasConnectionConcepts = nil
+        canvasMode.canvasQuoteTarget = nil
+        canvasMode.canvasSelectedItemCount = 0
 
         if let id = activeConversationID,
            let index = conversations.firstIndex(where: { $0.id == id }) {
@@ -1009,7 +994,7 @@ struct CurrentConversationView: View {
         activeConversationID = fresh.id
         activeBranches = [ChatBranch(startingConcept: nil)]
         displayedContextWordCount = 0
-        promotedCanvasInsightIDs = []
+        canvasMode.promotedCanvasInsightIDs = []
         focusedBranchID = activeBranches.first?.id
         publishShellMenuState()
         persistConversations()
