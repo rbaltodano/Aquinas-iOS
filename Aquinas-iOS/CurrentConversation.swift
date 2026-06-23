@@ -39,6 +39,7 @@ struct CurrentConversationView: View {
     let conversationFontSize: ConversationFontSizeOption
     let inputTextAlignment: InputTextAlignmentOption
     let inputFont: ConversationFontOption
+    let responseTextAlignment: ResponseTextAlignmentOption
     let responseFont: ConversationFontOption
 
     // MARK: Conversation list (source of truth for side menu)
@@ -78,6 +79,7 @@ struct CurrentConversationView: View {
     @State private var canvasSelectedItemCount: Int = 0
     @State private var canvasSelectionRequest: Int = 0
     @State private var canvasClearSelectionRequest: Int = 0
+    @State private var canvasDismissHoverRequest: Int = 0
     @State private var canvasCreateConceptRequest: Int = 0
     @State private var canvasInquireConnectionRequest: Int = 0
     @State private var canvasConnectionConcepts: (ConceptDefinition, ConceptDefinition)?
@@ -90,7 +92,6 @@ struct CurrentConversationView: View {
     @State private var titleEditDraft: String = ""
 
     // MARK: Model controls
-    @State private var areResponsesCollapsed: Bool = false
     @State private var isThinkingEnabled: Bool = false
     @State private var selectedPersonality: String = "Scholarly"
     @State private var isPersonalityMenuOpen: Bool = false
@@ -98,6 +99,9 @@ struct CurrentConversationView: View {
     @State private var showPhotoPicker: Bool = false
     @State private var showCamera: Bool = false
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
+
+    // MARK: Context usage
+    @State private var displayedContextWordCount: Int = 0
 
     // MARK: Insight library sheet
     @State private var isInsightLibraryOpen: Bool = false
@@ -171,6 +175,24 @@ struct CurrentConversationView: View {
         canvasSelectedItemCount > 0
     }
 
+    private func contextWordCount(in branches: [ChatBranch]) -> Int {
+        var textParts: [String] = []
+        for branch in branches {
+            if branch.topQuestionSubmitted { textParts.append(branch.topQuestionText) }
+            if let duplicatedResponse = branch.duplicatedResponse { textParts.append(duplicatedResponse) }
+            for block in branch.activeChatBlocks {
+                switch block {
+                case .text(let text), .user(let text, _, _):
+                    textParts.append(text)
+                }
+            }
+        }
+        return textParts
+            .joined(separator: " ")
+            .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+            .count
+    }
+
     // MARK: Helpers
     private var effectiveFocusedID: UUID? {
         focusedBranchID ?? activeBranches.first?.id
@@ -232,6 +254,7 @@ struct CurrentConversationView: View {
             insights: conversationInsights,
             selectionRequest: canvasSelectionRequest,
             clearSelectionRequest: canvasClearSelectionRequest,
+            dismissHoverRequest: canvasDismissHoverRequest,
             createConceptRequest: canvasCreateConceptRequest,
             promotedInsightIDs: promotedCanvasInsightIDs,
             onClose: closeTopicCanvas,
@@ -297,7 +320,6 @@ struct CurrentConversationView: View {
             isThinkingEnabled: $isThinkingEnabled,
             selectedPersonality: $selectedPersonality,
             isPersonalityMenuOpen: $isPersonalityMenuOpen,
-            areResponsesCollapsed: $areResponsesCollapsed,
             isAtBottom: true,
             isKeyboardOpen: isKeyboardOpen,
             showsSendButton: isKeyboardOpen && hasTextToSubmit,
@@ -324,7 +346,12 @@ struct CurrentConversationView: View {
             isMidpointMode: isCanvasMidpointMode,
             onMidpointCenter: { canvasMidpointCenterRequest += 1 },
             onMidpointPlace: { canvasMidpointPlaceRequest += 1 },
-            onClearCanvasSelection: { canvasClearSelectionRequest += 1 }
+            onClearCanvasSelection: { canvasClearSelectionRequest += 1 },
+            contextWordCount: displayedContextWordCount,
+            onClearConversation: clearCurrentConversation,
+            onContextWillOpen: {
+                if isTopicCanvasVisible { canvasDismissHoverRequest += 1 }
+            }
         )
     }
 
@@ -336,6 +363,19 @@ struct CurrentConversationView: View {
 
                 // Horizontal branch pager
                 branchPager(in: geo)
+
+                // Top fade gradient, independent of the nav bar.
+                LinearGradient(
+                    stops: [
+                        Gradient.Stop(color: Color(red: 0.07, green: 0.06, blue: 0.05).opacity(0.97), location: 0.00),
+                        Gradient.Stop(color: Color(red: 0.07, green: 0.06, blue: 0.05).opacity(0), location: 1.00),
+                    ],
+                    startPoint: UnitPoint(x: 0.5, y: 0.33),
+                    endPoint: UnitPoint(x: 0.5, y: 1)
+                )
+                .frame(height: 150)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .allowsHitTesting(false)
 
                 // Bottom fade gradient (hidden in canvas mode)
                 if !isTopicCanvasVisible {
@@ -432,7 +472,7 @@ struct CurrentConversationView: View {
         .onReceive(NotificationCenter.default.publisher(
             for: UIResponder.keyboardWillHideNotification
         )) { _ in
-            withAnimation(.easeInOut(duration: 0.2)) {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
                 isKeyboardOpen = false
             }
         }
@@ -514,6 +554,7 @@ struct CurrentConversationView: View {
                 activeBranches = [ChatBranch(startingConcept: nil)]
                 promotedCanvasInsightIDs = []
             }
+            displayedContextWordCount = contextWordCount(in: activeBranches)
             focusedBranchID = activeBranches.first?.id
             publishShellMenuState()
             scrollToBottomAfterLayout()
@@ -697,12 +738,12 @@ struct CurrentConversationView: View {
                     uploadedFiles: $uploadedFiles,
                     showsPendingUploads: b.id == effectiveFocusedID,
                     quotedConcept: b.id == effectiveFocusedID ? attachedConcept : nil,
-                    areResponsesCollapsed: areResponsesCollapsed,
                     targetSpawnResponseIndex: $targetSpawnResponseIndex,
                     externalSubmitTrigger: b.id == effectiveFocusedID ? externalSubmitTrigger : 0,
                     conversationFontSize: conversationFontSize,
                     inputTextAlignment: inputTextAlignment,
                     inputFont: inputFont,
+                    responseTextAlignment: responseTextAlignment,
                     responseFont: responseFont,
                     onSpawnYChange: { _, _ in },
                     onDuplicateResponse: { text, index in
@@ -734,9 +775,12 @@ struct CurrentConversationView: View {
 	                    guard b.id == effectiveFocusedID else { return }
 	                    hasTextToSubmit = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 	                },
-	                    onQuoteHandled: { attachedConcept = nil },
+                    onQuoteHandled: { attachedConcept = nil },
                     connectionConcepts: b.id == effectiveFocusedID ? canvasConnectionConcepts : nil,
-                    onConnectionHandled: { canvasConnectionConcepts = nil }
+                    onConnectionHandled: { canvasConnectionConcepts = nil },
+                    onResponseCompleted: {
+                        displayedContextWordCount = contextWordCount(in: activeBranches)
+                    }
 	                )
 	                .padding(.horizontal, 16)
 
@@ -911,11 +955,41 @@ struct CurrentConversationView: View {
     private func switchToConversation(_ conversation: InquiryConversation) {
         saveCurrentConversation()
         activeConversationID = conversation.id
-        activeBranches = conversation.branches.isEmpty
+        let nextBranches = conversation.branches.isEmpty
             ? [ChatBranch(startingConcept: nil)]
             : conversation.branches
+        activeBranches = nextBranches
+        displayedContextWordCount = contextWordCount(in: nextBranches)
         promotedCanvasInsightIDs = conversation.promotedInsightIDs
         focusedBranchID = activeBranches.first?.id
+        publishShellMenuState()
+        persistConversations()
+        scrollToBottomAfterLayout()
+    }
+
+    /// Reset the active conversation in place so study-topic membership and the
+    /// conversation's identity remain stable while every question/response disappears.
+    private func clearCurrentConversation() {
+        persistenceTask?.cancel()
+        let freshBranches = [ChatBranch(startingConcept: nil)]
+        activeBranches = freshBranches
+        focusedBranchID = freshBranches.first?.id
+        displayedContextWordCount = 0
+        promotedCanvasInsightIDs = []
+        attachedConcept = nil
+        uploadedFiles.removeAll()
+        hasTextToSubmit = false
+        canvasConnectionConcepts = nil
+        canvasQuoteTarget = nil
+        canvasSelectedItemCount = 0
+
+        if let id = activeConversationID,
+           let index = conversations.firstIndex(where: { $0.id == id }) {
+            conversations[index].title = "New Conversation"
+            conversations[index].branches = freshBranches
+            conversations[index].promotedInsightIDs = []
+        }
+
         publishShellMenuState()
         persistConversations()
         scrollToBottomAfterLayout()
@@ -934,6 +1008,7 @@ struct CurrentConversationView: View {
         conversations.insert(fresh, at: 0)
         activeConversationID = fresh.id
         activeBranches = [ChatBranch(startingConcept: nil)]
+        displayedContextWordCount = 0
         promotedCanvasInsightIDs = []
         focusedBranchID = activeBranches.first?.id
         publishShellMenuState()
@@ -994,16 +1069,6 @@ private struct BranchModeTopBar: View {
 
     var body: some View {
         ZStack(alignment: .top) {
-            LinearGradient(
-                stops: [
-                    .init(color: AquinasTheme.Colors.canvas, location: 0),
-                    .init(color: AquinasTheme.Colors.canvas.opacity(0), location: 1),
-                ],
-                startPoint: .top, endPoint: .bottom
-            )
-            .frame(height: 100)
-            .allowsHitTesting(false)
-
             // Normal mode layout
             HStack(spacing: 0) {
                 AquinasNavButton(onMenuTap: onMenuTap)

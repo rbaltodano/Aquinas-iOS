@@ -19,6 +19,8 @@ struct InsightTreeCanvasView: View {
     let pulsingNodeID: UUID?
     let selectedCanvasTargets: [CanvasSelectionTarget]
     let selectionPulseRequest: Int
+    var makeNodeChildIDs: Set<UUID> = []
+    var isHoveringTarget: Bool = false
     var isMidpointMode: Bool = false
     var midpointCenterRequest: Int = 0
     var midpointPlaceRequest: Int = 0
@@ -49,7 +51,10 @@ struct InsightTreeCanvasView: View {
     @State private var pulseCycleStartedAt = Date().timeIntervalSinceReferenceDate
     @State private var connectorPulseDelayUntil = Date().timeIntervalSinceReferenceDate
     @State private var selectionPulseStartTime: TimeInterval?
-    @State private var reticleNudge: CGSize = .zero
+    @State private var selectionFlashOpacity: CGFloat = 1
+    @State private var loadingInsightIDs: Set<UUID> = []
+    @State private var loadingFlashOpacity: CGFloat = 1
+    @State private var unsplayedInsightIDs: Set<UUID> = []
     @State private var midpointHandleWorld: CGPoint?
     @State private var midpointHandleVisible: Bool = false
     @State private var dragStartHandleWorld: CGPoint?
@@ -69,6 +74,17 @@ struct InsightTreeCanvasView: View {
 
     private var insightTreeCanvasColor: Color {
         AquinasTheme.Colors.canvas
+    }
+
+    /// While a selection exists and nothing is hovered, the unselected nodes/insights flash
+    /// (mirroring the "Add concept to selection" button) to invite adding another. Hovering stops it.
+    private var insightsFlashing: Bool {
+        !selectedCanvasTargets.isEmpty && !isHoveringTarget && !isMidpointMode
+    }
+
+    private func itemFlashOpacity(selected: Bool) -> Double {
+        guard insightsFlashing, !selected else { return 1 }
+        return Double(selectionFlashOpacity)
     }
 
     private var insightTreeInsightColor: Color {
@@ -106,6 +122,7 @@ struct InsightTreeCanvasView: View {
 
                     ForEach(nodes) { node in
                         nodeGroup(node, camera: camera, size: size, labelOpacity: labelOpacity)
+                            .opacity(itemFlashOpacity(selected: selectedCanvasTargets.contains(.node(node.id))))
 
                         ForEach(Array(node.insights.prefix(6).enumerated()), id: \.element.id) { index, insight in
                             insightLabel(
@@ -117,6 +134,7 @@ struct InsightTreeCanvasView: View {
                                 size: size,
                                 labelOpacity: labelOpacity
                             )
+                            .opacity(itemFlashOpacity(selected: selectedCanvasTargets.contains(.insight(insight.id))))
                         }
                     }
                 }
@@ -156,29 +174,94 @@ struct InsightTreeCanvasView: View {
                 guard newValue > 0 else { return }
                 selectionPulseStartTime = Date().timeIntervalSinceReferenceDate
             }
+            .onChange(of: insightsFlashing) { _, flashing in
+                if flashing {
+                    selectionFlashOpacity = 1
+                    withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
+                        selectionFlashOpacity = 0.25
+                    }
+                } else {
+                    withAnimation(.easeInOut(duration: 0.2)) { selectionFlashOpacity = 1 }
+                }
+            }
             .onChange(of: selectedCanvasTargets.count) { oldCount, newCount in
-                // When the first insight is added, pop the reticle in a random direction
-                // to hint that you can pan the canvas around.
+                // When the first insight is added, drift the whole camera in a random
+                // direction (and stay there) to hint that the canvas can be panned.
                 guard oldCount == 0, newCount == 1, !isMidpointMode else { return }
                 let angle = Double.random(in: 0..<(2 * Double.pi))
-                let distance: CGFloat = 28
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.5)) {
-                    reticleNudge = CGSize(width: cos(angle) * distance, height: sin(angle) * distance)
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.34) {
-                    withAnimation(.spring(response: 0.55, dampingFraction: 0.68)) {
-                        reticleNudge = .zero
-                    }
+                let distance: CGFloat = 90
+                withAnimation(.spring(response: 0.6, dampingFraction: 0.82)) {
+                    offset.width += cos(angle) * distance
+                    offset.height += sin(angle) * distance
                 }
             }
             .onChange(of: nodes) { _, newNodes in
-                // Reveal labels of nodes added after the initial entrance (e.g. placed midpoints).
+                // Insights added after the initial entrance (Make Node children, placed midpoints):
+                // they start as a flashing icon at the node center, splay out to their orbit
+                // staggered by 0.15s each, then once "loaded" the title blurs up.
                 guard hasAppeared else { return }
-                let allIDs = Set(newNodes.flatMap { Array($0.insights.prefix(6)).map(\.id) })
-                let missing = allIDs.subtracting(revealedInsightIDs)
-                guard !missing.isEmpty else { return }
-                withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
-                    for id in missing { revealedInsightIDs.insert(id) }
+                let known = revealedInsightIDs.union(loadingInsightIDs)
+                var newOnes: [(id: UUID, orbitIndex: Int)] = []
+                var plainNewIDs: [UUID] = []
+                for node in newNodes {
+                    for (i, insight) in Array(node.insights.prefix(6)).enumerated() where !known.contains(insight.id) {
+                        if makeNodeChildIDs.contains(insight.id) {
+                            newOnes.append((insight.id, i))   // Make Node child → loading mask + splay
+                        } else {
+                            plainNewIDs.append(insight.id)     // everything else → normal blur/transform pop-in
+                        }
+                    }
+                }
+
+                // Other new insights just appear with the standard blur + transform reveal.
+                if !plainNewIDs.isEmpty {
+                    withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
+                        for id in plainNewIDs { revealedInsightIDs.insert(id) }
+                    }
+                }
+
+                guard !newOnes.isEmpty else { return }
+
+                for one in newOnes {
+                    loadingInsightIDs.insert(one.id)
+                    unsplayedInsightIDs.insert(one.id)
+                }
+
+                // Splay each child out from the node center, staggered per orbit index.
+                for one in newOnes {
+                    let delay = Double(one.orbitIndex) * 0.15
+                    Task {
+                        try? await Task.sleep(for: .seconds(delay))
+                        await MainActor.run {
+                            withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) {
+                                _ = unsplayedInsightIDs.remove(one.id)
+                            }
+                        }
+                    }
+                }
+
+                // After generation completes, reveal the titles with a blur-up.
+                let newIDs = newOnes.map(\.id)
+                Task {
+                    try? await Task.sleep(for: .milliseconds(1300))
+                    await MainActor.run {
+                        withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
+                            for id in newIDs {
+                                loadingInsightIDs.remove(id)
+                                revealedInsightIDs.insert(id)
+                            }
+                        }
+                    }
+                }
+            }
+            .onChange(of: loadingInsightIDs.isEmpty) { _, empty in
+                if empty {
+                    loadingFlashOpacity = 1
+                } else {
+                    loadingFlashOpacity = 1
+                    withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
+                        loadingFlashOpacity = 0.35
+                    }
                 }
             }
             .onChange(of: isMidpointMode) { _, active in
@@ -535,7 +618,6 @@ struct InsightTreeCanvasView: View {
            let activeWorldPosition = worldPosition(for: activeTarget) {
             let activePosition = camera.worldToScreen(activeWorldPosition, in: size)
             let center = focusAnchor(in: size)
-            let reticleCenter = CGPoint(x: center.x + reticleNudge.width, y: center.y + reticleNudge.height)
 
             ZStack {
                 ForEach(Array(selectedCanvasTargets.indices.dropFirst()), id: \.self) { index in
@@ -553,7 +635,7 @@ struct InsightTreeCanvasView: View {
                     }
                 }
 
-                AnimatableLine(start: activePosition, end: reticleCenter)
+                AnimatableLine(start: activePosition, end: center)
                     .stroke(
                         AquinasTheme.Colors.accentGreen.opacity(0.8),
                         style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
@@ -561,7 +643,7 @@ struct InsightTreeCanvasView: View {
                     .frame(width: size.width, height: size.height)
 
                 SelectionReticle()
-                    .position(reticleCenter)
+                    .position(center)
 
                 if let selectionPulseStartTime,
                    selectedCanvasTargets.count > 1,
@@ -608,7 +690,7 @@ struct InsightTreeCanvasView: View {
                         if segEnd > segStart {
                             pulseSegment(
                                 start: activePosition,
-                                end: reticleCenter,
+                                end: center,
                                 from: segStart, to: segEnd,
                                 lineWidth: 4,
                                 color: AquinasTheme.Colors.accentGreen,
@@ -1109,22 +1191,30 @@ struct InsightTreeCanvasView: View {
         labelOpacity: Double
     ) -> some View {
         let worldPosition = insightWorldPosition(for: node, index: index, count: count)
-        let position      = camera.worldToScreen(worldPosition, in: size)
         let isRevealed    = revealedInsightIDs.contains(insight.id)
+        let isLoading     = loadingInsightIDs.contains(insight.id)
         let isSelected    = selectedCanvasTargets.contains(.insight(insight.id))
+        let isVisible     = isRevealed || isLoading
+        // While unsplayed, render at the node center so the child appears to splay out from it.
+        let atCenter      = unsplayedInsightIDs.contains(insight.id)
+        let renderWorld   = atCenter ? node.position : worldPosition
+        let position      = camera.worldToScreen(renderWorld, in: size)
 
         return HStack(spacing: 10) {
             Image(systemName: "text.bubble.fill")
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundColor(AquinasTheme.Colors.lightGreen)
+                .opacity(isLoading ? loadingFlashOpacity : 1)
 
-            Text(insight.title)
-                .font(.figtreeHeading2)
-                .foregroundColor(AquinasTheme.Colors.lightGreen)
-                .lineLimit(1)
-                .opacity(labelOpacity)
-                .blur(radius: isRevealed ? 0 : 8)
-                .animation(.spring(response: 0.6, dampingFraction: 0.75), value: isRevealed)
+            // Title appears only once loaded, blurring up into place.
+            if isRevealed {
+                Text(insight.title)
+                    .font(.figtreeHeading2)
+                    .foregroundColor(AquinasTheme.Colors.lightGreen)
+                    .lineLimit(1)
+                    .opacity(labelOpacity)
+                    .transition(.blurUp)
+            }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 16)
@@ -1138,7 +1228,7 @@ struct InsightTreeCanvasView: View {
         .shadow(color: AquinasTheme.Colors.canvas, radius: 24, x: 0, y: 0)
         .contentShape(Rectangle())
         .onTapGesture {
-            guard canAcceptTap else { return }
+            guard canAcceptTap, !isLoading else { return }
             if selectedCanvasTargets.isEmpty {
                 rippleTrigger = RippleTrigger(
                     worldOrigin: worldPosition,
@@ -1148,10 +1238,10 @@ struct InsightTreeCanvasView: View {
             focusHoveredTarget(at: worldPosition, in: size)
             onInsightTapped(insight)
         }
-        .offset(y: isRevealed ? 0 : 24)
-        .opacity(isRevealed ? 1 : 0)
-        .blur(radius: isRevealed ? 0 : 8)
-        .animation(.spring(response: 0.6, dampingFraction: 0.75), value: isRevealed)
+        .offset(y: isVisible ? 0 : 24)
+        .opacity(isVisible ? 1 : 0)
+        .blur(radius: isVisible ? 0 : 8)
+        .animation(.spring(response: 0.6, dampingFraction: 0.75), value: isVisible)
         .transition(.scale(scale: 0.88, anchor: .center).combined(with: .opacity))
         .position(position)
         .zIndex(30)
@@ -1409,29 +1499,12 @@ private struct AnimatableLine: Shape {
     }
 }
 
-/// The selection-mode reticle: a small circle with four outward chevrons indicating that the
-/// canvas can be panned to bring the next insight toward it.
+/// The selection-mode reticle: a small circle indicating where the next insight connects.
 private struct SelectionReticle: View {
-    private var color: Color { AquinasTheme.Colors.lightGreen.opacity(0.8) }
-
     var body: some View {
-        ZStack {
-            Circle()
-                .stroke(color, lineWidth: 1.5)
-                .frame(width: 18, height: 18)
-
-            arrow("chevron.up").offset(y: -18)
-            arrow("chevron.down").offset(y: 18)
-            arrow("chevron.left").offset(x: -18)
-            arrow("chevron.right").offset(x: 18)
-        }
-        .frame(width: 54, height: 54)
-    }
-
-    private func arrow(_ name: String) -> some View {
-        Image(systemName: name)
-            .font(.system(size: 9, weight: .bold))
-            .foregroundColor(color)
+        Circle()
+            .stroke(AquinasTheme.Colors.lightGreen.opacity(0.8), lineWidth: 1.5)
+            .frame(width: 18, height: 18)
     }
 }
 
@@ -1478,6 +1551,28 @@ private struct MidpointHandle: View {
         .onAppear {
             startTime = Date().timeIntervalSinceReferenceDate
         }
+    }
+}
+
+/// Blur + fade + slight upward drift, used when a freshly-loaded insight title appears.
+private struct BlurUpModifier: ViewModifier {
+    let blur: CGFloat
+    let opacity: Double
+    let offsetY: CGFloat
+    func body(content: Content) -> some View {
+        content
+            .blur(radius: blur)
+            .opacity(opacity)
+            .offset(y: offsetY)
+    }
+}
+
+private extension AnyTransition {
+    static var blurUp: AnyTransition {
+        .modifier(
+            active: BlurUpModifier(blur: 8, opacity: 0, offsetY: 8),
+            identity: BlurUpModifier(blur: 0, opacity: 1, offsetY: 0)
+        )
     }
 }
 

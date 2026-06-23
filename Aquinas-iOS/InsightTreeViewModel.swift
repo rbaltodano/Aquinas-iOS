@@ -17,6 +17,7 @@ import SwiftUI
 final class InsightTreeViewModel: ObservableObject {
     @Published private(set) var nodes: [NodeModel] = []
     @Published private(set) var edges: [EdgeModel] = []
+    @Published private(set) var makeNodeChildIDs: Set<UUID> = []
     @Published var selectedNode: NodeModel?
     @Published var selectedSuggestedNode: NodeModel?
 
@@ -165,9 +166,17 @@ final class InsightTreeViewModel: ObservableObject {
         }
         insights = embeddedInsights
 
+        // The children spawned by "Make Node" (deterministic IDs) — used by the canvas to
+        // give only these the icon-first loading mask + splay animation.
+        makeNodeChildIDs = Set(promotedInsightIDs.flatMap { insightID -> [UUID] in
+            let nodeID = promotedNodeID(for: insightID)
+            return (0..<3).map { makeNodeChildID(for: nodeID, index: $0) }
+        })
+
         guard embeddedInsights.count >= 5 else {
             var nextNodes = makeEarlyNodes(from: embeddedInsights)
             var nextEdges: [EdgeModel] = []
+            appendPromotedNodes(to: &nextNodes, edges: &nextEdges, from: embeddedInsights)
             appendPlacedMidpointNodes(to: &nextNodes, edges: &nextEdges)
             let nextIDs = Set(nextNodes.map(\.id))
             let hasNew = !nextIDs.isSubset(of: renderedNodeIDs)
@@ -270,29 +279,47 @@ final class InsightTreeViewModel: ObservableObject {
     ) {
         guard !promotedInsightIDs.isEmpty else { return }
 
-        let promotedSet = Set(promotedInsightIDs)
-        let pinnedInsights = embeddedInsights.filter { promotedSet.contains($0.id) }
-        guard !pinnedInsights.isEmpty else { return }
+        for insightID in promotedInsightIDs {
+            guard let sourceIndex = nodes.firstIndex(where: { $0.insights.contains(where: { $0.id == insightID }) }),
+                  let insight = nodes[sourceIndex].insights.first(where: { $0.id == insightID }) else {
+                continue
+            }
+            let sourceNode = nodes[sourceIndex]
+            let promotedNodeID = promotedNodeID(for: insightID)
 
-        for (index, insight) in pinnedInsights.enumerated() {
-            guard let sourceNode = nodes.first(where: { $0.insights.contains(where: { $0.id == insight.id }) }) else {
+            // Turning an insight into a concept spawns 3 relevant child insights around it.
+            // Placeholder "New Insight" copy until the model fills them in. IDs are stable so
+            // rebuilds don't recreate them (which would re-trigger their load animation).
+            let childInsights = (0..<3).map { childIndex in
+                InsightModel(
+                    id: makeNodeChildID(for: promotedNodeID, index: childIndex),
+                    title: "New Insight",
+                    definition: ""
+                )
+            }
+
+            // If the insight already is its own node (canvas early layout), convert it in
+            // place so the insight itself becomes the concept — no duplicate node beside it.
+            if sourceNode.id == insightID && sourceNode.insights.count == 1 {
+                nodes[sourceIndex].insights = childInsights
                 continue
             }
 
-            let promotedNodeID = promotedNodeID(for: insight.id)
             guard !nodes.contains(where: { $0.id == promotedNodeID }) else { continue }
 
-            let defaultOffsetX: CGFloat = index.isMultiple(of: 2) ? 210 : -210
-            let defaultOffsetY: CGFloat = 170 + (CGFloat(index / 2) * 120)
+            // Clustered layout: pull the insight out into its own node positioned where its
+            // chip was orbiting, and remove it from the cluster so it isn't shown twice.
+            let visible = Array(sourceNode.insights.prefix(6))
+            let orbitIndex = visible.firstIndex(where: { $0.id == insightID }) ?? 0
+            let orbitPos = insightOrbitPosition(node: sourceNode, index: orbitIndex, count: min(sourceNode.insights.count, 6))
+            nodes[sourceIndex].insights.removeAll { $0.id == insightID }
+
             let promotedNode = NodeModel(
                 id: promotedNodeID,
                 conceptLabel: insight.title,
-                insights: [insight],
+                insights: childInsights,
                 embedding: insight.embedding ?? [],
-                position: restoredPosition(for: promotedNodeID) ?? CGPoint(
-                    x: sourceNode.position.x + defaultOffsetX,
-                    y: sourceNode.position.y + defaultOffsetY
-                ),
+                position: restoredPosition(for: promotedNodeID) ?? orbitPos,
                 isSuggested: false,
                 suggestedInsights: nil
             )
@@ -347,6 +374,29 @@ final class InsightTreeViewModel: ObservableObject {
 
             nodes.append(placedNode)
         }
+    }
+
+    /// Orbit position of an insight chip around its node — mirrors the canvas layout
+    /// so a promoted node lands exactly where its chip was.
+    private func insightOrbitPosition(node: NodeModel, index: Int, count: Int) -> CGPoint {
+        let clampedCount = max(count, 1)
+        let angle = (CGFloat(index) / CGFloat(clampedCount)) * (.pi * 2) + .pi / 8
+        let radius: CGFloat = node.isSuggested ? 118 : 190
+        return CGPoint(x: node.position.x + cos(angle) * radius, y: node.position.y + sin(angle) * radius)
+    }
+
+    private func makeNodeChildID(for nodeID: UUID, index: Int) -> UUID {
+        let digest = SHA256.hash(data: Data("makenode-child:\(nodeID.uuidString):\(index)".utf8))
+        let bytes = Array(digest.prefix(16))
+        let uuidString = String(
+            format: "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5],
+            bytes[6], bytes[7],
+            bytes[8], bytes[9],
+            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        )
+        return UUID(uuidString: uuidString) ?? UUID()
     }
 
     private func promotedNodeID(for insightID: UUID) -> UUID {

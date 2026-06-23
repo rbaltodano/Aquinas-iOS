@@ -20,7 +20,6 @@ struct InquiryControlDock: View {
     @Binding var isThinkingEnabled: Bool
     @Binding var selectedPersonality: String
     @Binding var isPersonalityMenuOpen: Bool
-    @Binding var areResponsesCollapsed: Bool
     let isAtBottom: Bool
     var isKeyboardOpen: Bool = false
     var showsSendButton: Bool = false
@@ -41,12 +40,38 @@ struct InquiryControlDock: View {
     var onMidpointCenter: () -> Void = {}
     var onMidpointPlace: () -> Void = {}
     var onClearCanvasSelection: () -> Void = {}
+    var contextWordCount: Int = 0
+    // Prototype word-based capacity while the real token limit is unwired.
+    var contextWordLimit: Int = 10_000
+    var onClearConversation: () -> Void = {}
+    var onContextWillOpen: () -> Void = {}
 
-    @State private var isAttachmentMenuOpen = false
     @State private var thinkingIconDrawID = UUID()
     @State private var canvasActionDrawID = UUID()
     @State private var isScrollButtonVisible = false
     @State private var controlScale: CGFloat = 1
+    @State private var isContextCardOpen = false
+    @State private var isContextCompacting = false
+    @State private var isContextCompactionComplete = false
+    @State private var contextCardDragY: CGFloat = 0
+    @State private var contextCompactTask: Task<Void, Never>?
+    @State private var addFlashOpacity: CGFloat = 1
+
+    /// Flash the Add button while in Select mode with an insight hovered, hinting it can be added.
+    private var shouldFlashAdd: Bool {
+        hasSelectedCanvasItems && hasCanvasHover
+    }
+
+    private func startAddFlashIfNeeded() {
+        if shouldFlashAdd {
+            addFlashOpacity = 1
+            withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
+                addFlashOpacity = 0.5
+            }
+        } else {
+            withAnimation(.easeInOut(duration: 0.2)) { addFlashOpacity = 1 }
+        }
+    }
 
     private var controlCount: Int {
         if isCanvasMode && isMidpointMode {
@@ -75,6 +100,13 @@ struct InquiryControlDock: View {
         return attachmentCount + thinkingCount + canvasActionCount + 1 + (showsSendButton ? 1 : 0)
     }
 
+    /// Captures everything that changes the dock's visible controls — including swaps that
+    /// keep the same control count but change content width (e.g. the "Add" button ↔ the
+    /// "Tap another Insight" hint) — so the capsule resizes with the same spring + scale bump.
+    private var controlLayoutKey: String {
+        "\(controlCount)|\(isMidpointMode ? 1 : 0)|\(hasCanvasHover ? 1 : 0)|\(hasCanvasInsightHover ? 1 : 0)|\(selectedCanvasItemCount)|\(showsSendButton ? 1 : 0)"
+    }
+
     var body: some View {
         ZStack(alignment: .top) {
             HStack(alignment: .center, spacing: 24) {
@@ -94,24 +126,43 @@ struct InquiryControlDock: View {
                     canvasActionButton(title: "Place", icon: "arrow.down", action: onMidpointPlace)
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 } else if isCanvasMode && (hasCanvasHover || hasSelectedCanvasItems) {
-                    selectCanvasActionButton
-
-                    if hasSelectedCanvasItems && selectedCanvasItemCount == 2 {
-                        canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onInquireConnection)
-                            .transition(.scale(scale: 0.4).combined(with: .opacity))
-                        canvasActionButton(title: "Midpoint", icon: "graph.2d", action: onMidpointConcepts)
-                            .transition(.scale(scale: 0.4).combined(with: .opacity))
-                    } else if hasSelectedCanvasItems && selectedCanvasItemCount > 2 {
-                        canvasActionButton(title: "Midpoint", icon: "graph.2d", action: onMidpointConcepts)
-                            .transition(.scale(scale: 0.4).combined(with: .opacity))
-                    } else if hasCanvasInsightHover && !hasSelectedCanvasItems {
-                        canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
-                            .transition(.scale(scale: 0.4).combined(with: .opacity))
-                        canvasActionButton(title: "Make Node", icon: "move.3d", action: onCreateCanvasConcept)
-                            .transition(.scale(scale: 0.4).combined(with: .opacity))
-                    } else if hasCanvasHover && !hasSelectedCanvasItems {
-                        canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
-                            .transition(.scale(scale: 0.4).combined(with: .opacity))
+                    if hasSelectedCanvasItems && hasCanvasHover {
+                        // Selection mode + hovering an addable insight/node:
+                        // the Add button is the only control present.
+                        selectCanvasActionButton
+                            .opacity(shouldFlashAdd ? addFlashOpacity : 1)
+                            .onAppear { startAddFlashIfNeeded() }
+                            .onChange(of: shouldFlashAdd) { _, _ in startAddFlashIfNeeded() }
+                    } else if hasSelectedCanvasItems {
+                        // Selection mode, nothing hovered: hint (1 selected) or the
+                        // selection actions (Quote + Midpoint for 2, Midpoint for 3+).
+                        if selectedCanvasItemCount == 1 {
+                            Text("Tap another Insight for actions")
+                                .font(.custom("Figtree-Bold", size: 14))
+                                .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+                                .fixedSize()
+                                .transition(.opacity)
+                        } else if selectedCanvasItemCount == 2 {
+                            canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onInquireConnection)
+                                .transition(.scale(scale: 0.4).combined(with: .opacity))
+                            canvasActionButton(title: "Midpoint", icon: "graph.2d", action: onMidpointConcepts)
+                                .transition(.scale(scale: 0.4).combined(with: .opacity))
+                        } else {
+                            canvasActionButton(title: "Midpoint", icon: "graph.2d", action: onMidpointConcepts)
+                                .transition(.scale(scale: 0.4).combined(with: .opacity))
+                        }
+                    } else {
+                        // No selection yet — entry point while hovering an insight/node.
+                        selectCanvasActionButton
+                        if hasCanvasInsightHover {
+                            canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
+                                .transition(.scale(scale: 0.4).combined(with: .opacity))
+                            canvasActionButton(title: "Make Node", icon: "move.3d", action: onCreateCanvasConcept)
+                                .transition(.scale(scale: 0.4).combined(with: .opacity))
+                        } else if hasCanvasHover {
+                            canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
+                                .transition(.scale(scale: 0.4).combined(with: .opacity))
+                        }
                     }
                 }
 
@@ -129,14 +180,39 @@ struct InquiryControlDock: View {
             .clipShape(Capsule())
             .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
             .scaleEffect(controlScale)
-            .animation(.spring(response: 0.38, dampingFraction: 0.78), value: controlCount)
+            .animation(.spring(response: 0.38, dampingFraction: 0.78), value: controlLayoutKey)
 
             if !isCanvasMode {
                 scrollToBottomButton
             }
         }
         .frame(maxWidth: .infinity, alignment: .center)
+        // An overlay does not participate in layout, so presenting the card never
+        // changes the dock's height or moves the model controls.
+        .overlay(alignment: .top) {
+            if isContextCardOpen {
+                ContextUsageCard(
+                    wordCount: contextWordCount,
+                    wordLimit: contextWordLimit,
+                    isCompacting: isContextCompacting,
+                    isCompactionComplete: isContextCompactionComplete,
+                    onCompact: beginContextCompaction,
+                    onClear: clearConversation,
+                    onArrowAppear: contextArrowDidAppear
+                )
+                // Keep the popup's bottom edge parked just above the dock while
+                // its height animates from the full card down to the compact pill.
+                .offset(y: (isContextCompacting ? -52 : -146) + contextCardDragY)
+                .gesture(contextCardDismissGesture)
+                .transition(.asymmetric(
+                    insertion: .identity,
+                    removal: .scale(scale: 0.35, anchor: .bottom).combined(with: .opacity)
+                ))
+                .zIndex(20)
+            }
+        }
         .padding(.bottom, isKeyboardOpen ? 8 : 24)
+        .animation(.spring(response: 0.42, dampingFraction: 0.86), value: isKeyboardOpen)
         .background(alignment: .bottom) {
             LinearGradient(
                 stops: [
@@ -156,7 +232,7 @@ struct InquiryControlDock: View {
             guard let isVisible = notification.userInfo?["isVisible"] as? Bool else { return }
             isScrollButtonVisible = isVisible
         }
-        .onChange(of: controlCount) { _, _ in
+        .onChange(of: controlLayoutKey) { _, _ in
             controlScale = 1.05
             withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
                 controlScale = 1
@@ -165,12 +241,38 @@ struct InquiryControlDock: View {
         .onChange(of: hasCanvasHover) { _, selected in
             if selected { canvasActionDrawID = UUID() }
         }
+        .onChange(of: hasCanvasInsightHover) { _, isHoveringInsight in
+            if isHoveringInsight { dismissContextPopup() }
+        }
+        .onDisappear {
+            contextCompactTask?.cancel()
+        }
     }
 
     private var attachmentButton: some View {
-        Button {
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
-                isAttachmentMenuOpen.toggle()
+        Menu {
+            Button {
+                showCamera = true
+            } label: {
+                Label("Camera", systemImage: "camera")
+            }
+
+            Button {
+                showPhotoPicker = true
+            } label: {
+                Label("Photo", systemImage: "photo")
+            }
+
+            Button {
+                showFilePicker = true
+            } label: {
+                Label("File", systemImage: "doc")
+            }
+
+            Button {
+                onOpenInsights()
+            } label: {
+                Label("Insights", systemImage: "text.bubble")
             }
         } label: {
             Image(systemName: "plus")
@@ -178,19 +280,8 @@ struct InquiryControlDock: View {
                 .foregroundColor(AquinasTheme.Colors.lightGreen)
                 .frame(width: 16, height: 16)
         }
+        .menuStyle(.button)
         .buttonStyle(.plain)
-        .overlay(alignment: .bottomLeading) {
-            if isAttachmentMenuOpen {
-                AttachmentMenu(
-                    isAttachmentMenuOpen: $isAttachmentMenuOpen,
-                    showPhotoPicker: $showPhotoPicker,
-                    showFilePicker: $showFilePicker,
-                    showCamera: $showCamera,
-                    onOpenInsights: onOpenInsights
-                )
-                .offset(y: -56)
-            }
-        }
     }
 
     private var thinkingButton: some View {
@@ -219,6 +310,13 @@ struct InquiryControlDock: View {
         Button {
             if hasSelectedCanvasItems {
                 onClearCanvasSelection()
+            } else if !isContextCompacting {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.7)
+                contextCardDragY = 0
+                if !isContextCardOpen { onContextWillOpen() }
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                    isContextCardOpen.toggle()
+                }
             }
         } label: {
             let contextColor = AquinasTheme.Colors.paragraphText.opacity(0.75)
@@ -227,7 +325,7 @@ struct InquiryControlDock: View {
                     Image(systemName: "xmark")
                         .font(.system(size: 14, weight: .semibold))
                 } else {
-                    ContextUsageIcon(progress: 0.36, color: contextColor)
+                    ContextUsageIcon(progress: contextProgress, color: contextColor)
                 }
                 if !hasCanvasHover && !hasSelectedCanvasItems {
                     Text("Context")
@@ -241,6 +339,101 @@ struct InquiryControlDock: View {
             .animation(.spring(response: 0.3, dampingFraction: 0.8), value: hasSelectedCanvasItems)
         }
         .buttonStyle(.plain)
+    }
+
+    private var contextProgress: CGFloat {
+        guard contextWordLimit > 0 else { return 0 }
+        return min(max(CGFloat(contextWordCount) / CGFloat(contextWordLimit), 0), 1)
+    }
+
+    private func clearConversation() {
+        contextCompactTask?.cancel()
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.75)
+        onClearConversation()
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+            isContextCardOpen = false
+            isContextCompacting = false
+            isContextCompactionComplete = false
+        }
+    }
+
+    private var contextCardDismissGesture: some Gesture {
+        DragGesture(minimumDistance: 4)
+            .onChanged { value in
+                guard !isContextCompacting else { return }
+                contextCardDragY = max(0, value.translation.height)
+            }
+            .onEnded { value in
+                guard !isContextCompacting else { return }
+                let height = value.translation.height
+                let predicted = value.predictedEndTranslation.height
+                if height > 100 || predicted > 180 {
+                    withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                        isContextCardOpen = false
+                        contextCardDragY = 0
+                    }
+                } else {
+                    withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) {
+                        contextCardDragY = 0
+                    }
+                }
+            }
+    }
+
+    private func beginContextCompaction() {
+        guard !isContextCompacting else { return }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.65)
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+            isContextCompacting = true
+            isContextCompactionComplete = false
+        }
+        contextCompactTask?.cancel()
+        contextCompactTask = Task {
+            do { try await Task.sleep(for: .seconds(4)) } catch { return }
+            await MainActor.run {
+                playContextCompactedHaptics()
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isContextCompactionComplete = true
+                }
+            }
+            do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            await MainActor.run {
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                    isContextCardOpen = false
+                }
+            }
+            do { try await Task.sleep(for: .milliseconds(450)) } catch { return }
+            await MainActor.run {
+                isContextCompacting = false
+                isContextCompactionComplete = false
+            }
+        }
+    }
+
+    private func contextArrowDidAppear() {
+        guard isContextCompacting, !isContextCompactionComplete else { return }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.55)
+    }
+
+    private func playContextCompactedHaptics() {
+        let generator = UIImpactFeedbackGenerator(style: .light)
+        generator.prepare()
+        generator.impactOccurred(intensity: 0.75)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            generator.prepare()
+            generator.impactOccurred(intensity: 0.75)
+        }
+    }
+
+    private func dismissContextPopup() {
+        guard isContextCardOpen else { return }
+        contextCompactTask?.cancel()
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+            isContextCardOpen = false
+            isContextCompacting = false
+            isContextCompactionComplete = false
+            contextCardDragY = 0
+        }
     }
 
     private func canvasActionButton(title: String, icon: String, action: @escaping () -> Void) -> some View {
@@ -263,7 +456,7 @@ struct InquiryControlDock: View {
         Button(action: onSelectCanvasItem) {
             HStack(spacing: 8) {
                 selectionCountIcon
-                Text(selectedCanvasItemCount >= 1 ? "Add" : "Select")
+                Text(selectedCanvasItemCount >= 1 ? "Add concept to selection" : "Select")
                     .font(.custom("Figtree-Bold", size: 14))
             }
             .frame(height: 16, alignment: .center)
@@ -331,83 +524,185 @@ private struct ContextUsageIcon: View {
                 .trim(from: 0, to: min(max(progress, 0), 1))
                 .stroke(color, style: StrokeStyle(lineWidth: 3, lineCap: .round))
                 .rotationEffect(.degrees(-90))
+                .animation(.easeInOut(duration: 0.65), value: progress)
         }
         .frame(width: 14, height: 14)
     }
 }
 
-struct AttachmentMenu: View {
-    @Binding var isAttachmentMenuOpen: Bool
-    @Binding var showPhotoPicker: Bool
-    @Binding var showFilePicker: Bool
-    @Binding var showCamera: Bool
-    var onOpenInsights: () -> Void
+private struct ContextUsageCard: View {
+    @Environment(\.colorScheme) private var colorScheme
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            MenuOptionRow(icon: "camera", title: "Camera", delay: 0) { closeMenu(); showCamera = true }
-            MenuOptionRow(icon: "photo", title: "Photo", delay: 0.05) { closeMenu(); showPhotoPicker = true }
-            MenuOptionRow(icon: "doc", title: "File", delay: 0.10) { closeMenu(); showFilePicker = true }
-            MenuOptionRow(icon: "text.bubble", title: "Insights", delay: 0.15) { closeMenu(); onOpenInsights() }
-        }
-        .menuPanelStyle(anchor: .bottomLeading)
+    let wordCount: Int
+    let wordLimit: Int
+    let isCompacting: Bool
+    let isCompactionComplete: Bool
+    var onCompact: () -> Void
+    var onClear: () -> Void
+    var onArrowAppear: () -> Void
+
+    @State private var hasAppeared = false
+
+    private var progress: CGFloat {
+        guard wordLimit > 0 else { return 0 }
+        return min(max(CGFloat(wordCount) / CGFloat(wordLimit), 0), 1)
     }
 
-    private func closeMenu() {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) { isAttachmentMenuOpen = false }
+    private var visualProgress: CGFloat {
+        guard wordCount > 0 else { return 0 }
+        // Prototype-only visual floor: the real word count stays accurate above,
+        // but the 10k placeholder limit makes normal conversations look empty.
+        return max(progress, 0.72)
     }
-}
 
-struct MenuOptionRow: View {
-    let icon: String
-    let title: String
-    let delay: TimeInterval
-    var action: () -> Void
-    @State private var showsIcon = false
-    @State private var showsText = false
+    private var progressTrackColor: Color {
+        colorScheme == .dark
+            ? Color(hex: 0x130F0C)
+            : .white
+    }
+
+    private var progressTrackBorderColor: Color {
+        colorScheme == .dark
+            ? Color(hex: 0xFFFAF0, alpha: 0.08)
+            : AquinasTheme.Colors.darkBrown.opacity(0.15)
+    }
+
+    private var progressFillColor: Color {
+        colorScheme == .dark
+            ? Color(hex: 0xFFFAF0, alpha: 0.55)
+            : AquinasTheme.Colors.paragraphText.opacity(0.5)
+    }
 
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: 12) {
-                Image(systemName: icon)
-                    .font(.system(size: 16, weight: .semibold))
-                    .frame(width: 16, height: 16)
-                    .foregroundColor(AquinasTheme.Colors.lightGreen)
-                    .opacity(showsIcon ? 1 : 0)
-                    .sfSymbolDrawOn(delay: delay)
-                Text(title)
-                    .font(.custom("LibreBaskerville-Bold", size: 12))
-                    .foregroundColor(AquinasTheme.Colors.lightGreen)
-                    .opacity(showsText ? 1 : 0)
-                    .offset(x: showsText ? 0 : -10)
+        Group {
+            if isCompacting {
+                if isCompactionComplete {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+                            .sfSymbolDrawOn()
+                        Text("Compacted")
+                            .font(.custom("Figtree-SemiBold", size: 14))
+                            .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+                    }
+                    .transition(.opacity)
+                } else {
+                    HStack(spacing: 8) {
+                        ContextCompactingIcon(onAppearCycle: onArrowAppear)
+                        Text("Compacting")
+                            .font(.custom("Figtree-SemiBold", size: 14))
+                            .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+                    }
+                    .transition(.opacity)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text("Context")
+                                .font(.custom("Figtree-Bold", size: 18))
+                                .foregroundColor(AquinasTheme.Colors.headingText)
+                            Spacer()
+                            Text("\(formatted(wordCount)) / \(formatted(wordLimit))")
+                                .font(.custom("Figtree-Bold", size: 14))
+                                .monospacedDigit()
+                        }
+                        .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+
+                        GeometryReader { geometry in
+                            ZStack(alignment: .leading) {
+                                Capsule()
+                                    .fill(progressTrackColor)
+                                    .overlay(Capsule().stroke(progressTrackBorderColor, lineWidth: 1))
+                                Capsule()
+                                    .fill(progressFillColor)
+                                    .frame(width: visualProgress > 0 ? max(geometry.size.width * visualProgress, 8) : 0)
+                                    .animation(.easeInOut(duration: 0.65), value: visualProgress)
+                            }
+                        }
+                        .frame(height: 2)
+                    }
+
+                    HStack {
+                        Button("Compact", action: onCompact)
+                        Spacer()
+                        Button("Clear", action: onClear)
+                    }
+                    .font(.custom("Figtree-SemiBold", size: 14))
+                    .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+                    .buttonStyle(.plain)
+                }
+                .transition(.opacity)
             }
         }
-        .buttonStyle(.plain)
+        .padding(isCompacting ? 14 : 32)
+        .frame(width: isCompacting ? 126 : 315, height: isCompacting ? 44 : nil)
+        .background(AquinasTheme.Colors.canvasSecondary)
+        .clipShape(RoundedRectangle(cornerRadius: isCompacting ? 22 : 36, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: isCompacting ? 22 : 36, style: .continuous)
+                .stroke(AquinasTheme.Colors.darkBrown.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 16)
+        .scaleEffect(hasAppeared ? 1 : 0.35, anchor: .bottom)
+        .opacity(hasAppeared ? 1 : 0)
+        .animation(.spring(response: 0.42, dampingFraction: 0.86), value: isCompacting)
         .onAppear {
-            withAnimation(.easeOut(duration: 0.3).delay(delay)) {
-                showsIcon = true
-                showsText = true
+            hasAppeared = false
+            DispatchQueue.main.async {
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                    hasAppeared = true
+                }
             }
         }
     }
-}
 
-private struct MenuPanelStyle: ViewModifier {
-    let anchor: UnitPoint
-
-    func body(content: Content) -> some View {
-        content
-            .fixedSize()
-            .padding(.horizontal, 36)
-            .padding(.vertical, 24)
-            .background(RoundedRectangle(cornerRadius: 24, style: .continuous).fill(AquinasTheme.Colors.canvasSecondary))
-            .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
-            .transition(.scale(scale: 0.92, anchor: anchor).combined(with: .opacity))
+    private func formatted(_ count: Int) -> String {
+        if count >= 1_000 {
+            return String(format: "%.1fk", Double(count) / 1_000)
+        }
+        return "\(count)"
     }
 }
 
-private extension View {
-    func menuPanelStyle(anchor: UnitPoint) -> some View {
-        modifier(MenuPanelStyle(anchor: anchor))
+private struct ContextCompactingIcon: View {
+    var onAppearCycle: () -> Void
+
+    @State private var rotation = Double([0, 45, 90, 135, 180, 225, 270].randomElement() ?? 0)
+    @State private var iconOpacity: Double = 0
+    @State private var iconScale: CGFloat = 0.86
+    @State private var iconBlur: CGFloat = 4
+
+    var body: some View {
+        Image(systemName: "line.diagonal.trianglehead.up.right")
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+            .rotationEffect(.degrees(rotation))
+            .opacity(iconOpacity)
+            .scaleEffect(iconScale)
+            .blur(radius: iconBlur)
+            .frame(width: 16, height: 16)
+            .task {
+                while !Task.isCancelled {
+                    onAppearCycle()
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        iconOpacity = 1
+                        iconScale = 1
+                        iconBlur = 0
+                    }
+                    try? await Task.sleep(for: .milliseconds(150))
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.easeIn(duration: 0.15)) {
+                        iconOpacity = 0
+                        iconScale = 0.86
+                        iconBlur = 4
+                    }
+                    try? await Task.sleep(for: .milliseconds(150))
+                    guard !Task.isCancelled else { return }
+                    let directions = [0, 45, 90, 135, 180, 225, 270].map(Double.init)
+                    rotation = directions.filter { $0 != rotation }.randomElement() ?? 0
+                }
+            }
     }
 }

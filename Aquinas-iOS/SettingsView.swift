@@ -15,6 +15,7 @@ struct SettingsView: View {
     @Binding var conversationFontSize: ConversationFontSizeOption
     @Binding var inputTextAlignment: InputTextAlignmentOption
     @Binding var inputFont: ConversationFontOption
+    @Binding var responseTextAlignment: ResponseTextAlignmentOption
     @Binding var responseFont: ConversationFontOption
     var onOpenMenu: () -> Void
 
@@ -89,6 +90,10 @@ struct SettingsView: View {
 
                                 SettingsRow(title: "Input Font") {
                                     FontSegmentedControl(selection: $inputFont)
+                                }
+
+                                SettingsRow(title: "Response Text Alignment") {
+                                    ResponseAlignmentSegmentedControl(selection: $responseTextAlignment)
                                 }
 
                                 SettingsRow(title: "Response Font") {
@@ -332,6 +337,48 @@ enum ConversationFontOption: String, CaseIterable, Identifiable {
     }
 }
 
+enum ResponseTextAlignmentOption: String, CaseIterable, Identifiable {
+    case center
+    case left
+
+    var id: Self { self }
+
+    var textAlignment: TextAlignment {
+        switch self {
+        case .center: return .center
+        case .left: return .leading
+        }
+    }
+
+    var frameAlignment: Alignment {
+        switch self {
+        case .center: return .center
+        case .left: return .leading
+        }
+    }
+
+    var horizontalAlignment: HorizontalAlignment {
+        switch self {
+        case .center: return .center
+        case .left: return .leading
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .center: return "text.aligncenter"
+        case .left: return "text.alignleft"
+        }
+    }
+
+    var accessibilityLabel: String {
+        switch self {
+        case .center: return "Align response text center"
+        case .left: return "Align response text left"
+        }
+    }
+}
+
 enum ConversationFontSizeOption: String, CaseIterable, Identifiable {
     case large = "Large"
     case medium = "Medium"
@@ -375,6 +422,48 @@ private struct IconSegmentedControl: View {
                                     Capsule()
                                         .fill(AquinasTheme.Colors.systemSelection)
                                         .matchedGeometryEffect(id: "input-alignment-selection", in: selectionNamespace)
+                                }
+                            }
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(option.accessibilityLabel)
+            }
+        }
+        .padding(4)
+        .background(AquinasTheme.Colors.canvas)
+        .clipShape(Capsule())
+        .overlay(
+            Capsule()
+                .stroke(AquinasTheme.Colors.darkBrown.opacity(0.05), lineWidth: 1)
+        )
+    }
+}
+
+private struct ResponseAlignmentSegmentedControl: View {
+    @Binding var selection: ResponseTextAlignmentOption
+    @Namespace private var selectionNamespace
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(ResponseTextAlignmentOption.allCases) { option in
+                Button {
+                    guard selection != option else { return }
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.84)) {
+                        selection = option
+                    }
+                } label: {
+                    Image(systemName: option.iconName)
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                        .frame(width: 58.5, height: 26.125)
+                        .background(
+                            ZStack {
+                                if selection == option {
+                                    Capsule()
+                                        .fill(AquinasTheme.Colors.systemSelection)
+                                        .matchedGeometryEffect(id: "response-alignment-selection", in: selectionNamespace)
                                 }
                             }
                         )

@@ -18,7 +18,7 @@ enum AquinasTheme {
         /// The canvas colour of the *opposite* mode — dark in light-mode, light in dark-mode.
         static let canvasInverse = Color(light: 0x14110F, dark: 0xF2E7D4)
         static let canvasSecondary = Color(light: 0xFFFAF0, dark: 0x24201C)
-        static let canvasTertiary = Color(light: 0xFBF4E7, dark: 0x110D09)
+        static let canvasTertiary = Color(light: 0x2A2520, dark: 0xC0B494)
         static let componentBackground = Color(
             light: 0x6F6844,
             lightAlpha: 0.05,

@@ -519,7 +519,6 @@ struct ActiveInquiryView: View {
                                     uploadedFiles: $uploadedFiles,
                                     showsPendingUploads: branch.id == (focusedBranchID ?? activeBranches.first?.id),
                                     quotedConcept: branch.id == (focusedBranchID ?? activeBranches.first?.id) ? attachedConcept : nil,
-                                    areResponsesCollapsed: areResponsesCollapsed,
                                     targetSpawnResponseIndex: $targetSpawnResponseIndex,
                                     onSpawnYChange: { responseIndex, yOffset in
                                         updateChildren(of: branch.id, responseIndex: responseIndex, to: yOffset)
@@ -653,7 +652,6 @@ struct ActiveInquiryView: View {
                 isThinkingEnabled: $isThinkingEnabled,
                 selectedPersonality: $selectedPersonality,
                 isPersonalityMenuOpen: $isPersonalityMenuOpen,
-                areResponsesCollapsed: $areResponsesCollapsed,
                 isAtBottom: isAtBottom,
                 onScrollToBottom: {
                     scrollToBottomRequest += 1
@@ -1222,12 +1220,12 @@ struct ChatThreadColumn: View {
     @Binding var uploadedFiles: [UploadedFile]
     let showsPendingUploads: Bool
     let quotedConcept: ConceptDefinition?
-    let areResponsesCollapsed: Bool
     @Binding var targetSpawnResponseIndex: Int?
     var externalSubmitTrigger: Int = 0
     var conversationFontSize: ConversationFontSizeOption = .large
     var inputTextAlignment: InputTextAlignmentOption = .center
     var inputFont: ConversationFontOption = .serif
+    var responseTextAlignment: ResponseTextAlignmentOption = .center
     var responseFont: ConversationFontOption = .sans
     var onSpawnYChange: (Int, CGFloat) -> Void
     var onDuplicateResponse: (String, Int) -> Void
@@ -1239,6 +1237,7 @@ struct ChatThreadColumn: View {
     var onQuoteHandled: () -> Void
     var connectionConcepts: (ConceptDefinition, ConceptDefinition)? = nil
     var onConnectionHandled: (() -> Void)? = nil
+    var onResponseCompleted: () -> Void = {}
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -1549,7 +1548,7 @@ struct ChatThreadColumn: View {
                             targetSpawnY: $targetSpawnY,
                             targetSpawnResponseIndex: $targetSpawnResponseIndex,
                             columnSpaceName: "ColumnContent-\(branchData.id)",
-                            areResponsesCollapsed: areResponsesCollapsed,
+                            responseTextAlignment: responseTextAlignment,
                             responseFont: responseFont,
                             conversationFontSize: conversationFontSize,
                             onCenterChange: onSpawnYChange,
@@ -1559,6 +1558,7 @@ struct ChatThreadColumn: View {
                             onFinish: {
                                 animatedResponseIndices.remove(index)
                                 withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) { branchData.showBottomInput = true }
+                                onResponseCompleted()
                             }
                         )
                         .id("\(branchData.id)-response-\(index)")
@@ -1745,7 +1745,7 @@ struct TrackedResponseCard: View {
     @Binding var targetSpawnY: CGFloat
     @Binding var targetSpawnResponseIndex: Int?
     let columnSpaceName: String
-    let areResponsesCollapsed: Bool
+    let responseTextAlignment: ResponseTextAlignmentOption
     let responseFont: ConversationFontOption
     let conversationFontSize: ConversationFontSizeOption
     var onCenterChange: (Int, CGFloat) -> Void = { _, _ in }
@@ -1771,8 +1771,8 @@ struct TrackedResponseCard: View {
         ModelResponseCard(
             title: "Are Some Lies Acceptable?",
             fullText: textContent,
-            forceCollapsed: areResponsesCollapsed,
             shouldAnimateOnAppear: shouldAnimateOnAppear,
+            responseTextAlignment: responseTextAlignment,
             responseFont: responseFont,
             conversationFontSize: conversationFontSize,
             onDuplicateBranch: onDuplicateBranch,

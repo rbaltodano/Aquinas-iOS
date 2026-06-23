@@ -28,6 +28,7 @@ typealias BlurFadeModifier = GlideFadeModifier
 /// Simple wrapping layout for streamed words and inline insight links.
 struct FlowLayout: Layout {
     var spacing: CGFloat = 4.5
+    var alignment: TextAlignment = .center
 
     // MARK: - Cache
     //
@@ -54,11 +55,11 @@ struct FlowLayout: Layout {
     }
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize {
-        FlowResult(in: proposal.width ?? 0, subviews: subviews, spacing: spacing, cache: &cache).size
+        FlowResult(in: proposal.width ?? 0, subviews: subviews, spacing: spacing, alignment: alignment, cache: &cache).size
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) {
-        let result = FlowResult(in: bounds.width, subviews: subviews, spacing: spacing, cache: &cache)
+        let result = FlowResult(in: bounds.width, subviews: subviews, spacing: spacing, alignment: alignment, cache: &cache)
         for (index, subview) in subviews.enumerated() {
             subview.place(
                 at: CGPoint(x: bounds.minX + result.points[index].x,
@@ -72,7 +73,7 @@ struct FlowLayout: Layout {
         var size: CGSize = .zero
         var points: [CGPoint] = []
 
-        init(in maxWidth: CGFloat, subviews: Subviews, spacing: CGFloat, cache: inout [Int: CGSize]) {
+        init(in maxWidth: CGFloat, subviews: Subviews, spacing: CGFloat, alignment: TextAlignment, cache: inout [Int: CGSize]) {
             var currentX: CGFloat = 0
             var currentY: CGFloat = 0
             var lineHeight: CGFloat = 0
@@ -105,9 +106,15 @@ struct FlowLayout: Layout {
             // Close the final row.
             rowRanges.append((rowStart..<subviews.count, max(0, currentX - spacing)))
 
-            // Center each row within the available width.
+            // Position each completed row using the user's response alignment.
             for (range, width) in rowRanges {
-                let offset = max(0, (maxWidth - width) / 2)
+                let offset: CGFloat
+                switch alignment {
+                case .center:
+                    offset = max(0, (maxWidth - width) / 2)
+                default:
+                    offset = 0
+                }
                 for i in range {
                     points[i].x += offset
                 }
@@ -171,6 +178,7 @@ private struct ResponseSegment: Identifiable {
 struct StreamingMessageView: View {
     let fullText: String
     let shouldStream: Bool
+    let responseTextAlignment: ResponseTextAlignmentOption
     let responseFont: ConversationFontOption
     let conversationFontSize: ConversationFontSizeOption
     var onQuote: ((String) -> Void)? = nil
@@ -194,6 +202,7 @@ struct StreamingMessageView: View {
     init(
         fullText: String,
         shouldStream: Bool = true,
+        responseTextAlignment: ResponseTextAlignmentOption = .center,
         responseFont: ConversationFontOption = .sans,
         conversationFontSize: ConversationFontSizeOption = .large,
         onQuote: ((String) -> Void)? = nil,
@@ -202,6 +211,7 @@ struct StreamingMessageView: View {
     ) {
         self.fullText = fullText
         self.shouldStream = shouldStream
+        self.responseTextAlignment = responseTextAlignment
         self.responseFont = responseFont
         self.conversationFontSize = conversationFontSize
         self.onQuote = onQuote
@@ -224,7 +234,7 @@ struct StreamingMessageView: View {
     }
 
     var body: some View {
-        VStack(alignment: .center, spacing: 12) {
+        VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 12) {
 
             // Reserve the final response height up front so the card doesn't jump,
             // then reveal content on top of the ghost via streaming progress.
@@ -253,7 +263,7 @@ struct StreamingMessageView: View {
                 )
             }
         }
-        .frame(maxWidth: .infinity, alignment: .center)
+        .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
         .task {
             if shouldStream { await streamText() }
         }
@@ -263,7 +273,7 @@ struct StreamingMessageView: View {
 
     @ViewBuilder
     private func segmentsView(displayedCount: Int) -> some View {
-        VStack(alignment: .center, spacing: 16) {
+        VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 16) {
             ForEach(segments) { segment in
                 segmentView(segment: segment, displayedCount: displayedCount)
             }
@@ -333,7 +343,7 @@ struct StreamingMessageView: View {
 
     @ViewBuilder
     private func wordFlow(words: [String], visibleCount: Int) -> some View {
-        FlowLayout {
+        FlowLayout(alignment: responseTextAlignment.textAlignment) {
             ForEach(Array(words.enumerated()), id: \.offset) { idx, word in
                 Group {
                     if let link = insightLink(from: word) {

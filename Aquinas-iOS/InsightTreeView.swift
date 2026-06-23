@@ -15,6 +15,7 @@ struct InsightTreeView: View {
     let insights: [ConceptDefinition]
     var selectionRequest: Int = 0
     var clearSelectionRequest: Int = 0
+    var dismissHoverRequest: Int = 0
     var createConceptRequest: Int = 0
     var promotedInsightIDs: [UUID] = []
     var onClose: (() -> Void)?
@@ -67,6 +68,7 @@ struct InsightTreeView: View {
         insights: [ConceptDefinition],
         selectionRequest: Int = 0,
         clearSelectionRequest: Int = 0,
+        dismissHoverRequest: Int = 0,
         createConceptRequest: Int = 0,
         promotedInsightIDs: [UUID] = [],
         onClose: (() -> Void)? = nil,
@@ -93,6 +95,7 @@ struct InsightTreeView: View {
         self.insights              = insights
         self.selectionRequest      = selectionRequest
         self.clearSelectionRequest = clearSelectionRequest
+        self.dismissHoverRequest   = dismissHoverRequest
         self.createConceptRequest  = createConceptRequest
         self.promotedInsightIDs    = promotedInsightIDs
         self.onClose               = onClose
@@ -166,6 +169,8 @@ struct InsightTreeView: View {
                 pulsingNodeID: selectedNode?.id,
                 selectedCanvasTargets: selectedCanvasTargets,
                 selectionPulseRequest: selectionPulseRequest,
+                makeNodeChildIDs: viewModel.makeNodeChildIDs,
+                isHoveringTarget: selectedInsight != nil || selectedNode != nil || hoveredConcept != nil,
                 isMidpointMode: isMidpointMode,
                 midpointCenterRequest: midpointCenterRequest,
                 midpointPlaceRequest: midpointPlaceRequest,
@@ -380,6 +385,9 @@ struct InsightTreeView: View {
         }
         .onChange(of: clearSelectionRequest) { _, _ in
             clearSelectedCanvasTargets()
+        }
+        .onChange(of: dismissHoverRequest) { _, _ in
+            dismissDockedInsight()
         }
         .onChange(of: createConceptRequest) { _, _ in
             promoteHoveredInsightToConcept()
@@ -614,11 +622,15 @@ struct InsightTreeView: View {
             selectionPulseRequest += 1
         }
         onSelectedCanvasItemCountChange?(selectedCanvasTargets.count)
+        // Clear the hover so the dock immediately reflects the selection state
+        // (e.g. shows the "Tap another Insight" hint) instead of waiting for a tap/drag.
+        clearCanvasSelectionSilently()
     }
 
     private func promoteHoveredInsightToConcept() {
         guard let selectedInsight else { return }
         guard !promotedInsightIDs.contains(selectedInsight.id) else { return }
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.8)
         onPromotedInsightIDsChange?(promotedInsightIDs + [selectedInsight.id])
     }
 
@@ -754,19 +766,21 @@ struct DockedInsightTreeCard: View {
                 )
             }
 
-            Text(insight.definition)
+            let definitionText = insight.definition.isEmpty || insight.definition.lowercased() == insight.title.lowercased()
+                ? "This is an example of what an Insight Card will look like, the definition as relates to subject will be here"
+                : insight.definition
+            Text(definitionText)
                 .font(.figtreeParagraph)
                 .lineSpacing(12)
                 .foregroundColor(AquinasTheme.Colors.paragraphText)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
+        .padding(32)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(insightTreeInsightColor)
-        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
+            RoundedRectangle(cornerRadius: 36, style: .continuous)
                 .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
         )
         .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 16)
@@ -834,9 +848,9 @@ private struct DockedNodeTreeCard: View {
         .padding(32)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(insightTreeInsightColor)
-        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
+            RoundedRectangle(cornerRadius: 36, style: .continuous)
                 .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
         )
         .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 16)
@@ -1015,6 +1029,7 @@ private struct EditablePercent: View {
     @State private var text = ""
     @State private var dragStartPercent: Int? = nil
     @State private var lastHapticPercent: Int = 0
+    @State private var flashOpacity: CGFloat = 1.0
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -1026,9 +1041,26 @@ private struct EditablePercent: View {
                     .font(.custom("Figtree-Bold", size: 16))
                     .foregroundColor(AquinasTheme.Colors.headingText)
                     .fixedSize()
+                    .opacity(flashOpacity)
                     .onSubmit(commit)
                     .onChange(of: focused) { _, isFocused in
                         if !isFocused { commit() }
+                    }
+                    .onAppear {
+                        flashOpacity = 1.0
+                        withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
+                            flashOpacity = 0.5
+                        }
+                    }
+                    .toolbar {
+                        ToolbarItemGroup(placement: .keyboard) {
+                            Spacer()
+                            Button(action: commit) {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundColor(AquinasTheme.Colors.lightGreen)
+                            }
+                        }
                     }
             } else {
                 Text("\(percent)%")
@@ -1067,7 +1099,9 @@ private struct EditablePercent: View {
     }
 
     private func commit() {
+        guard isEditing else { return }
         isEditing = false
+        focused = false
         let digits = text.filter(\.isNumber)
         guard let value = Int(digits) else { return }
         onChange(min(100, max(0, value)))

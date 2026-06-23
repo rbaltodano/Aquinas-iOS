@@ -105,6 +105,7 @@ struct ContentView: View {
     @AppStorage("aquinas.settings.conversationFontSize") private var conversationFontSize: ConversationFontSizeOption = .small
     @State private var inputTextAlignment: InputTextAlignmentOption = .center
     @State private var inputFont: ConversationFontOption = .serif
+    @AppStorage("aquinas.settings.responseTextAlignment") private var responseTextAlignment: ResponseTextAlignmentOption = .center
     @State private var responseFont: ConversationFontOption = .sans
 
 
@@ -112,6 +113,12 @@ struct ContentView: View {
     private let pageFadeDuration: TimeInterval = 0.25
     private let pageFadePauseDuration: TimeInterval = 0.15
     private let pageTransitionOffset: CGFloat = 8
+
+    private var rootSafeAreaColor: Color {
+        activePage == .conversation && isConversationCanvasMode
+            ? AquinasTheme.Colors.canvas
+            : canvasColor
+    }
 
     private var newInsightsCount: Int {
         guard let strings = UserDefaults.standard.stringArray(forKey: "AquinasSeenInsightIDs"),
@@ -165,6 +172,7 @@ struct ContentView: View {
             conversationFontSize: conversationFontSize,
             inputTextAlignment: inputTextAlignment,
             inputFont: inputFont,
+            responseTextAlignment: responseTextAlignment,
             responseFont: responseFont,
             uploadedFiles: $uploadedFiles,
             showFilePicker: $showFilePicker
@@ -174,8 +182,9 @@ struct ContentView: View {
     var body: some View {
         GeometryReader { _ in
             ZStack(alignment: .top) {
-                canvasColor
+                rootSafeAreaColor
                     .ignoresSafeArea()
+                    .animation(.easeInOut(duration: 0.2), value: isConversationCanvasMode)
 
                 VStack(spacing: 0) {
                     VStack(spacing: 0) {
@@ -231,6 +240,7 @@ struct ContentView: View {
                                     conversationFontSize: $conversationFontSize,
                                     inputTextAlignment: $inputTextAlignment,
                                     inputFont: $inputFont,
+                                    responseTextAlignment: $responseTextAlignment,
                                     responseFont: $responseFont,
                                     onOpenMenu: {
                                         dismissKeyboard()

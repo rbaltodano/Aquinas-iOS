@@ -37,7 +37,7 @@ struct CanvasModeToggleButton: View {
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: "flowchart")
+            Image(systemName: "point.3.connected.trianglepath.dotted")
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundColor(isActive ? AquinasTheme.Colors.surface : AquinasTheme.Colors.lightGreen)
                 .sfSymbolDrawOn()
@@ -114,7 +114,7 @@ struct AquinasSideMenu: View {
                         VStack(alignment: .leading, spacing: 0) {
                             SideMenuRow(icon: "house", title: "Home", isPresented: isPresented, delay: 0.20, action: {})
                             SideMenuRow(
-                                icon: "bubble.left.and.bubble.right",
+                                icon: "text.word.spacing",
                                 title: "Conversations",
                                 isActive: activePage == .openConversations,
                                 isPresented: isPresented,
@@ -157,9 +157,11 @@ struct AquinasSideMenu: View {
                             ForEach(Array(sideMenuStudyTopics.enumerated()), id: \.element.id) { index, topic in
                                 StudyTopicMenuRow(
                                     topic: topic,
+                                    conversations: conversations.filter { $0.studyTopicID == topic.id },
                                     isPresented: isPresented,
                                     delay: 0.20 + (Double(index) * 0.05),
                                     onSelect: { onSelectStudyTopic(topic) },
+                                    onSelectConversation: { onSelectConversation($0) },
                                     onRename: {
                                         topicRenameDraft = topic.title
                                         topicBeingRenamed = topic
@@ -686,12 +688,15 @@ private struct ConversationMenuRow: View {
 
 private struct StudyTopicMenuRow: View {
     let topic: StudyTopic
+    let conversations: [InquiryConversation]
     let isPresented: Bool
     let delay: TimeInterval
     var onSelect: () -> Void
+    var onSelectConversation: (InquiryConversation) -> Void = { _ in }
     var onRename: () -> Void = {}
     var onDelete: () -> Void = {}
     @State private var isVisible = false
+    @State private var isExpanded = false
     @State private var isShowingLongPressFeedback = false
     @State private var entranceRunID = UUID()
 
@@ -703,68 +708,100 @@ private struct StudyTopicMenuRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "text.book.closed")
-                .font(.system(size: 16, weight: .medium))
-                .foregroundColor(AquinasTheme.Colors.accent)
-                .frame(width: 16, height: 16)
-                .sfSymbolDrawOn()
+        VStack(alignment: .leading, spacing: 0) {
+            // ── Topic header row ─────────────────────────────────────────────
+            HStack(spacing: 12) {
+                Image(systemName: "text.book.closed")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundColor(AquinasTheme.Colors.accent)
+                    .frame(width: 16, height: 16)
+                    .sfSymbolDrawOn()
 
-            Text(displayTitle)
-                .font(.custom("LibreBaskerville-Regular", size: 14))
-                .lineSpacing(7)
-                .foregroundColor(AquinasTheme.Colors.paragraphText)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .multilineTextAlignment(.leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .scaleEffect(isShowingLongPressFeedback ? 1.05 : 1, anchor: .leading)
-
-            Menu {
-                Button("Rename", systemImage: "pencil.line") { onRename() }
-                Divider()
-                Button("Delete", systemImage: "trash", role: .destructive) { onDelete() }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 14, weight: .bold))
+                Text(displayTitle)
+                    .font(.custom("LibreBaskerville-Regular", size: 14))
+                    .lineSpacing(7)
                     .foregroundColor(AquinasTheme.Colors.paragraphText)
-                    .sfSymbolDrawOn(delay: delay + 0.08)
-                    .frame(width: 22, height: 22)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .scaleEffect(isShowingLongPressFeedback ? 1.05 : 1, anchor: .leading)
+
+
+                Menu {
+                    Button("Rename", systemImage: "pencil.line") { onRename() }
+                    Divider()
+                    Button("Delete", systemImage: "trash", role: .destructive) { onDelete() }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(AquinasTheme.Colors.paragraphText)
+                        .sfSymbolDrawOn(delay: delay + 0.08)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .padding(11)
+                .contentShape(Rectangle())
+                .padding(-11)
+                .accessibilityLabel("Topic options")
             }
-            .buttonStyle(.plain)
-            .padding(11)
-            .contentShape(Rectangle())
-            .padding(-11)
-            .accessibilityLabel("Topic options")
+            .padding(.horizontal, 24)
+            .padding(.vertical, 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .onTapGesture {
+                // First tap expands; tapping again navigates.
+                if isExpanded || conversations.isEmpty {
+                    onSelect()
+                } else {
+                    withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
+                        isExpanded = true
+                    }
+                }
+            }
+            .onLongPressGesture(
+                minimumDuration: longPressDuration,
+                maximumDistance: 18,
+                pressing: { isPressing in updateLongPressFeedback(isPressing) },
+                perform: {}
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .trim(from: 0, to: isShowingLongPressFeedback ? 1 : 0)
+                    .stroke(
+                        AquinasTheme.Colors.border,
+                        style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round)
+                    )
+                    .opacity(isShowingLongPressFeedback ? 1 : 0)
+                    .padding(1)
+                    .allowsHitTesting(false)
+            }
+
+            // ── Expanded conversation list ────────────────────────────────────
+            if isExpanded && !conversations.isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(conversations.enumerated()), id: \.element.id) { index, conversation in
+                        TopicConversationRow(
+                            conversation: conversation,
+                            index: index,
+                            onTap: { onSelectConversation(conversation) }
+                        )
+                    }
+                }
+                .padding(.bottom, 4)
+            }
         }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .onTapGesture(perform: onSelect)
-        .onLongPressGesture(
-            minimumDuration: longPressDuration,
-            maximumDistance: 18,
-            pressing: { isPressing in updateLongPressFeedback(isPressing) },
-            perform: {}
-        )
         .opacity(isVisible ? 1 : 0)
         .offset(x: isVisible ? 0 : -10)
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .trim(from: 0, to: isShowingLongPressFeedback ? 1 : 0)
-                .stroke(
-                    AquinasTheme.Colors.border,
-                    style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round)
-                )
-                .opacity(isShowingLongPressFeedback ? 1 : 0)
-                .padding(1)
-                .allowsHitTesting(false)
-        }
         .onAppear(perform: runEntrance)
-        .onChange(of: isPresented) { _, _ in
+        .onChange(of: isPresented) { _, newValue in
             isShowingLongPressFeedback = false
+            if !newValue {
+                withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
+                    isExpanded = false
+                }
+            }
             runEntrance()
         }
     }
@@ -787,6 +824,47 @@ private struct StudyTopicMenuRow: View {
             guard entranceRunID == runID, isPresented else { return }
             withAnimation(.easeOut(duration: 0.30)) { isVisible = true }
         }
+    }
+}
+
+private struct TopicConversationRow: View {
+    let conversation: InquiryConversation
+    let index: Int
+    var onTap: () -> Void
+
+    @State private var appeared = false
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 10) {
+                Image(systemName: "text.word.spacing")
+                    .font(.system(size: 11))
+                    .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.4))
+                    .frame(width: 14, height: 14)
+                    .sfSymbolDrawOn(delay: Double(index) * 0.15 + 0.05)
+                Text(conversation.title.isEmpty ? "Untitled" : conversation.title)
+                    .font(.custom("LibreBaskerville-Regular", size: 13))
+                    .foregroundColor(AquinasTheme.Colors.paragraphText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.leading, 52)
+            .padding(.trailing, 24)
+            .padding(.vertical, 9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .opacity(appeared ? 1 : 0)
+        .offset(x: appeared ? 0 : -8)
+        .onAppear {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.82)
+                .delay(Double(index) * 0.15)) {
+                appeared = true
+            }
+        }
+        .onDisappear { appeared = false }
     }
 }
 

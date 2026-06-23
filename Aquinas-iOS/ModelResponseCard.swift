@@ -14,8 +14,8 @@ import SwiftUI
 struct ModelResponseCard: View {
     let title: String
     let fullText: String
-    let forceCollapsed: Bool
     let shouldAnimateOnAppear: Bool
+    let responseTextAlignment: ResponseTextAlignmentOption
     let responseFont: ConversationFontOption
     let conversationFontSize: ConversationFontSizeOption
     var onDuplicateBranch: (() -> Void)? = nil
@@ -24,7 +24,6 @@ struct ModelResponseCard: View {
     @State private var isThinking: Bool
     @State private var isThinkingDocked: Bool
     @State private var showTitle: Bool
-    @State private var isCollapsed: Bool
     @State private var isThinkingExpanded: Bool = false
     @State private var visibleThinkingLineCount: Int = 0
     @State private var isThinkingRuleVisible: Bool = false
@@ -40,8 +39,8 @@ struct ModelResponseCard: View {
     init(
         title: String,
         fullText: String,
-        forceCollapsed: Bool,
         shouldAnimateOnAppear: Bool = true,
+        responseTextAlignment: ResponseTextAlignmentOption = .center,
         responseFont: ConversationFontOption = .sans,
         conversationFontSize: ConversationFontSizeOption = .large,
         onDuplicateBranch: (() -> Void)? = nil,
@@ -49,8 +48,8 @@ struct ModelResponseCard: View {
     ) {
         self.title = title
         self.fullText = fullText
-        self.forceCollapsed = forceCollapsed
         self.shouldAnimateOnAppear = shouldAnimateOnAppear
+        self.responseTextAlignment = responseTextAlignment
         self.responseFont = responseFont
         self.conversationFontSize = conversationFontSize
         self.onDuplicateBranch = onDuplicateBranch
@@ -58,7 +57,6 @@ struct ModelResponseCard: View {
         _isThinking = State(initialValue: shouldAnimateOnAppear)
         _isThinkingDocked = State(initialValue: !shouldAnimateOnAppear)
         _showTitle = State(initialValue: !shouldAnimateOnAppear)
-        _isCollapsed = State(initialValue: forceCollapsed)
     }
 
     var body: some View {
@@ -102,6 +100,10 @@ struct ModelResponseCard: View {
                 .buttonStyle(.plain)
                 .disabled(isThinking)
                 .accessibilityLabel(isThinkingExpanded ? "Hide Thinking" : "Show Thinking")
+                .frame(
+                    maxWidth: isThinking ? nil : .infinity,
+                    alignment: isThinking ? .center : responseTextAlignment.frameAlignment
+                )
 
                 if !isThinking && isThinkingExpanded {
                     VStack(alignment: .leading, spacing: 16) {
@@ -137,7 +139,9 @@ struct ModelResponseCard: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
                     }
+                    .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
                     .padding(.bottom, 40)
                     .transition(.opacity.combined(with: .move(edge: .top)))
                     .task {
@@ -164,41 +168,23 @@ struct ModelResponseCard: View {
                 // ── Title + response body (card state only) ───────────────────
                 if !isThinking {
                     if showTitle {
-                        Button(action: {
-                            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                                isCollapsed.toggle()
-                            }
-                        }) {
-                            HStack(alignment: .center, spacing: 6) {
-                                Text(title)
-                                    .font(.baskervilleDisplay)
-                                    .foregroundColor(brandBrown)
-
-                                Image(systemName: isCollapsed ? "chevron.down" : "chevron.up")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .foregroundColor(AquinasTheme.Colors.placeholderText)
-                                    .padding(.top, 2)
-                                    .sfSymbolDrawOn()
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .transition(.streamedTextFade)
+                        Text(title)
+                            .font(.baskervilleDisplay)
+                            .foregroundColor(brandBrown)
+                            .multilineTextAlignment(responseTextAlignment.textAlignment)
+                            .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
+                            .transition(.streamedTextFade)
                     }
 
                     StreamingMessageView(
                         fullText: fullText,
                         shouldStream: shouldAnimateOnAppear,
+                        responseTextAlignment: responseTextAlignment,
                         responseFont: responseFont,
                         conversationFontSize: conversationFontSize,
                         onBranch: onDuplicateBranch,
                         onFinish: onFinish
                     )
-                    .opacity(isCollapsed ? 0 : 1)
-                    .frame(height: isCollapsed ? 0 : nil)
-                    // Only clip while collapsed (so height 0 hides the body). When
-                    // expanded, leave overflow visible so the bottom line's fade-up
-                    // drift isn't cut off at the container edge.
-                    .clipped(when: isCollapsed)
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
                 }
             }
@@ -229,9 +215,6 @@ struct ModelResponseCard: View {
                 isThinking = false
             }
         }
-        .onAppear {
-            isCollapsed = forceCollapsed
-        }
         .onChange(of: isThinking) { _, newValue in
             if !newValue {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
@@ -239,11 +222,6 @@ struct ModelResponseCard: View {
                         showTitle = true
                     }
                 }
-            }
-        }
-        .onChange(of: forceCollapsed) { _, newValue in
-            withAnimation(.easeInOut(duration: 0.18)) {
-                isCollapsed = newValue
             }
         }
     }
