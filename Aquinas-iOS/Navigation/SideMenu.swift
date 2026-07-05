@@ -18,7 +18,7 @@ struct SideMenuTriggerButton: View {
                 .foregroundColor(AquinasTheme.Colors.darkGreen)
                 .sfSymbolDrawOn()
                 .frame(width: 48, height: 48)
-                .background(AquinasTheme.Colors.surface)
+                .background(AquinasTheme.Colors.canvasSecondary)
                 .clipShape(Circle())
                 .overlay(
                     Circle()
@@ -33,24 +33,166 @@ struct SideMenuTriggerButton: View {
 /// Top-right control for quickly moving between focused Branch mode and the wider Canvas view.
 struct CanvasModeToggleButton: View {
     let isActive: Bool
+    var updateCount: Int = 0
     var action: () -> Void
+    @State private var pulseScale: CGFloat = 1.0
+    @State private var updateCountTextWidth: CGFloat = 0
+    @State private var animatedButtonWidth: CGFloat = 48
+    @State private var animatedCountGap: CGFloat = 0
+    @State private var animatedCountWidth: CGFloat = 0
+
+    private static let collapsedWidth: CGFloat = 48
+    private static let activeWidth: CGFloat = 93
+    private static let countGap: CGFloat = 8
+
+    private var displayedUpdateCount: String {
+        guard updateCount > 0 else { return "0" }
+        return updateCount > 99 ? "99+" : "\(updateCount)"
+    }
+
+    private var showsUpdateCount: Bool {
+        !isActive && updateCount > 0
+    }
 
     var body: some View {
-        Button(action: action) {
-            Image(systemName: "point.3.connected.trianglepath.dotted")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundColor(isActive ? AquinasTheme.Colors.surface : AquinasTheme.Colors.lightGreen)
-                .sfSymbolDrawOn()
-                .frame(width: 48, height: 48)
-                .background(isActive ? AquinasTheme.Colors.lightGreen : AquinasTheme.Colors.surface)
-                .clipShape(Circle())
-                .overlay(
-                    Circle()
-                        .stroke(AquinasTheme.Colors.controlBorder, lineWidth: isActive ? 0 : 1)
-                )
+        Button(action: handleTap) {
+            HStack(spacing: 0) {
+                ZStack {
+                    if isActive {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(AquinasTheme.Colors.darkGreen)
+                            .transition(.blurFade)
+                    } else {
+                        Image(systemName: "point.3.connected.trianglepath.dotted")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(AquinasTheme.Colors.lightGreen)
+                            .sfSymbolDrawOn()
+                            .transition(.blurFade)
+                    }
+                }
+                .frame(width: 18, height: 18)
+
+                if !isActive {
+                    Color.clear
+                        .frame(width: animatedCountGap)
+
+                    updateCountText
+                        .frame(width: animatedCountWidth, alignment: .leading)
+                        .opacity(showsUpdateCount && animatedCountWidth > 0 ? 1 : 0)
+                        .blur(radius: showsUpdateCount && animatedCountWidth > 0 ? 0 : 6)
+                        .clipped()
+                }
+
+                if isActive {
+                    Text("Back")
+                        .font(.custom("Figtree-Bold", size: 14))
+                        .foregroundColor(AquinasTheme.Colors.paragraphText)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .transition(.blurFade)
+                }
+            }
+            .padding(.horizontal, isActive ? 19 : 15)
+            .frame(width: animatedButtonWidth, height: 48)
+            .background(AquinasTheme.Colors.canvasSecondary)
+            .clipShape(Capsule())
+            .clipped()
+            .overlay(
+                Capsule()
+                    .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
+            )
+            .animation(.spring(response: 0.42, dampingFraction: 0.84), value: isActive)
+            .animation(.easeInOut(duration: 0.22), value: displayedUpdateCount)
         }
+        .background(updateCountMeasurement)
         .buttonStyle(.plain)
+        .scaleEffect(pulseScale)
         .accessibilityLabel(isActive ? "Return to branch view" : "Open canvas view")
+        .onAppear {
+            updateButtonLayout(animated: false)
+        }
+        .onChange(of: isActive) { _, _ in
+            updateButtonLayout(animated: true)
+        }
+        .onChange(of: updateCount) { oldValue, newValue in
+            guard oldValue != newValue else { return }
+            updateButtonLayout(animated: true)
+            triggerPulse()
+        }
+    }
+
+    private var updateCountText: some View {
+                    Text(displayedUpdateCount)
+                        .font(.figtreeChipLabel)
+            .foregroundColor(AquinasTheme.Colors.headingText)
+            .lineLimit(1)
+            .monospacedDigit()
+            .fixedSize(horizontal: true, vertical: false)
+            .contentTransition(.numericText())
+    }
+
+    private var updateCountMeasurement: some View {
+        updateCountText
+            .hidden()
+            .background(
+                GeometryReader { proxy in
+                    Color.clear
+                        .preference(key: CanvasModeUpdateCountWidthKey.self, value: proxy.size.width)
+                }
+            )
+            .onPreferenceChange(CanvasModeUpdateCountWidthKey.self) { width in
+                updateCountTextWidth = width
+                updateButtonLayout(animated: showsUpdateCount)
+            }
+    }
+
+    private func targetButtonWidth(countWidth: CGFloat) -> CGFloat {
+        if isActive { return Self.activeWidth }
+        if showsUpdateCount { return Self.collapsedWidth + Self.countGap + countWidth }
+        return Self.collapsedWidth
+    }
+
+    private func updateButtonLayout(animated: Bool) {
+        let nextCountWidth = showsUpdateCount ? updateCountTextWidth : 0
+        let nextCountGap = showsUpdateCount ? Self.countGap : 0
+        let nextButtonWidth = targetButtonWidth(countWidth: nextCountWidth)
+
+        let updates = {
+            animatedCountWidth = nextCountWidth
+            animatedCountGap = nextCountGap
+            animatedButtonWidth = nextButtonWidth
+        }
+
+        if animated {
+            withAnimation(.easeInOut(duration: 0.28), updates)
+        } else {
+            updates()
+        }
+    }
+
+    private func handleTap() {
+        triggerPulse()
+        action()
+    }
+
+    private func triggerPulse() {
+        withAnimation(.spring(response: 0.22, dampingFraction: 0.52)) {
+            pulseScale = 1.05
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.68)) {
+                pulseScale = 1.0
+            }
+        }
+    }
+}
+
+private struct CanvasModeUpdateCountWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 
@@ -68,9 +210,12 @@ struct AquinasSideMenu: View {
     var onSelectConversation: (InquiryConversation) -> Void
     var onRenameConversation: (InquiryConversation, String) -> Void
     var onPinConversation: (InquiryConversation) -> Void
+    var onUnpinConversation: (InquiryConversation) -> Void
     var onAddConversationToStudyTopic: (InquiryConversation, UUID) -> Void
+    var onRemoveConversationFromStudyTopic: (InquiryConversation) -> Void
     var onDeleteConversation: (InquiryConversation) -> Void
     var newInsightsCount: Int = 0
+    var onOpenHome: () -> Void
     var onOpenConversations: () -> Void
     var onOpenInsights: () -> Void
     var onOpenStudyTopics: () -> Void
@@ -112,7 +257,14 @@ struct AquinasSideMenu: View {
                         SearchRow(isPresented: isPresented, delay: 0.15)
 
                         VStack(alignment: .leading, spacing: 0) {
-                            SideMenuRow(icon: "house", title: "Home", isPresented: isPresented, delay: 0.20, action: {})
+                            SideMenuRow(
+                                icon: "house",
+                                title: "Home",
+                                isActive: activePage == .home,
+                                isPresented: isPresented,
+                                delay: 0.20,
+                                action: onOpenHome
+                            )
                             SideMenuRow(
                                 icon: "text.word.spacing",
                                 title: "Conversations",
@@ -185,7 +337,8 @@ struct AquinasSideMenu: View {
                         .offset(x: showsOpenConversationsTitle ? 0 : -24)
 
                     VStack(alignment: .leading, spacing: 8) {
-                        ForEach(Array(conversations.enumerated()), id: \.element.id) { index, conversation in
+                        let sortedConversations = conversations.sorted { $0.isPinned && !$1.isPinned }
+                        ForEach(Array(sortedConversations.enumerated()), id: \.element.id) { index, conversation in
                             ConversationMenuRow(
                                 conversation: conversation,
                                 isActive: activePage == .conversation && conversation.id == activeConversationID,
@@ -201,8 +354,14 @@ struct AquinasSideMenu: View {
                                 onPin: {
                                     onPinConversation(conversation)
                                 },
+                                onUnpin: {
+                                    onUnpinConversation(conversation)
+                                },
                                 onAddToStudyTopic: {
                                     conversationBeingAddedToStudyTopic = conversation
+                                },
+                                onRemoveFromStudyTopic: {
+                                    onRemoveConversationFromStudyTopic(conversation)
                                 },
                                 onDelete: {
                                     onDeleteConversation(conversation)
@@ -597,6 +756,20 @@ private struct SideMenuRow: View {
     }
 }
 
+private struct PinBlurModifier: ViewModifier, Animatable {
+    var amount: Double // 1 = fully hidden, 0 = fully revealed
+    var animatableData: Double {
+        get { amount }
+        set { amount = newValue }
+    }
+    func body(content: Content) -> some View {
+        content
+            .blur(radius: amount * 7)
+            .opacity(1 - amount)
+            .scaleEffect(1 - amount * 0.38, anchor: .leading)
+    }
+}
+
 private struct ConversationMenuRow: View {
     let conversation: InquiryConversation
     let isActive: Bool
@@ -605,27 +778,56 @@ private struct ConversationMenuRow: View {
     var onSelect: () -> Void
     var onRename: () -> Void
     var onPin: () -> Void
+    var onUnpin: () -> Void = {}
     var onAddToStudyTopic: () -> Void
+    var onRemoveFromStudyTopic: () -> Void
     var onDelete: () -> Void
     @State private var isVisible = false
+    @State private var showUnpinConfirmation = false
+    @State private var isPinRevealed = false
     @State private var entranceRunID = UUID()
 
     var body: some View {
         HStack(spacing: 12) {
-            Text(conversation.title)
-                .font(.custom("LibreBaskerville-Regular", size: 14))
-                .lineSpacing(7)
-                .foregroundColor(AquinasTheme.Colors.paragraphText)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .multilineTextAlignment(.leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 8) {
+                if isPinRevealed {
+                    Button {
+                        showUnpinConfirmation = true
+                    } label: {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(AquinasTheme.Colors.accent)
+                    }
+                    .buttonStyle(.plain)
+                    .transition(.modifier(
+                        active: PinBlurModifier(amount: 1),
+                        identity: PinBlurModifier(amount: 0)
+                    ))
+                }
+                Text(conversation.title)
+                    .font(.custom("LibreBaskerville-Regular", size: 14))
+                    .lineSpacing(7)
+                    .foregroundColor(AquinasTheme.Colors.paragraphText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .multilineTextAlignment(.leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .animation(.spring(response: 0.40, dampingFraction: 0.78), value: isPinRevealed)
 
             if isActive {
                 Menu {
                     Button("Rename", systemImage: "pencil.line") { onRename() }
-                    Button("Pin", systemImage: "pin") { onPin() }
-                    Button("Add to Study Topic", systemImage: "book.closed") { onAddToStudyTopic() }
+                    if conversation.isPinned {
+                        Button("Unpin", systemImage: "pin.slash") { onUnpin() }
+                    } else {
+                        Button("Pin", systemImage: "pin") { onPin() }
+                    }
+                    if conversation.studyTopicID != nil {
+                        Button("Remove from Study Topic", systemImage: "book.closed") { onRemoveFromStudyTopic() }
+                    } else {
+                        Button("Add to Study Topic", systemImage: "book.closed") { onAddToStudyTopic() }
+                    }
                     Divider()
                     Button("Delete", systemImage: "trash", role: .destructive) { onDelete() }
                 } label: {
@@ -651,14 +853,36 @@ private struct ConversationMenuRow: View {
         .onTapGesture(perform: onSelect)
         .contextMenu {
             Button("Rename", systemImage: "pencil.line") { onRename() }
-            Button("Pin", systemImage: "pin") { onPin() }
-            Button("Add to Study Topic", systemImage: "book.closed") { onAddToStudyTopic() }
+            if conversation.isPinned {
+                Button("Unpin", systemImage: "pin.slash") { onUnpin() }
+            } else {
+                Button("Pin", systemImage: "pin") { onPin() }
+            }
+            if conversation.studyTopicID != nil {
+                Button("Remove from Study Topic", systemImage: "book.closed") { onRemoveFromStudyTopic() }
+            } else {
+                Button("Add to Study Topic", systemImage: "book.closed") { onAddToStudyTopic() }
+            }
             Divider()
             Button("Delete", systemImage: "trash", role: .destructive) { onDelete() }
         }
+        .alert("Unpin Conversation?", isPresented: $showUnpinConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Unpin") { onUnpin() }
+        } message: {
+            Text("Remove \"\(conversation.title)\" from pinned conversations?")
+        }
         .opacity(isVisible ? 1 : 0)
         .offset(x: isVisible ? 0 : -10)
-        .onAppear(perform: runEntrance)
+        .onAppear {
+            isPinRevealed = conversation.isPinned
+            runEntrance()
+        }
+        .onChange(of: conversation.isPinned) { _, newValue in
+            withAnimation(.spring(response: 0.40, dampingFraction: 0.78)) {
+                isPinRevealed = newValue
+            }
+        }
         .onChange(of: isPresented) { _, _ in
             runEntrance()
         }
@@ -868,7 +1092,7 @@ private struct TopicConversationRow: View {
     }
 }
 
-private struct SideMenuStudyTopicPickerSheet: View {
+struct SideMenuStudyTopicPickerSheet: View {
     let conversation: InquiryConversation
     var onSelectTopic: (StudyTopic) -> Void
 

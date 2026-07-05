@@ -523,10 +523,10 @@ struct InsightQuestionBar: View {
     private func insightChip(title: String, showRemove: Bool = false, onRemove: (() -> Void)? = nil) -> some View {
         HStack(spacing: 6) {
             Image(systemName: "text.bubble.fill")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundColor(AquinasTheme.Colors.darkGreen)
             Text(title)
-                .font(.figtreeChipLabel)
+                .font(.figtreeHeading2)
                 .foregroundColor(AquinasTheme.Colors.darkGreen)
                 .lineLimit(1)
             if showRemove, let onRemove {

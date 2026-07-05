@@ -139,6 +139,21 @@ extension AnyTransition {
     static var blurSlideUp: AnyTransition {
         glideFadeUp
     }
+
+    static var blurredTitleReplacement: AnyTransition {
+        .asymmetric(
+            insertion: .modifier(
+                active: GlideFadeModifier(isActive: true),
+                identity: GlideFadeModifier(isActive: false)
+            )
+            .animation(.easeOut(duration: 0.5)),
+            removal: .modifier(
+                active: GlideFadeModifier(isActive: true),
+                identity: GlideFadeModifier(isActive: false)
+            )
+            .animation(.easeInOut(duration: 0.5))
+        )
+    }
 }
 
 // MARK: - Cached Regex
@@ -243,6 +258,7 @@ struct StreamingMessageView: View {
                     .hidden()
 
                 segmentsView(displayedCount: displayedWords.count)
+                    .textSelection(.enabled)   // let the user highlight / copy the response text
             }
             .animation(.easeOut(duration: 0.55), value: displayedWords.count)
 

@@ -20,6 +20,13 @@ struct InsightTreeCanvasView: View {
     let selectedCanvasTargets: [CanvasSelectionTarget]
     let selectionPulseRequest: Int
     var makeNodeChildIDs: Set<UUID> = []
+    /// Nodes that are user-placed midpoints — rendered as a bare insight chip (no
+    /// node-concept circle), pinned at the node position.
+    var placedMidpointNodeIDs: Set<UUID> = []
+    /// For each placed-midpoint node, the sources it connects to (insight chips / node concepts).
+    var placedMidpointSources: [UUID: [MidpointSource]] = [:]
+    /// Per-insight bond length (connector radius) from relatedness to the parent node.
+    var insightBondLengths: [UUID: CGFloat] = [:]
     var isHoveringTarget: Bool = false
     var isMidpointMode: Bool = false
     var midpointCenterRequest: Int = 0
@@ -34,6 +41,25 @@ struct InsightTreeCanvasView: View {
     var onSuggestConnection: (EdgeModel) -> Void
     var onDismissSuggestedNode: (NodeModel) -> Void
     var onMidpointPlaced: (CGPoint, CanvasSelectionTarget, [Double]) -> Void = { _, _, _ in }
+    /// The insight id of a just-placed midpoint, so it runs the loading-icon → text-reveal sequence.
+    var midpointPlacedInsightID: UUID? = nil
+    /// Fired once the placed midpoint insight has "loaded" (icon flash → text reveal → dot pulse),
+    /// so the orchestration layer can pop its card.
+    var onMidpointInsightLoaded: (UUID) -> Void = { _ in }
+    /// True while Make Node children are generating, so the Context wheel spins.
+    var onGeneratingChange: (Bool) -> Void = { _ in }
+    /// Fired for each Make Node child at the instant it's revealed (as its haptic taps fire),
+    /// so the parent's docked card can grow an Insight link for it in sync with the animation.
+    var onMakeNodeChildRevealed: (UUID) -> Void = { _ in }
+    /// Live simulated node positions, reported up for persistence (on disappear / background).
+    var onPositionsSettled: ([UUID: CGPoint]) -> Void = { _ in }
+    /// Fired to clear any currently hovered/docked insight or node card (e.g. before a
+    /// generation zoom-out, so the previously hovered card doesn't linger).
+    var onRequestDismissHover: () -> Void = {}
+    /// Reports the current blue-dot count whenever insights become discovered or undiscovered.
+    var onUndiscoveredInsightCountChange: (Int) -> Void = { _ in }
+
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var scale: CGFloat = 1
     @State private var offset: CGSize = .zero
@@ -47,6 +73,8 @@ struct InsightTreeCanvasView: View {
     @State private var selectionRipples:   [RippleTrigger] = []
     @State private var hasAppeared:        Bool = false
     @State private var revealedInsightIDs: Set<UUID> = []
+    /// Insights the user hasn't opened yet — they show a blue "new" dot until first hovered.
+    @State private var undiscoveredInsightIDs: Set<UUID> = []
     @State private var entranceTask:       Task<Void, Never>? = nil
     @State private var pulseCycleStartedAt = Date().timeIntervalSinceReferenceDate
     @State private var connectorPulseDelayUntil = Date().timeIntervalSinceReferenceDate
@@ -59,7 +87,55 @@ struct InsightTreeCanvasView: View {
     @State private var midpointHandleVisible: Bool = false
     @State private var dragStartHandleWorld: CGPoint?
     @State private var lastHandleHapticPercent: Int?
+    /// Set when the user pans/zooms/taps after placing a midpoint, so the auto camera-hover
+    /// stops chasing the generating insight and the user can look around freely.
+    @State private var userMovedSincePlacement: Bool = false
     @GestureState private var dragOffset:  CGSize = .zero
+
+    // MARK: - Live physics simulation
+    /// Per-node simulated position + velocity. The canvas briefly relaxes these from the
+    /// view model's seed positions after topology changes, then freezes to avoid passive drift.
+    @State private var bodies: [UUID: SimBody] = [:]
+    /// Per-insight free bond angle around its node; VSEPR repulsion spreads chips to maximize
+    /// angular separation. Keyed by insight id.
+    @State private var chipAngles: [UUID: ChipAngle] = [:]
+    @State private var alpha: Double = 0
+    @State private var displayLink: DisplayLinkDriver? = nil
+    @State private var lastTickAt: CFTimeInterval = 0
+    @State private var simFramesRemaining: Int = 0
+
+    // Force constants — mirror InsightTreeViewModel.runForceLayout so the live sim matches the seed.
+    private static let repulsionK: CGFloat = 3600
+    private static let repulsionMinDist: CGFloat = 60
+    private static let overlapPadding: CGFloat = 24
+    private static let simDamping: CGFloat = 0.62       // lower = settles faster, less wobble
+    private static let simMaxStep: CGFloat = 4          // per-frame move clamp (matches VM)
+    private static let simMaxDt: CFTimeInterval = 1.0 / 30
+    private static let constraintIterations = 4          // rigid edge-length projection passes
+    private static let alphaDecay: Double = 0.08
+    private static let alphaFloor: Double = 0
+    private static let jitterAmplitude: CGFloat = 0
+    private static let settleFrameBudget: Int = 150   // longer: node bonds rotate into VSEPR angles
+    private static let settleVelocityThreshold: CGFloat = 0.02
+    // Per-insight "inner tube": when two chips get within this radius they bounce apart.
+    // Cross-node overlap also nudges the parent nodes apart.
+    private static let insightBubbleRadius: CGFloat = 48
+    private static let insightBubblePadding: CGFloat = 12
+    private static let bubblePushK: CGFloat = 0.06
+    private static let forceGain: CGFloat = 0.5          // scales summed force → velocity
+    // VSEPR angular spread: every domain around a node — insight bonds AND bonds to neighbor
+    // nodes — repels EQUALLY (`domainK`), settling to maximum separation (2 → 180° linear,
+    // 3 → 120° trigonal, etc.). Both chip bonds AND node-to-node bonds rotate by a DIRECT
+    // clamped angular step (not a force) — a force competes with the generic pairwise node
+    // repulsion and gets drowned out, leaving node-node bond angles barely moving.
+    private static let domainK: Double = 1.0
+    private static let chipAngGain: Double = 0.4         // viscous angular response speed
+    private static let chipMaxAngStep: Double = 0.05     // max radians a bond rotates per frame
+    private static let chipAngleEps: Double = 0.12       // softens the 1/Δθ repulsion
+    // Node-to-node bond spreading: a tangential force that swings a neighbor node around the
+    // shared node, run through the damped velocity pipeline (converges, no fly-off/jitter).
+    private static let edgeTorqueGain: CGFloat = 0.5
+    private static let edgeTorqueMax: CGFloat = 2.5      // clamp the tangential force per bond
 
     private var activeScale: CGFloat {
         clamp(scale, lower: 0.28, upper: 2.6)
@@ -100,6 +176,7 @@ struct InsightTreeCanvasView: View {
             let size = proxy.size
             let camera = InsightTreeCamera(scale: activeScale, offset: activeOffset)
             let labelOpacity = Self.labelOpacity(for: activeScale)
+            let nodeLabelOpacity = Self.nodeLabelOpacity(for: activeScale)
 
             ZStack {
                 insightTreeCanvasColor.ignoresSafeArea()
@@ -115,14 +192,18 @@ struct InsightTreeCanvasView: View {
 
                 ZStack {
                     graphEdges(camera: camera, size: size)
-                    insightConnectors(camera: camera, size: size, labelOpacity: labelOpacity)
+                    midpointConnectors(camera: camera, size: size)
+                    insightConnectors(camera: camera, size: size)
                     connectorPulseOverlay(camera: camera, size: size)
                     selectionOverlay(camera: camera, size: size)
                     edgeHitTargets(camera: camera, size: size)
 
-                    ForEach(nodes) { node in
-                        nodeGroup(node, camera: camera, size: size, labelOpacity: labelOpacity)
-                            .opacity(itemFlashOpacity(selected: selectedCanvasTargets.contains(.node(node.id))))
+                    ForEach(displayNodes) { node in
+                        // Placed-midpoint nodes render as just their insight chip — no concept circle.
+                        if !placedMidpointNodeIDs.contains(node.id) {
+                            nodeGroup(node, camera: camera, size: size, labelOpacity: nodeLabelOpacity)
+                                .opacity(itemFlashOpacity(selected: selectedCanvasTargets.contains(.node(node.id))))
+                        }
 
                         ForEach(Array(node.insights.prefix(6).enumerated()), id: \.element.id) { index, insight in
                             insightLabel(
@@ -152,6 +233,7 @@ struct InsightTreeCanvasView: View {
             .simultaneousGesture(zoomGesture(in: size))  // always available for precision zooming
             .onTapGesture {
                 selectedEdgeID = nil
+                userMovedSincePlacement = true
             }
             .onChange(of: restoreFocusedCameraRequest) { oldValue, newValue in
                 restorePreFocusCamera()
@@ -164,11 +246,18 @@ struct InsightTreeCanvasView: View {
             }
             .onAppear {
                 hasAppeared = true
+                reconcileBodies()   // seed live physics bodies + start the tick
                 let newInsights = computeNewInsights()
+                undiscoveredInsightIDs = loadUndiscoveredInsightIDs()
+                markUndiscovered(newInsights.map(\.id))   // new since last open → blue dot
+                reportUndiscoveredInsightCount()
                 saveAllInsightIDsAsSeen()
                 entranceTask = Task {
                     await runEntranceSequence(newInsights: newInsights, in: size)
                 }
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase != .active { persistLivePositions() }
             }
             .onChange(of: selectionPulseRequest) { _, newValue in
                 guard newValue > 0 else { return }
@@ -195,6 +284,12 @@ struct InsightTreeCanvasView: View {
                     offset.height += sin(angle) * distance
                 }
             }
+            .onChange(of: nodes) { _, _ in
+                // Seed/drop live physics bodies as the topology changes (preserving existing
+                // bodies so the tree doesn't jump), then wake the sim.
+                reconcileBodies()
+                reportUndiscoveredInsightCount()
+            }
             .onChange(of: nodes) { _, newNodes in
                 // Insights added after the initial entrance (Make Node children, placed midpoints):
                 // they start as a flashing icon at the node center, splay out to their orbit
@@ -203,9 +298,12 @@ struct InsightTreeCanvasView: View {
                 let known = revealedInsightIDs.union(loadingInsightIDs)
                 var newOnes: [(id: UUID, orbitIndex: Int)] = []
                 var plainNewIDs: [UUID] = []
+                var placedMidpointID: UUID? = nil
                 for node in newNodes {
                     for (i, insight) in Array(node.insights.prefix(6)).enumerated() where !known.contains(insight.id) {
-                        if makeNodeChildIDs.contains(insight.id) {
+                        if insight.id == midpointPlacedInsightID {
+                            placedMidpointID = insight.id     // just-placed midpoint → simulated load + hover
+                        } else if makeNodeChildIDs.contains(insight.id) {
                             newOnes.append((insight.id, i))   // Make Node child → loading mask + splay
                         } else {
                             plainNewIDs.append(insight.id)     // everything else → normal blur/transform pop-in
@@ -220,11 +318,78 @@ struct InsightTreeCanvasView: View {
                     }
                 }
 
+                // A freshly placed midpoint insight runs a generation sequence:
+                //   1. hover/zoom on the hollow "Insight Loading Icon" while generating
+                //   2. once complete, the hollow icon fades+blurs out while the solid icon+title
+                //      cross-fade in (fade/transform/blur), AND a big shockwave radiates — together
+                //   3. shortly after, the insight card pops up
+                if let placedID = placedMidpointID {
+                    loadingInsightIDs.insert(placedID)
+                    userMovedSincePlacement = false
+                    // Gets a blue "undiscovered" dot until first hovered, same as other new insights.
+                    markUndiscovered([placedID])
+                    if let pos = worldPosition(forInsightID: placedID) {
+                        focusHoveredTarget(at: pos, in: size)
+                    }
+                    Task {
+                        // Simulate the model generating this insight (loading icon flashes).
+                        try? await Task.sleep(for: .seconds(3.5))
+                        await MainActor.run {
+                            // Re-center the hover on the icon the instant it's generated (unless
+                            // the user has since moved), then draw on the solid icon + fire the
+                            // big shockwave simultaneously.
+                            if let pos = worldPosition(forInsightID: placedID) {
+                                if !userMovedSincePlacement {
+                                    focusHoveredTarget(at: pos, in: size)
+                                }
+                                rippleTrigger = RippleTrigger(
+                                    worldOrigin: pos,
+                                    startTime: Date().timeIntervalSinceReferenceDate,
+                                    strength: 2.8,
+                                    radiusScale: 0.5
+                                )
+                                // Two quick haptic taps as the shockwave bursts out.
+                                playGeneratedHaptics()
+                            }
+                            // Cross-fade: hollow loading icon fades+blurs out as the solid
+                            // icon+title fade/transform/blur in, together.
+                            withAnimation(.easeOut(duration: 0.32)) {
+                                loadingInsightIDs.remove(placedID)
+                                revealedInsightIDs.insert(placedID)
+                            }
+                        }
+                        // After the reveal settles, bring up the card.
+                        try? await Task.sleep(for: .milliseconds(650))
+                        await MainActor.run { onMidpointInsightLoaded(placedID) }
+                    }
+                }
+
                 guard !newOnes.isEmpty else { return }
 
                 for one in newOnes {
                     loadingInsightIDs.insert(one.id)
                     unsplayedInsightIDs.insert(one.id)
+                }
+                // Spin the Context wheel while these generate (same as the midpoint tool).
+                onGeneratingChange(true)
+                // New generated insights get a blue "undiscovered" dot until first hovered.
+                markUndiscovered(newOnes.map(\.id))
+
+                // Zoom out so the parent node and all its new children are visible together
+                // before the per-child tour begins, centered on the node itself.
+                onRequestDismissHover()
+                let genNodeIDs = Set(newOnes.compactMap { one in
+                    newNodes.first(where: { $0.insights.contains { $0.id == one.id } })?.id
+                })
+                let genNodePositions = genNodeIDs.compactMap { simPosition(of: $0) }
+                let framePositions = genNodePositions
+                    + newOnes.compactMap { worldPosition(forInsightID: $0.id) }
+                if !framePositions.isEmpty {
+                    zoomToFit(
+                        worldPositions: framePositions, in: size,
+                        padding: 90, fitFactor: 1.0,
+                        center: genNodePositions.count == 1 ? genNodePositions.first : nil
+                    )
                 }
 
                 // Splay each child out from the node center, staggered per orbit index.
@@ -240,18 +405,45 @@ struct InsightTreeCanvasView: View {
                     }
                 }
 
-                // After generation completes, reveal the titles with a blur-up.
-                let newIDs = newOnes.map(\.id)
+                // Generation completes after the same dwell the midpoint tool uses. Then the
+                // camera pans to each new child in turn so the user can see what was made: as it
+                // settles on each one, the hollow loading icon cross-fades to the solid icon+title,
+                // a big shockwave bursts out from it, and two haptic taps fire. The Context wheel
+                // stops once every child has been revealed.
                 Task {
-                    try? await Task.sleep(for: .milliseconds(1300))
-                    await MainActor.run {
-                        withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
-                            for id in newIDs {
-                                loadingInsightIDs.remove(id)
-                                revealedInsightIDs.insert(id)
+                    try? await Task.sleep(for: .seconds(3.5))
+                    for (index, one) in newOnes.enumerated() {
+                        guard !Task.isCancelled else { break }
+                        await MainActor.run {
+                            if let pos = worldPosition(forInsightID: one.id) {
+                                // First child: zoom back to the default zoom level — the same
+                                // one used for the normal new-insight entrance — while panning
+                                // to it, as a single combined animation (not two in sequence).
+                                focusInsight(at: pos, in: size, targetScale: index == 0 ? 1 : nil)
                             }
                         }
+                        try? await Task.sleep(for: .milliseconds(900))   // camera spring settle
+                        await MainActor.run {
+                            if let pos = worldPosition(forInsightID: one.id) {
+                                rippleTrigger = RippleTrigger(
+                                    worldOrigin: pos,
+                                    startTime: Date().timeIntervalSinceReferenceDate,
+                                    strength: 2.8,
+                                    radiusScale: 0.5
+                                )
+                            }
+                            playGeneratedHaptics()
+                            // Grow the parent's docked card with an Insight link for this child,
+                            // in sync with the haptic taps.
+                            onMakeNodeChildRevealed(one.id)
+                            withAnimation(.easeOut(duration: 0.32)) {
+                                loadingInsightIDs.remove(one.id)
+                                revealedInsightIDs.insert(one.id)
+                            }
+                        }
+                        try? await Task.sleep(for: .milliseconds(700))   // entrance settle before next
                     }
+                    await MainActor.run { onGeneratingChange(false) }
                 }
             }
             .onChange(of: loadingInsightIDs.isEmpty) { _, empty in
@@ -259,14 +451,14 @@ struct InsightTreeCanvasView: View {
                     loadingFlashOpacity = 1
                 } else {
                     loadingFlashOpacity = 1
-                    withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
+                    withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
                         loadingFlashOpacity = 0.35
                     }
                 }
             }
             .onChange(of: isMidpointMode) { _, active in
                 if active {
-                    midpointHandleWorld = midpointCenter()
+                    midpointHandleWorld = centeredMidpointHandle()
                     midpointHandleVisible = false
                     reportMidpointWeights()
                     let positions = selectedWorldPositions()
@@ -281,13 +473,17 @@ struct InsightTreeCanvasView: View {
                 } else {
                     midpointHandleVisible = false
                     midpointHandleWorld = nil
-                    restorePreFocusCamera()
+                    // On a placement we hand the camera to the new insight (the nodes onChange
+                    // focuses it), so don't restore the pre-midpoint camera. Only restore on cancel.
+                    if midpointPlacedInsightID == nil {
+                        restorePreFocusCamera()
+                    }
                 }
             }
             .onChange(of: midpointCenterRequest) { _, newValue in
                 guard newValue > 0, isMidpointMode else { return }
                 withAnimation(.spring(response: 0.42, dampingFraction: 0.78)) {
-                    midpointHandleWorld = midpointCenter()
+                    midpointHandleWorld = centeredMidpointHandle()
                 }
                 reportMidpointWeights()
             }
@@ -296,12 +492,14 @@ struct InsightTreeCanvasView: View {
                 applyMidpointTarget(index: midpointTargetIndex, weight: midpointTargetWeight)
             }
             .onChange(of: midpointPlaceRequest) { _, newValue in
-                guard newValue > 0, isMidpointMode, let handle = midpointHandleWorld else { return }
+                guard newValue > 0, isMidpointMode, let handle = effectiveMidpointHandle() else { return }
                 guard let nearest = nearestSelectedTarget(to: handle) else { return }
                 onMidpointPlaced(handle, nearest, midpointWeights(for: handle))
             }
             .onDisappear {
                 entranceTask?.cancel()
+                persistLivePositions()
+                stopSim()
             }
             .task(id: selectionRippleKey) {
                 // All selected items pulse the dot grid together, faster than the hover cadence.
@@ -366,6 +564,7 @@ struct InsightTreeCanvasView: View {
                     return
                 }
                 if markCanvasDragIfNeeded(value.translation) {
+                    userMovedSincePlacement = true
                     onCanvasMoved()
                 }
             }
@@ -404,6 +603,7 @@ struct InsightTreeCanvasView: View {
                 if pinchStartScale == nil {
                     pinchStartScale = scale
                     pinchStartOffset = offset
+                    userMovedSincePlacement = true
                     onCanvasMoved()
                 }
 
@@ -456,14 +656,18 @@ struct InsightTreeCanvasView: View {
         !isDraggingCanvas && Date().timeIntervalSince(lastCanvasDragEndedAt) > 0.16
     }
 
-    private func focusInsight(at worldPosition: CGPoint, in size: CGSize) {
+    /// Pans (and, if `targetScale` is supplied, simultaneously zooms) to center `worldPosition`
+    /// — a single spring rather than two sequential ones when both need to change together.
+    private func focusInsight(at worldPosition: CGPoint, in size: CGSize, targetScale: CGFloat? = nil) {
         rememberCameraBeforeFocusIfNeeded()
         let target = focusAnchor(in: size)
+        let nextScale = targetScale ?? scale
 
         withAnimation(.spring(response: 0.58, dampingFraction: 0.64, blendDuration: 0.08)) {
+            scale = nextScale
             offset = CGSize(
-                width: target.x - size.width / 2 - (worldPosition.x * scale),
-                height: target.y - size.height / 2 + (worldPosition.y * scale)
+                width: target.x - size.width / 2 - (worldPosition.x * nextScale),
+                height: target.y - size.height / 2 + (worldPosition.y * nextScale)
             )
         }
     }
@@ -510,11 +714,11 @@ struct InsightTreeCanvasView: View {
     @ViewBuilder
     private func graphEdges(camera: InsightTreeCamera, size: CGSize) -> some View {
         let hasSelection = !selectedCanvasTargets.isEmpty
-        return ForEach(displayGraphEdges()) { edge in
-            if let from = nodes.first(where: { $0.id == edge.fromNodeID }),
-               let to = nodes.first(where: { $0.id == edge.toNodeID }) {
-                let start = camera.worldToScreen(from.position, in: size)
-                let end = camera.worldToScreen(to.position, in: size)
+        ForEach(displayGraphEdges()) { edge in
+            if let from = simPosition(of: edge.fromNodeID),
+               let to = simPosition(of: edge.toNodeID) {
+                let start = camera.worldToScreen(from, in: size)
+                let end = camera.worldToScreen(to, in: size)
 
                 AnimatableLine(start: start, end: end)
                     .stroke(
@@ -533,17 +737,56 @@ struct InsightTreeCanvasView: View {
         }
     }
 
+    /// World endpoint for a midpoint's source: the insight's chip, or the node center for a
+    /// whole-node-concept source.
+    private func midpointSourceEndpoint(_ source: MidpointSource) -> CGPoint? {
+        if source.isNode {
+            if let node = displayNodes.first(where: { $0.insights.contains { $0.id == source.insightID } }) {
+                return node.position
+            }
+            return simPosition(of: source.insightID)
+        }
+        return worldPosition(forInsightID: source.insightID)
+    }
+
+    /// Lines from each placed midpoint to the insight chips / node concepts it was spawned from.
     @ViewBuilder
-    private func insightConnectors(camera: InsightTreeCamera, size: CGSize, labelOpacity: Double) -> some View {
+    private func midpointConnectors(camera: InsightTreeCamera, size: CGSize) -> some View {
         let hasSelection = !selectedCanvasTargets.isEmpty
-        ForEach(nodes) { node in
+        ForEach(Array(placedMidpointNodeIDs), id: \.self) { placedID in
+            if let placedWorld = simPosition(of: placedID), let sources = placedMidpointSources[placedID] {
+                let end = camera.worldToScreen(placedWorld, in: size)
+                ForEach(Array(sources.enumerated()), id: \.offset) { _, source in
+                    if let sourceWorld = midpointSourceEndpoint(source) {
+                        AnimatableLine(start: camera.worldToScreen(sourceWorld, in: size), end: end)
+                            .stroke(
+                                AquinasTheme.Colors.divider.opacity(0.9),
+                                style: StrokeStyle(lineWidth: 1, lineCap: .round)
+                            )
+                            .frame(width: size.width, height: size.height)
+                            .allowsHitTesting(false)
+                            .opacity(hasSelection ? 0.5 : 1.0)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func insightConnectors(camera: InsightTreeCamera, size: CGSize) -> some View {
+        let hasSelection = !selectedCanvasTargets.isEmpty
+        // Placed-midpoint chips sit on the node itself, so they have no orbit connectors.
+        let connectorNodes = displayNodes.filter { !placedMidpointNodeIDs.contains($0.id) }
+        ForEach(connectorNodes) { node in
             ForEach(Array(node.insights.prefix(6).enumerated()), id: \.element.id) { index, insight in
                 let start = camera.worldToScreen(node.position, in: size)
                 let end = camera.worldToScreen(
                     insightWorldPosition(for: node, index: index, count: min(node.insights.count, 6)),
                     in: size
                 )
-                let baseOpacity = 0.2 + (0.35 * labelOpacity)
+                // Connector lines stay at a constant opacity regardless of zoom — only the
+                // chip label/background fade with `labelOpacity`, not the lines themselves.
+                let baseOpacity = 0.55
 
                 AnimatableLine(start: start, end: end)
                     .stroke(
@@ -566,7 +809,7 @@ struct InsightTreeCanvasView: View {
             ZStack {
                 graphEdgePulseOverlay(sourceNodeID: sourceNodeID, camera: camera, size: size, progress: pulseProgress)
 
-                ForEach(nodes) { node in
+                ForEach(displayNodes) { node in
                     let visibleInsights = Array(node.insights.prefix(6))
                     let isPulsingNode = pulsingNodeID == node.id
                     let selectedInsightIndex = pulsingInsightID.flatMap { pulsingID in
@@ -717,12 +960,12 @@ struct InsightTreeCanvasView: View {
         if let sourceNodeID {
             ForEach(displayGraphEdges()) { edge in
                 if edge.fromNodeID == sourceNodeID || edge.toNodeID == sourceNodeID,
-                   let sourceNode = nodes.first(where: { $0.id == sourceNodeID }) {
+                   let sourcePos = simPosition(of: sourceNodeID) {
                     let targetNodeID = edge.fromNodeID == sourceNodeID ? edge.toNodeID : edge.fromNodeID
 
-                    if let targetNode = nodes.first(where: { $0.id == targetNodeID }) {
-                        let start = camera.worldToScreen(sourceNode.position, in: size)
-                        let end = camera.worldToScreen(targetNode.position, in: size)
+                    if let targetPos = simPosition(of: targetNodeID) {
+                        let start = camera.worldToScreen(sourcePos, in: size)
+                        let end = camera.worldToScreen(targetPos, in: size)
 
                         travelingPulseLine(start: start, end: end, progress: progress, lineWidth: 2.2)
                             .frame(width: size.width, height: size.height)
@@ -838,7 +1081,7 @@ struct InsightTreeCanvasView: View {
         }
 
         if let pulsingNodeID {
-            return nodes.first(where: { $0.id == pulsingNodeID })?.position
+            return simPosition(of: pulsingNodeID)
         }
 
         return nil
@@ -855,7 +1098,7 @@ struct InsightTreeCanvasView: View {
     private func worldPosition(for target: CanvasSelectionTarget) -> CGPoint? {
         switch target {
         case .node(let nodeID):
-            return nodes.first(where: { $0.id == nodeID })?.position
+            return simPosition(of: nodeID)
         case .insight(let insightID):
             return insightFocusTarget(for: insightID)
         }
@@ -870,8 +1113,16 @@ struct InsightTreeCanvasView: View {
     }
 
     private func reportMidpointWeights() {
-        guard let handle = midpointHandleWorld else { return }
+        guard let handle = effectiveMidpointHandle() else { return }
         onMidpointWeightsChange(midpointWeights(for: handle))
+    }
+
+    private func centeredMidpointHandle() -> CGPoint? {
+        midpointCenter().map(constrainHandle)
+    }
+
+    private func effectiveMidpointHandle() -> CGPoint? {
+        midpointHandleWorld.map(constrainHandle)
     }
 
     /// Moves the handle so that the given selected insight has the target weight.
@@ -1028,7 +1279,7 @@ struct InsightTreeCanvasView: View {
             .allowsHitTesting(false)
 
             // Draggable handle.
-            if let handle = midpointHandleWorld {
+            if let handle = effectiveMidpointHandle() {
                 let handleScreen = camera.worldToScreen(handle, in: size)
                 MidpointHandle()
                     .scaleEffect(midpointHandleVisible ? 1 : 0.3)
@@ -1050,11 +1301,11 @@ struct InsightTreeCanvasView: View {
         // zoom-driven label fade by forcing full label opacity.
         switch target {
         case .node(let id):
-            if let node = nodes.first(where: { $0.id == id }) {
+            if let node = displayNodes.first(where: { $0.id == id }) {
                 nodeGroup(node, camera: camera, size: size, labelOpacity: 1)
             }
         case .insight(let id):
-            if let node = nodes.first(where: { $0.insights.contains { $0.id == id } }) {
+            if let node = displayNodes.first(where: { $0.insights.contains { $0.id == id } }) {
                 let visible = Array(node.insights.prefix(6))
                 if let index = visible.firstIndex(where: { $0.id == id }) {
                     insightLabel(
@@ -1075,11 +1326,11 @@ struct InsightTreeCanvasView: View {
     private func edgeHitTargets(camera: InsightTreeCamera, size: CGSize) -> some View {
         ForEach(edges) { edge in
             if edge.showSuggestButton,
-               let from = nodes.first(where: { $0.id == edge.fromNodeID }),
-               let to = nodes.first(where: { $0.id == edge.toNodeID }) {
+               let from = simPosition(of: edge.fromNodeID),
+               let to = simPosition(of: edge.toNodeID) {
                 let midpoint = CGPoint(
-                    x: (from.position.x + to.position.x) / 2,
-                    y: (from.position.y + to.position.y) / 2
+                    x: (from.x + to.x) / 2,
+                    y: (from.y + to.y) / 2
                 )
                 let position = camera.worldToScreen(midpoint, in: size)
 
@@ -1096,7 +1347,7 @@ struct InsightTreeCanvasView: View {
                         if selectedEdgeID == edge.id {
                             Text("Suggest Connection")
                                 .font(.figtreeHeading3)
-                                .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                                .foregroundStyle(AquinasTheme.Colors.primaryReadable)
                                 .padding(.horizontal, 14)
                                 .padding(.vertical, 8)
                                 .background(AquinasTheme.Colors.surface)
@@ -1129,11 +1380,11 @@ struct InsightTreeCanvasView: View {
             VStack(spacing: 18) {
                 Image(systemName: node.isSuggested ? "sparkles" : "brain.head.profile")
                     .font(.system(size: node.isSuggested ? 20 : 24, weight: .semibold))
-                    .foregroundColor(AquinasTheme.Colors.lightGreen)
+                    .foregroundStyle(AquinasTheme.Colors.lightGreen)
 
                 Text(node.conceptLabel)
                     .font(.custom("LibreBaskerville-Regular", size: 18))
-                    .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                    .foregroundStyle(AquinasTheme.Colors.primaryReadable)
                     .multilineTextAlignment(.center)
                     .lineLimit(2)
                     .minimumScaleFactor(0.75)
@@ -1165,7 +1416,7 @@ struct InsightTreeCanvasView: View {
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                        .foregroundStyle(AquinasTheme.Colors.primaryReadable)
                         .frame(width: 32, height: 32)
                         .contentShape(Rectangle())
                 }
@@ -1181,6 +1432,16 @@ struct InsightTreeCanvasView: View {
         .zIndex(node.isSuggested ? 20 : 10)
     }
 
+    /// Two quick medium taps, fired as a generated insight's shockwave bursts out.
+    private func playGeneratedHaptics() {
+        let generator = UIImpactFeedbackGenerator(style: .medium)
+        generator.impactOccurred(intensity: 0.9)
+        Task {
+            try? await Task.sleep(for: .milliseconds(120))
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.9)
+        }
+    }
+
     private func insightLabel(
         _ insight: InsightModel,
         node: NodeModel,
@@ -1190,45 +1451,67 @@ struct InsightTreeCanvasView: View {
         size: CGSize,
         labelOpacity: Double
     ) -> some View {
-        let worldPosition = insightWorldPosition(for: node, index: index, count: count)
+        // Placed-midpoint insights are pinned at the node position itself (no orbit).
+        let isPinnedAtNode = placedMidpointNodeIDs.contains(node.id)
+        let worldPosition = isPinnedAtNode ? node.position : insightWorldPosition(for: node, index: index, count: count)
         let isRevealed    = revealedInsightIDs.contains(insight.id)
         let isLoading     = loadingInsightIDs.contains(insight.id)
         let isSelected    = selectedCanvasTargets.contains(.insight(insight.id))
-        let isVisible     = isRevealed || isLoading
+        // Pinned (placed-midpoint) chips stay visible from the moment they appear — even in
+        // the brief gap between the icon turning solid and the title blurring in.
+        let isVisible     = isRevealed || isLoading || isPinnedAtNode
         // While unsplayed, render at the node center so the child appears to splay out from it.
         let atCenter      = unsplayedInsightIDs.contains(insight.id)
         let renderWorld   = atCenter ? node.position : worldPosition
         let position      = camera.worldToScreen(renderWorld, in: size)
+        // Stable per-chip delay (0.05–0.25s) so the title collapse/expand staggers across chips.
 
-        return HStack(spacing: 10) {
-            Image(systemName: "text.bubble.fill")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundColor(AquinasTheme.Colors.lightGreen)
-                .opacity(isLoading ? loadingFlashOpacity : 1)
-
-            // Title appears only once loaded, blurring up into place.
+        return ZStack(alignment: .leading) {
+            // While generating: the hollow loading bubble, flashing. On completion it fades
+            // out and blurs as the solid content cross-fades in.
+            if isLoading {
+                Image(systemName: "text.bubble")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(AquinasTheme.Colors.lightGreen)
+                    .opacity(loadingFlashOpacity)
+                    .transition(.fadeBlur)
+            }
+            // Icon + title appear together as one unit (fade + transform + blur), like a
+            // streamed model response. The icon stays full opacity; only the title fades with zoom.
             if isRevealed {
-                Text(insight.title)
-                    .font(.figtreeHeading2)
-                    .foregroundColor(AquinasTheme.Colors.lightGreen)
-                    .lineLimit(1)
-                    .opacity(labelOpacity)
-                    .transition(.blurUp)
+                RevealedInsightLabel(title: insight.title, labelOpacity: labelOpacity)
+                    .transition(.glideFadeUp)
             }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 16)
-        .background(insightTreeCanvasColor)
+        // Background + title fade with zoom, leaving just the floating icon.
+        .background(insightTreeCanvasColor.opacity(labelOpacity))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
             if isSelected {
                 SelectedCanvasInsightBorder()
+                    .opacity(labelOpacity)
             }
         }
-        .shadow(color: AquinasTheme.Colors.canvas, radius: 24, x: 0, y: 0)
+        // Blue "new / undiscovered" dot — disappears the first time the insight is hovered.
+        .overlay(alignment: .topLeading) {
+            if isVisible, undiscoveredInsightIDs.contains(insight.id) {
+                Circle()
+                    .fill(Color(red: 0.25, green: 0.55, blue: 1.0))
+                    .frame(width: 9, height: 9)
+                    .overlay(Circle().stroke(insightTreeCanvasColor, lineWidth: 1.5))
+                    .offset(x: 4, y: 4)
+                    .transition(.scale.combined(with: .opacity))
+            }
+        }
+        .shadow(color: AquinasTheme.Colors.canvas.opacity(labelOpacity), radius: 24, x: 0, y: 0)
         .contentShape(Rectangle())
         .onTapGesture {
-            guard canAcceptTap, !isLoading else { return }
+            // The placed-midpoint "Insight Loading Icon" stays hoverable even while generating;
+            // other loading insights (Make Node children) are not tappable until revealed.
+            guard canAcceptTap, !isLoading || isPinnedAtNode else { return }
+            markDiscovered(insight.id)   // hovering clears its blue dot
             if selectedCanvasTargets.isEmpty {
                 rippleTrigger = RippleTrigger(
                     worldOrigin: worldPosition,
@@ -1248,7 +1531,10 @@ struct InsightTreeCanvasView: View {
     }
 
     private func insightFocusTarget(for insightID: UUID) -> CGPoint? {
-        for node in nodes {
+        for node in displayNodes {
+            if placedMidpointNodeIDs.contains(node.id), node.insights.contains(where: { $0.id == insightID }) {
+                return node.position   // pinned chip sits on the node itself
+            }
             let visibleInsights = Array(node.insights.prefix(6))
             if let index = visibleInsights.firstIndex(where: { $0.id == insightID }) {
                 return insightWorldPosition(for: node, index: index, count: min(node.insights.count, 6))
@@ -1274,27 +1560,30 @@ struct InsightTreeCanvasView: View {
             }
         }
 
-        guard nodes.count > 1 else {
+        // Placed midpoints only connect via their own source connectors — never the generic
+        // 2-node / ring fallback, which would add a stray line to a neighbor node.
+        let graphNodes = nodes.filter { !placedMidpointNodeIDs.contains($0.id) }
+        guard graphNodes.count > 1 else {
             return []
         }
 
-        if nodes.count == 2 {
+        if graphNodes.count == 2 {
             return [
                 RenderedGraphEdge(
-                    id: "\(nodes[0].id.uuidString)-\(nodes[1].id.uuidString)",
-                    fromNodeID: nodes[0].id,
-                    toNodeID: nodes[1].id,
+                    id: "\(graphNodes[0].id.uuidString)-\(graphNodes[1].id.uuidString)",
+                    fromNodeID: graphNodes[0].id,
+                    toNodeID: graphNodes[1].id,
                     isSuggested: false
                 )
             ]
         }
 
-        return nodes.indices.map { index in
-            let nextIndex = (index + 1) % nodes.count
+        return graphNodes.indices.map { index in
+            let nextIndex = (index + 1) % graphNodes.count
             return EdgeModel(
                 id: UUID(),
-                fromNodeID: nodes[index].id,
-                toNodeID: nodes[nextIndex].id,
+                fromNodeID: graphNodes[index].id,
+                toNodeID: graphNodes[nextIndex].id,
                 distance: 0.5,
                 isSuggested: false,
                 showSuggestButton: false
@@ -1309,30 +1598,389 @@ struct InsightTreeCanvasView: View {
         }
     }
 
+    /// Bond length (connector radius) for an insight chip — its relatedness to the parent node.
+    private func bondLength(forInsightID id: UUID) -> CGFloat {
+        insightBondLengths[id] ?? 190
+    }
+
+    /// Even starting angle for an insight before VSEPR repulsion spreads it.
+    private func baseChipAngle(index: Int, count: Int) -> Double {
+        Double(index) / Double(max(count, 1)) * (.pi * 2) + .pi / 8
+    }
+
+    /// Wraps an angle difference to [-π, π].
+    private func wrapAngle(_ a: Double) -> Double {
+        var x = a.truncatingRemainder(dividingBy: 2 * .pi)
+        if x > .pi { x -= 2 * .pi }
+        if x < -.pi { x += 2 * .pi }
+        return x
+    }
+
     private func insightWorldPosition(for node: NodeModel, index: Int, count: Int) -> CGPoint {
-        let clampedCount = max(count, 1)
-        let angle = (CGFloat(index) / CGFloat(clampedCount)) * (.pi * 2) + .pi / 8
-        let radius = CGFloat(node.isSuggested ? 118 : 190)
+        guard index < node.insights.count else { return node.position }
+        let insightID = node.insights[index].id
+        // Free VSEPR bond angle (falls back to the even base angle until the sim seeds it).
+        let angle = chipAngles[insightID]?.angle ?? baseChipAngle(index: index, count: count)
+        let radius = bondLength(forInsightID: insightID)
         return CGPoint(
             x: node.position.x + cos(angle) * radius,
             y: node.position.y + sin(angle) * radius
         )
     }
 
+    // MARK: - Live Physics Simulation
+
+    /// `nodes` with each position replaced by its live simulated position (falls back to the
+    /// view model's position until a body is seeded). Everything renders off this.
+    private var displayNodes: [NodeModel] {
+        nodes.map { node in
+            guard let body = bodies[node.id] else { return node }
+            var copy = node
+            copy.position = body.pos
+            return copy
+        }
+    }
+
+    /// Live simulated position for a node id (for by-id lookups).
+    private func simPosition(of id: UUID) -> CGPoint? {
+        bodies[id]?.pos ?? nodes.first(where: { $0.id == id })?.position
+    }
+
+    /// Mirrors `InsightTreeViewModel.mapDistanceToLength` — semantic distance → spring length.
+    private func springTargetLength(_ distance: Double) -> CGFloat {
+        80 + CGFloat(distance) * 320
+    }
+
+    /// Node footprint for the overlap-separation force — its longest bond plus chip extent.
+    private func simFootprintRadius(_ node: NodeModel) -> CGFloat {
+        if placedMidpointNodeIDs.contains(node.id) { return 70 }
+        let maxBond = node.insights.prefix(6).map { bondLength(forInsightID: $0.id) }.max() ?? 190
+        return maxBond + 64
+    }
+
+    private func startSim(frameBudget: Int = Self.settleFrameBudget) {
+        simFramesRemaining = max(simFramesRemaining, frameBudget)
+        alpha = 1.0
+        lastTickAt = 0
+        guard displayLink == nil else { return }
+        let driver = DisplayLinkDriver()
+        driver.onTick = { ts in stepSimulation(now: ts) }
+        driver.start()
+        displayLink = driver
+    }
+
+    private func stopSim() {
+        displayLink?.stop()
+        displayLink = nil
+        simFramesRemaining = 0
+        lastTickAt = 0
+    }
+
+    private func freezeSimulation(_ nextBodies: [UUID: SimBody]? = nil) {
+        var frozen = nextBodies ?? bodies
+        for (id, var body) in frozen {
+            body.vel = .zero
+            frozen[id] = body
+        }
+        bodies = frozen
+        alpha = 0
+        stopSim()
+    }
+
+    /// Seed bodies for new nodes, drop bodies for removed nodes, preserve the rest (no jump),
+    /// and wake the sim. Called when the view model's topology changes.
+    private func reconcileBodies() {
+        let liveIDs = Set(nodes.map(\.id))
+        var next = bodies.filter { liveIDs.contains($0.key) }
+        for node in nodes where next[node.id] == nil {
+            next[node.id] = SimBody(pos: node.position, vel: .zero)
+        }
+        bodies = next
+
+        // Seed/drop per-insight bond angle; new chips start at their even base angle, then
+        // VSEPR repulsion spreads them. Existing angles are preserved (no jump).
+        let chipIDs = Set(nodes.flatMap { $0.insights.prefix(6).map(\.id) })
+        var nextAngles = chipAngles.filter { chipIDs.contains($0.key) }
+        for node in nodes {
+            let count = min(node.insights.count, 6)
+            for (index, insight) in node.insights.prefix(6).enumerated() where nextAngles[insight.id] == nil {
+                nextAngles[insight.id] = ChipAngle(angle: baseChipAngle(index: index, count: count))
+            }
+        }
+        chipAngles = nextAngles
+
+        startSim()
+    }
+
+    /// One integration step. Reads live `bodies` positions, applies the same forces the view
+    /// model's seed layout uses, holds pinned nodes fixed, and writes back once.
+    private func stepSimulation(now: CFTimeInterval) {
+        guard !bodies.isEmpty else { return }
+        guard simFramesRemaining > 0 else {
+            freezeSimulation()
+            return
+        }
+        let dt = lastTickAt == 0 ? CGFloat(1.0 / 60) : CGFloat(min(now - lastTickAt, Self.simMaxDt))
+        lastTickAt = now
+        let dtScale = dt * 60   // ≈1 at 60fps; keeps motion frame-rate independent
+
+        // Which nodes are held fixed this frame.
+        var pinned = placedMidpointNodeIDs
+        if isHoveringTarget, let focused = focusedNodeID() {
+            pinned.insert(focused)   // keep the open-card node from sliding under its card
+        }
+
+        let nodeByID = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
+        let entries = bodies.map { ($0.key, $0.value) }
+        var forces: [UUID: CGVector] = [:]
+        var maxChipAngMotion: Double = 0   // keeps the sim awake while chips are still spreading
+
+        // Live world positions of each visible chip (free VSEPR bond angle + relatedness radius),
+        // used for cross-node node-push and the angular spread below.
+        struct ChipInfo { let id: UUID; let nodeID: UUID; let angle: Double; let pos: CGPoint }
+        var chipInfos: [ChipInfo] = []
+        var chipByNode: [UUID: [CGPoint]] = [:]
+        for (id, body) in bodies {
+            if placedMidpointNodeIDs.contains(id) {
+                chipByNode[id] = [body.pos]   // bare midpoint chip sits on the node
+                continue
+            }
+            guard let node = nodeByID[id] else { continue }
+            var pts: [CGPoint] = []
+            for (index, insight) in node.insights.prefix(6).enumerated() {
+                let theta = chipAngles[insight.id]?.angle ?? baseChipAngle(index: index, count: min(node.insights.count, 6))
+                let radius = bondLength(forInsightID: insight.id)
+                let pos = CGPoint(x: body.pos.x + cos(theta) * radius, y: body.pos.y + sin(theta) * radius)
+                chipInfos.append(ChipInfo(id: insight.id, nodeID: id, angle: theta, pos: pos))
+                pts.append(pos)
+            }
+            chipByNode[id] = pts
+        }
+
+        // Every domain around a node: its insight bonds AND its bonds to neighbor nodes. VSEPR
+        // repels them all equally — chip bonds rotate the chip angle, edge bonds rotate the
+        // neighbor node tangentially (at fixed bond length), so bond angles are maximized.
+        enum BondKind { case insight(UUID); case edge(neighbor: UUID) }
+        struct Bond { let angle: Double; let kind: BondKind }
+        var bondsByNode: [UUID: [Bond]] = [:]
+        for ci in chipInfos {
+            bondsByNode[ci.nodeID, default: []].append(Bond(angle: ci.angle, kind: .insight(ci.id)))
+        }
+        // Use the SAME edges that are rendered (displayGraphEdges fabricates a line for the
+        // 2-node / ring fallback), so every visible node-to-node line is a VSEPR domain too.
+        for edge in displayGraphEdges() {
+            guard let aPos = bodies[edge.fromNodeID]?.pos, let bPos = bodies[edge.toNodeID]?.pos else { continue }
+            bondsByNode[edge.fromNodeID, default: []].append(Bond(angle: Double(atan2(bPos.y - aPos.y, bPos.x - aPos.x)), kind: .edge(neighbor: edge.toNodeID)))
+            bondsByNode[edge.toNodeID, default: []].append(Bond(angle: Double(atan2(aPos.y - bPos.y, aPos.x - bPos.x)), kind: .edge(neighbor: edge.fromNodeID)))
+        }
+
+        // Repulsion (all pairs) + overlap separation + per-chip bubble collision.
+        for i in entries.indices {
+            let (idA, a) = entries[i]
+            if pinned.contains(idA) { continue }
+            var fx: CGFloat = 0, fy: CGFloat = 0
+            for j in entries.indices where j != i {
+                let (idB, b) = entries[j]
+                var dx = a.pos.x - b.pos.x
+                var dy = a.pos.y - b.pos.y
+                var dist = hypot(dx, dy)
+                if dist < 0.5 { dx = .random(in: -1...1); dy = .random(in: -1...1); dist = 1 }
+                let clamped = max(Self.repulsionMinDist, dist)
+                let f = Self.repulsionK / (clamped * clamped)
+                fx += (dx / dist) * f
+                fy += (dy / dist) * f
+
+                if let na = nodeByID[idA], let nb = nodeByID[idB] {
+                    let minDist = simFootprintRadius(na) + simFootprintRadius(nb) + Self.overlapPadding
+                    if dist < minDist {
+                        let push = (minDist - dist) * 0.05
+                        fx += (dx / dist) * push
+                        fy += (dy / dist) * push
+                    }
+                }
+
+                // Per-chip bubbles: if any of A's chips overlaps any of B's chips, bump A away.
+                if let chipsA = chipByNode[idA], let chipsB = chipByNode[idB] {
+                    let minChip = Self.insightBubbleRadius * 2 + Self.insightBubblePadding
+                    for ca in chipsA {
+                        for cb in chipsB {
+                            var cdx = ca.x - cb.x
+                            var cdy = ca.y - cb.y
+                            var cd = hypot(cdx, cdy)
+                            if cd >= minChip { continue }
+                            if cd < 0.5 { cdx = .random(in: -1...1); cdy = .random(in: -1...1); cd = 1 }
+                            let push = (minChip - cd) * Self.bubblePushK
+                            fx += (cdx / cd) * push
+                            fy += (cdy / cd) * push
+                        }
+                    }
+                }
+            }
+            // No idle jitter: once the short settling pass ends, nodes stay put.
+            fx += CGFloat.random(in: -Self.jitterAmplitude...Self.jitterAmplitude) * CGFloat(alpha)
+            fy += CGFloat.random(in: -Self.jitterAmplitude...Self.jitterAmplitude) * CGFloat(alpha)
+            forces[idA] = CGVector(dx: fx, dy: fy)
+        }
+
+        // Unified VSEPR bond-angle spread: for every node, all incident domains (insight bonds +
+        // bonds to neighbor nodes) repel each other equally toward maximum separation. Insight
+        // bonds rotate the chip's free angle directly; node-to-node bonds apply a *tangential
+        // force* that swings the neighbor around the shared node through the damped velocity
+        // pipeline. The rigid edge constraint below re-fixes the bond length each frame.
+        var chipTorque: [UUID: Double] = [:]
+        for (_, bonds) in bondsByNode where bonds.count > 1 {
+            for ii in bonds.indices {
+                let bi = bonds[ii]
+                var torque = 0.0
+                for jj in bonds.indices where jj != ii {
+                    var dθ = wrapAngle(bi.angle - bonds[jj].angle)
+                    if abs(dθ) < 1e-4 { dθ = .random(in: -0.05...0.05) }
+                    torque += Self.domainK * (dθ >= 0 ? 1 : -1) / (abs(dθ) + Self.chipAngleEps)
+                }
+                switch bi.kind {
+                case .insight(let id):
+                    chipTorque[id, default: 0] += torque
+                case .edge(let neighbor):
+                    guard !pinned.contains(neighbor) else { continue }
+                    // Tangential direction (perpendicular to the bond) around the shared node.
+                    let tx = CGFloat(-sin(bi.angle)), ty = CGFloat(cos(bi.angle))
+                    var mag = CGFloat(torque) * Self.edgeTorqueGain
+                    mag = max(-Self.edgeTorqueMax, min(Self.edgeTorqueMax, mag))
+                    forces[neighbor, default: .zero].dx += tx * mag
+                    forces[neighbor, default: .zero].dy += ty * mag
+                }
+            }
+        }
+        // Cooling factor (simulated annealing). The VSEPR angular repulsion and pairwise node
+        // repulsion never vanish at equilibrium, so leaving motion uncooled makes bonds oscillate
+        // around the ±π boundary and nodes creep — visible as jitter that only stops when the frame
+        // budget expires. Scaling every frame's displacement by `alpha` (which decays to 0) lets the
+        // layout converge and freeze smoothly.
+        let cool = alpha
+        let coolCG = CGFloat(alpha)
+
+        if !chipTorque.isEmpty {
+            var nextAngles = chipAngles
+            for (id, torque) in chipTorque {
+                guard var ch = nextAngles[id] else { continue }
+                let rawStep = max(-Self.chipMaxAngStep, min(Self.chipMaxAngStep, torque * Self.chipAngGain * Double(dtScale)))
+                let step = rawStep * cool
+                ch.angle += step
+                maxChipAngMotion = max(maxChipAngMotion, abs(step))
+                nextAngles[id] = ch
+            }
+            chipAngles = nextAngles
+        }
+
+        // Integrate (semi-implicit Euler; force scaled into velocity so spacing is effective).
+        var next = bodies
+        var maxMove: CGFloat = 0
+        for (id, force) in forces {
+            guard var body = next[id], !pinned.contains(id) else { continue }
+            let vx = (body.vel.dx + force.dx * Self.forceGain * dtScale) * Self.simDamping
+            let vy = (body.vel.dy + force.dy * Self.forceGain * dtScale) * Self.simDamping
+            // Clamp the per-frame move (matches the view model's ±4 clamp), then cool it.
+            let stepX = max(-Self.simMaxStep, min(Self.simMaxStep, vx * dtScale)) * coolCG
+            let stepY = max(-Self.simMaxStep, min(Self.simMaxStep, vy * dtScale)) * coolCG
+            body.pos.x += stepX
+            body.pos.y += stepY
+            body.vel = CGVector(dx: vx, dy: vy)
+            next[id] = body
+            maxMove = max(maxMove, hypot(stepX, stepY))
+        }
+
+        // Rigid edge constraint: lines keep their fixed target length (no growing/shrinking).
+        // A few projection iterations snap each connected pair back to its target distance.
+        for _ in 0..<Self.constraintIterations {
+            for edge in edges {
+                guard var a = next[edge.fromNodeID], var b = next[edge.toNodeID] else { continue }
+                let aPin = pinned.contains(edge.fromNodeID)
+                let bPin = pinned.contains(edge.toNodeID)
+                if aPin && bPin { continue }
+                var dx = b.pos.x - a.pos.x
+                var dy = b.pos.y - a.pos.y
+                var d = hypot(dx, dy)
+                if d < 0.001 { dx = .random(in: -1...1); dy = .random(in: -1...1); d = 1 }
+                let target = springTargetLength(edge.distance)
+                let corr = (d - target) / d
+                if aPin {
+                    b.pos.x -= dx * corr; b.pos.y -= dy * corr
+                    next[edge.toNodeID] = b
+                } else if bPin {
+                    a.pos.x += dx * corr; a.pos.y += dy * corr
+                    next[edge.fromNodeID] = a
+                } else {
+                    a.pos.x += dx * corr * 0.5; a.pos.y += dy * corr * 0.5
+                    b.pos.x -= dx * corr * 0.5; b.pos.y -= dy * corr * 0.5
+                    next[edge.fromNodeID] = a
+                    next[edge.toNodeID] = b
+                }
+            }
+        }
+
+        // Pinned bodies track their authoritative view-model position.
+        for id in pinned {
+            if let node = nodeByID[id] { next[id]?.pos = node.position }
+        }
+
+        // Drift guard: with nothing pinned to anchor the graph, keep the centroid of all
+        // bodies fixed frame-to-frame. This removes any net translation the bond-angle forces
+        // introduce, so the tree spreads in place instead of flying off in one direction.
+        if pinned.isEmpty, !next.isEmpty {
+            var oldSum = CGPoint.zero, newSum = CGPoint.zero
+            for (id, body) in next {
+                newSum.x += body.pos.x; newSum.y += body.pos.y
+                let prev = bodies[id]?.pos ?? body.pos
+                oldSum.x += prev.x; oldSum.y += prev.y
+            }
+            let n = CGFloat(next.count)
+            let shiftX = (oldSum.x - newSum.x) / n
+            let shiftY = (oldSum.y - newSum.y) / n
+            if abs(shiftX) > 0.0001 || abs(shiftY) > 0.0001 {
+                for id in next.keys {
+                    next[id]?.pos.x += shiftX
+                    next[id]?.pos.y += shiftY
+                }
+            }
+        }
+
+        alpha = max(Self.alphaFloor, alpha * (1 - Self.alphaDecay))
+        simFramesRemaining -= 1
+        // Settle once the actual (cooled) per-frame motion is negligible — both node displacement
+        // and chip-angle rotation. Because displacement is cooled by `alpha`, this is reached
+        // smoothly instead of being cut off by the frame budget mid-jitter.
+        let settled = maxMove <= Self.settleVelocityThreshold && maxChipAngMotion <= 0.002
+        if simFramesRemaining <= 0 || (alpha <= 0.01 && settled) {
+            freezeSimulation(next)
+        } else {
+            bodies = next
+        }
+    }
+
+    /// The node id owning the currently focused/hovered target, if any.
+    private func focusedNodeID() -> UUID? {
+        if let nodeID = pulsingNodeID { return nodeID }
+        if let insightID = focusedInsightID ?? pulsingInsightID {
+            return nodes.first(where: { $0.insights.contains { $0.id == insightID } })?.id
+        }
+        return nil
+    }
+
+    /// Report live positions up for persistence.
+    private func persistLivePositions() {
+        guard !bodies.isEmpty else { return }
+        onPositionsSettled(bodies.mapValues(\.pos))
+    }
+
     // MARK: - New-Insight Entrance Sequence
 
-    private static let seenInsightIDsKey = "AquinasSeenInsightIDs"
-
     private func loadSeenInsightIDs() -> Set<UUID> {
-        guard let strings = UserDefaults.standard.stringArray(forKey: Self.seenInsightIDsKey) else {
-            return []
-        }
-        return Set(strings.compactMap { UUID(uuidString: $0) })
+        InsightDiscoveryStore.loadSeenInsightIDs()
     }
 
     private func saveAllInsightIDsAsSeen() {
-        let ids = nodes.flatMap { $0.insights }.map { $0.id.uuidString }
-        UserDefaults.standard.set(ids, forKey: Self.seenInsightIDsKey)
+        let ids = nodes.flatMap { $0.insights }.map(\.id)
+        InsightDiscoveryStore.saveSeenInsightIDs(ids)
     }
 
     /// Returns insights that weren't present the last time InsightTree was opened.
@@ -1345,9 +1993,52 @@ struct InsightTreeCanvasView: View {
         }
     }
 
+    // MARK: - Undiscovered (blue-dot) tracking
+
+    private func loadUndiscoveredInsightIDs() -> Set<UUID> {
+        InsightDiscoveryStore.loadUndiscoveredInsightIDs()
+    }
+
+    private func persistUndiscoveredInsightIDs() {
+        InsightDiscoveryStore.saveUndiscoveredInsightIDs(undiscoveredInsightIDs)
+    }
+
+    private func reportUndiscoveredInsightCount() {
+        let visibleInsightIDs = Set(nodes.flatMap { node in
+            Array(node.insights.prefix(6)).map(\.id)
+        })
+        onUndiscoveredInsightCountChange(undiscoveredInsightIDs.intersection(visibleInsightIDs).count)
+    }
+
+    /// Flag newly appeared/generated insights as undiscovered (they get a blue dot).
+    private func markUndiscovered(_ ids: [UUID]) {
+        var changed = false
+        for id in ids where !undiscoveredInsightIDs.contains(id) {
+            undiscoveredInsightIDs.insert(id)
+            changed = true
+        }
+        if changed {
+            persistUndiscoveredInsightIDs()
+            reportUndiscoveredInsightCount()
+        }
+    }
+
+    /// The user hovered an insight — clear its blue dot (forever).
+    private func markDiscovered(_ id: UUID) {
+        guard undiscoveredInsightIDs.contains(id) else { return }
+        withAnimation(.easeOut(duration: 0.25)) {
+            _ = undiscoveredInsightIDs.remove(id)
+        }
+        persistUndiscoveredInsightIDs()
+        reportUndiscoveredInsightCount()
+    }
+
     /// World position of an insight looked up by ID (nil if not visible on tree).
     private func worldPosition(forInsightID id: UUID) -> CGPoint? {
-        for node in nodes {
+        for node in displayNodes {
+            if placedMidpointNodeIDs.contains(node.id), node.insights.contains(where: { $0.id == id }) {
+                return node.position   // pinned chip sits on the node itself
+            }
             let visible = Array(node.insights.prefix(6))
             if let idx = visible.firstIndex(where: { $0.id == id }) {
                 return insightWorldPosition(for: node, index: idx, count: min(node.insights.count, 6))
@@ -1369,7 +2060,15 @@ struct InsightTreeCanvasView: View {
     }
 
     /// Zoom/pan so that all supplied world points fit in the viewport with padding.
-    private func zoomToFit(worldPositions positions: [CGPoint], in size: CGSize) {
+    /// Pass `center` to anchor on a specific world point (e.g. a node) instead of the
+    /// bounding-box centroid of `positions`.
+    private func zoomToFit(
+        worldPositions positions: [CGPoint],
+        in size: CGSize,
+        padding: CGFloat = 180,
+        fitFactor: CGFloat = 0.88,
+        center: CGPoint? = nil
+    ) {
         guard positions.count >= 2 else {
             if let pos = positions.first { focusInsight(at: pos, in: size) }
             return
@@ -1380,15 +2079,14 @@ struct InsightTreeCanvasView: View {
         let minY = positions.map { $0.y }.min()!
         let maxY = positions.map { $0.y }.max()!
 
-        let padding: CGFloat    = 180
         let worldWidth          = max(maxX - minX + padding * 2, 1)
         let worldHeight         = max(maxY - minY + padding * 2, 1)
         let targetScale         = clamp(
-            min(size.width / worldWidth, size.height / worldHeight) * 0.88,
+            min(size.width / worldWidth, size.height / worldHeight) * fitFactor,
             lower: 0.28, upper: 1.4
         )
-        let centerX = (minX + maxX) / 2
-        let centerY = (minY + maxY) / 2
+        let centerX = center?.x ?? (minX + maxX) / 2
+        let centerY = center?.y ?? (minY + maxY) / 2
 
         rememberCameraBeforeFocusIfNeeded()
         withAnimation(.spring(response: 0.58, dampingFraction: 0.64, blendDuration: 0.08)) {
@@ -1457,6 +2155,15 @@ struct InsightTreeCanvasView: View {
         let progress = (scale - startFade) / (fullyVisible - startFade)
         return Double(clamp(progress, lower: 0, upper: 1))
     }
+
+    /// Node Concept labels fade at a lower zoom than insight chips, so they stay legible
+    /// when zoomed further out (insight chips drop away first, concepts persist).
+    private static func nodeLabelOpacity(for scale: CGFloat) -> Double {
+        let startFade = CGFloat(0.30)
+        let fullyVisible = CGFloat(0.40)
+        let progress = (scale - startFade) / (fullyVisible - startFade)
+        return Double(clamp(progress, lower: 0, upper: 1))
+    }
 }
 
 private struct RenderedGraphEdge: Identifiable {
@@ -1464,6 +2171,46 @@ private struct RenderedGraphEdge: Identifiable {
     let fromNodeID: UUID
     let toNodeID: UUID
     let isSuggested: Bool
+}
+
+/// A simulated node: live position + velocity, integrated each frame.
+struct SimBody {
+    var pos: CGPoint
+    var vel: CGVector
+}
+
+/// Per-insight bond angle around its node (free absolute angle in radians; VSEPR repulsion
+/// spreads chips to maximize separation).
+struct ChipAngle {
+    var angle: Double
+}
+
+/// Drives a per-frame tick from a `CADisplayLink`. The callback fires as a run-loop event
+/// OUTSIDE SwiftUI body evaluation, so the sim can safely assign `@State` each frame (doing
+/// that inside a `TimelineView` closure would be "modifying state during view update").
+@MainActor
+final class DisplayLinkDriver {
+    private var link: CADisplayLink?
+    var onTick: ((CFTimeInterval) -> Void)?
+
+    private final class Proxy: NSObject {
+        let fire: (CFTimeInterval) -> Void
+        init(_ fire: @escaping (CFTimeInterval) -> Void) { self.fire = fire }
+        @objc func step(_ link: CADisplayLink) { fire(link.timestamp) }
+    }
+
+    func start() {
+        guard link == nil else { return }
+        let proxy = Proxy { [weak self] ts in self?.onTick?(ts) }
+        let l = CADisplayLink(target: proxy, selector: #selector(Proxy.step(_:)))
+        l.add(to: .main, forMode: .common)
+        link = l
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+    }
 }
 
 private struct InsightTreeCameraSnapshot {
@@ -1541,7 +2288,7 @@ private struct MidpointHandle: View {
 
                 Image(systemName: "text.bubble.fill")
                     .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(AquinasTheme.Colors.accentGreen)
+                    .foregroundStyle(AquinasTheme.Colors.accentGreen)
                     .shadow(color: Color.black.opacity(0.18), radius: 3, x: 0, y: 1)
                     .opacity(Double(1.0 - phase * 0.5))   // 100% at bottom, 50% at top
                     .offset(y: yOffset)
@@ -1551,6 +2298,86 @@ private struct MidpointHandle: View {
         .onAppear {
             startTime = Date().timeIntervalSinceReferenceDate
         }
+    }
+}
+
+/// Insight chip contents: the bubble icon + the title. As `labelOpacity` fades with zoom, the
+/// title's *width* animates to 0 (a true ease, not a discrete display:none), so the chip
+/// smoothly collapses to just the icon.
+private struct RevealedInsightLabel: View {
+    let title: String
+    let labelOpacity: Double
+
+    @State private var titleWidth: CGFloat = 0
+    /// Animated width state — toggled (with an explicit ease) when the fade crosses 0, so the
+    /// per-frame canvas re-render can't swallow an implicit animation.
+    @State private var showTitle: Bool = true
+
+    /// Title keeps full width through the whole fade; it only collapses once opacity hits 0.
+    private var collapsed: Bool { labelOpacity <= 0.01 }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Image(systemName: "text.bubble.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(AquinasTheme.Colors.lightGreen)
+            Text(title)
+                .font(.figtreeHeading2)
+                .foregroundStyle(AquinasTheme.Colors.lightGreen)
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.leading, 10)               // icon↔title gap, collapses with the width
+                .background(
+                    GeometryReader { geo in
+                        Color.clear
+                            .onAppear { titleWidth = geo.size.width }
+                            .onChange(of: geo.size.width) { _, w in if w > 0 { titleWidth = w } }
+                    }
+                )
+                .frame(width: titleWidth == 0 ? nil : (showTitle ? titleWidth : 0), alignment: .leading)
+                .clipped()
+                .opacity(labelOpacity)
+        }
+        .onAppear { showTitle = !collapsed }
+        .onChange(of: collapsed) { _, isCollapsed in
+            // Defer to the next runloop tick so the animation escapes the pinch-gesture
+            // transaction (which has animations disabled) — otherwise manual zoom wouldn't ease.
+            DispatchQueue.main.async {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    showTitle = !isCollapsed
+                }
+            }
+        }
+    }
+}
+
+/// A title that reveals one letter at a time (blur + fade + drift), staggered left to right.
+/// Used for the dramatic entrance of a placed-midpoint insight.
+private struct LetterRevealText: View {
+    let text: String
+    let font: Font
+    let color: Color
+    var perLetterDelay: Double = 0.045
+
+    @State private var revealed = false
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(Array(text.enumerated()), id: \.offset) { index, character in
+                Text(character == " " ? "\u{00A0}" : String(character))
+                    .font(font)
+                    .foregroundStyle(color)
+                    .fixedSize()
+                    .opacity(revealed ? 1 : 0)
+                    .blur(radius: revealed ? 0 : 6)
+                    .offset(y: revealed ? 0 : 8)
+                    .animation(
+                        .easeOut(duration: 0.45).delay(Double(index) * perLetterDelay),
+                        value: revealed
+                    )
+            }
+        }
+        .onAppear { revealed = true }
     }
 }
 
@@ -1571,6 +2398,14 @@ private extension AnyTransition {
     static var blurUp: AnyTransition {
         .modifier(
             active: BlurUpModifier(blur: 8, opacity: 0, offsetY: 8),
+            identity: BlurUpModifier(blur: 0, opacity: 1, offsetY: 0)
+        )
+    }
+
+    /// Fade + blur, no transform — used to dissolve the hollow loading icon out.
+    static var fadeBlur: AnyTransition {
+        .modifier(
+            active: BlurUpModifier(blur: 6, opacity: 0, offsetY: 0),
             identity: BlurUpModifier(blur: 0, opacity: 1, offsetY: 0)
         )
     }

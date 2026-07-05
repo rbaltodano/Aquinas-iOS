@@ -55,9 +55,9 @@ struct AquinasNavButton: View {
             }
             // padding of 15 makes the capsule exactly 48×48 with no text
             // (15 + 18 + 15 = 48) so it renders as a perfect circle.
-            .padding(.horizontal, 15)
+            .padding(.horizontal, isDetailVisible ? 19 : 15)
             .frame(height: 48)
-            .background(AquinasTheme.Colors.surface)
+            .background(AquinasTheme.Colors.canvasSecondary)
             .clipShape(Capsule())
             .overlay(
                 Capsule()

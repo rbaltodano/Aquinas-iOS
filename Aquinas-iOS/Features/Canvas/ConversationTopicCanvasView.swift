@@ -550,10 +550,10 @@ struct ConversationTopicCanvasView: View {
                                     TravelingPulseLine(width: 48, progress: progress)
                                     HStack(spacing: 6) {
                                         Image(systemName: "text.bubble.fill")
-                                            .font(.system(size: 10, weight: .semibold))
+                                            .font(.system(size: 14, weight: .semibold))
                                             .foregroundColor(AquinasTheme.Colors.darkGreen)
                                         Text(label)
-                                            .font(.custom("Figtree-Bold", size: 13))
+                                            .font(.figtreeHeading2)
                                             .foregroundColor(AquinasTheme.Colors.darkGreen)
                                             .lineLimit(1)
                                     }
@@ -615,7 +615,7 @@ struct ConversationTopicCanvasView: View {
                 concept: insight,
                 collectedDefinitions: $savedInsights
             )
-            .presentationDetents([.fraction(0.45)])
+            .presentationDetents([.height(340), .large])
             .presentationDragIndicator(.visible)
             .presentationBackground(AquinasTheme.Colors.canvas)
         }
@@ -957,10 +957,10 @@ struct TopicBubbleView: View {
                         Button(action: onTapInsightChip) {
                             HStack(spacing: 4) {
                                 Image(systemName: "text.bubble.fill")
-                                    .font(.system(size: 9, weight: .semibold))
+                                    .font(.system(size: 14, weight: .semibold))
                                     .foregroundColor(AquinasTheme.Colors.lightGreen)
                                 Text("+\(collapsedCount)")
-                                    .font(.custom("Figtree-Regular", size: 11))
+                                    .font(.figtreeHeading2)
                                     .foregroundColor(AquinasTheme.Colors.lightGreen)
                             }
                             .padding(.horizontal, 8)

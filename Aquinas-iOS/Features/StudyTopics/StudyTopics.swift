@@ -403,7 +403,7 @@ struct StudyTopicDetailView: View {
     @State private var titleDraft: String
     @State private var descriptionDraft: String
     @State private var localFiles: [UploadedFile]
-    @FocusState private var isTitleFocused: Bool
+    @State private var isTitleFocused: Bool = false
 
     init(
         topic: StudyTopic,
@@ -451,28 +451,24 @@ struct StudyTopicDetailView: View {
 
             let topicConversations = conversations.filter { $0.studyTopicID == topic.id }
 
-            ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 0) {
-                    // Spacer behind the floating hamburger button.
-                    Color.clear.frame(height: 72)
+            GeometryReader { geometry in
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        // Spacer behind the floating hamburger button.
+                        Color.clear.frame(height: 72)
 
-                    VStack(alignment: .center, spacing: 48) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack(alignment: .top, spacing: 12) {
-                                placeholderTextField(
+                        VStack(alignment: .leading, spacing: 48) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                StudyTopicTitleTextView(
                                     placeholder: "New Study Topic",
                                     text: $titleDraft,
-                                    font: .custom("LibreBaskerville-Regular", size: 28),
-                                    color: AquinasTheme.Colors.primaryReadable,
-                                    emptyOpacity: 0.5,
-                                    lineLimit: 1...2,
-                                    focusBinding: $isTitleFocused
+                                    isFocused: $isTitleFocused,
+                                    lineSpacing: 18
                                 )
-                                .lineSpacing(14)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                                 .onChange(of: titleDraft) { _, _ in persistDrafts() }
 
-                                Spacer(minLength: 8)
-
+                                /*
                                 Menu {
                                     Button("Rename", systemImage: "pencil.line") {
                                         isTitleFocused = true
@@ -498,85 +494,90 @@ struct StudyTopicDetailView: View {
                                 .contentShape(Rectangle())
                                 .padding(-11)
                                 .accessibilityLabel("Topic options")
+                                */
+
+                                placeholderTextField(
+                                    placeholder: "Briefly describe the topic of this study",
+                                    text: $descriptionDraft,
+                                    font: .custom("Figtree-Regular", size: 14),
+                                    color: AquinasTheme.Colors.paragraphText,
+                                    emptyOpacity: 0.5,
+                                    lineLimit: 1...4,
+                                    lineSpacing: 7
+                                )
+                                .padding(.leading, 24)
+                                .onChange(of: descriptionDraft) { _, _ in persistDrafts() }
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
 
-                            placeholderTextField(
-                                placeholder: "Briefly describe the topic of this study",
-                                text: $descriptionDraft,
-                                font: .custom("Figtree-Regular", size: 14),
-                                color: AquinasTheme.Colors.paragraphText,
-                                emptyOpacity: 0.5,
-                                lineLimit: 1...4
-                            )
-                            .lineSpacing(7)
-                            .onChange(of: descriptionDraft) { _, _ in persistDrafts() }
-                        }
-
-                        // Files section — only shown when at least one file has been uploaded.
-                        if !localFiles.isEmpty {
-                            StudyTopicFilesSection(
-                                files: localFiles,
-                                onRemove: { file in
-                                    withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
-                                        localFiles.removeAll { $0.id == file.id }
-                                    }
-                                    persistDrafts()
-                                }
-                            )
-                        }
-
-                        if !topicConversations.isEmpty {
-                            LazyVStack(spacing: 16) {
-                                ForEach(topicConversations) { conversation in
-                                    OpenConversationCard(
-                                        conversation: conversation,
-                                        isActive: conversation.id == activeConversationID,
-                                        latestAnswer: latestAnswer(in: conversation),
-                                        insights: insights(for: conversation),
-                                        onSelect: { onSelectConversation(conversation) },
-                                        onOpenInsight: { insight in activeInsight = insight },
-                                        onRename: { conv in
-                                            renameDraft = conv.title
-                                            conversationBeingRenamed = conv
+                            // Files section — only shown when at least one file has been uploaded.
+                            if !localFiles.isEmpty {
+                                StudyTopicFilesSection(
+                                    files: localFiles,
+                                    onRemove: { file in
+                                        withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
+                                            localFiles.removeAll { $0.id == file.id }
                                         }
-                                    )
+                                        persistDrafts()
+                                    }
+                                )
+                            }
+
+                            if !topicConversations.isEmpty {
+                                LazyVStack(spacing: 16) {
+                                    ForEach(topicConversations) { conversation in
+                                        OpenConversationCard(
+                                            conversation: conversation,
+                                            isActive: conversation.id == activeConversationID,
+                                            latestAnswer: latestAnswer(in: conversation),
+                                            insights: insights(for: conversation),
+                                            onSelect: { onSelectConversation(conversation) },
+                                            onOpenInsight: { insight in activeInsight = insight },
+                                            onRename: { conv in
+                                                renameDraft = conv.title
+                                                conversationBeingRenamed = conv
+                                            }
+                                        )
+                                    }
                                 }
+                                .frame(maxWidth: .infinity)
                             }
-                            .frame(maxWidth: .infinity)
-                        }
 
-                        Button(action: {
-                            isExistingConversationPickerOpen = true
-                        }) {
-                            HStack(spacing: 8) {
-                                Image(systemName: "plus")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .sfSymbolDrawOn()
-                                Text("Add Existing Conversation")
-                                    .font(.custom("Figtree-Regular", size: 14))
-                            }
-                            .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.5))
-                            .frame(maxWidth: .infinity)
-                            .padding(24)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                    .stroke(
-                                        AquinasTheme.Colors.darkText.opacity(0.15),
-                                        style: StrokeStyle(lineWidth: 1, dash: [5, 4])
+                            Button(action: {
+                                isExistingConversationPickerOpen = true
+                            }) {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "plus")
+                                        .font(.system(size: 10, weight: .bold))
+                                        .sfSymbolDrawOn()
+                                    Text("Add Existing Conversation")
+                                        .font(.custom("Figtree-Regular", size: 14))
+                                }
+                                .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.5))
+                                .frame(maxWidth: .infinity)
+                                .padding(24)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .stroke(
+                                            AquinasTheme.Colors.darkText.opacity(0.15),
+                                            style: StrokeStyle(lineWidth: 1, dash: [5, 4])
+                                        )
                                     )
-                            )
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(.top, 24)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 24)
 
-                    Color.clear.frame(height: 120)
+                        Color.clear.frame(height: 120)
+                    }
+                    .frame(width: max(0, geometry.size.width - 48), alignment: .leading)
+                    .padding(.horizontal, 24)
+                    .frame(width: geometry.size.width, alignment: .leading)
                 }
-                .padding(.horizontal, 24)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .scrollDismissesKeyboard(.interactively)
+                .scrollClipDisabled()
             }
-            .scrollDismissesKeyboard(.interactively)
-            .scrollClipDisabled()
 
             VStack {
                 Spacer()
@@ -622,7 +623,7 @@ struct StudyTopicDetailView: View {
         )
         .sheet(item: $activeInsight) { insight in
             ConceptSheetContent(concept: insight, collectedDefinitions: $savedInsights)
-                .presentationDetents([.fraction(0.45)])
+                .presentationDetents([.height(340), .large])
                 .presentationDragIndicator(.visible)
                 .presentationBackground(AquinasTheme.Colors.canvas)
         }
@@ -649,7 +650,7 @@ struct StudyTopicDetailView: View {
         }
         .sheet(item: $pickerActiveInsight) { insight in
             ConceptSheetContent(concept: insight, collectedDefinitions: $savedInsights)
-                .presentationDetents([.fraction(0.45)])
+                .presentationDetents([.height(340), .large])
                 .presentationDragIndicator(.visible)
                 .presentationBackground(AquinasTheme.Colors.canvas)
         }
@@ -696,12 +697,23 @@ struct StudyTopicDetailView: View {
         color: Color,
         emptyOpacity: Double,
         lineLimit: ClosedRange<Int>,
+        lineSpacing: CGFloat = 0,
+        minimumHeight: CGFloat? = nil,
         focusBinding: FocusState<Bool>.Binding? = nil
     ) -> some View {
         ZStack(alignment: .topLeading) {
+            Text(text.wrappedValue.isEmpty ? placeholder : text.wrappedValue)
+                .font(font)
+                .lineSpacing(lineSpacing)
+                .lineLimit(lineLimit)
+                .fixedSize(horizontal: false, vertical: true)
+                .hidden()
+                .allowsHitTesting(false)
+
             if text.wrappedValue.isEmpty {
                 Text(placeholder)
                     .font(font)
+                    .lineSpacing(lineSpacing)
                     .foregroundColor(color.opacity(emptyOpacity))
                     .fixedSize(horizontal: false, vertical: true)
                     .allowsHitTesting(false)
@@ -712,7 +724,9 @@ struct StudyTopicDetailView: View {
                     .font(font)
                     .foregroundColor(color)
                     .tint(AquinasTheme.Colors.secondaryMuted)
+                    .lineSpacing(lineSpacing)
                     .lineLimit(lineLimit)
+                    .scrollDisabled(true)
                     .fixedSize(horizontal: false, vertical: true)
                     .focused(focusBinding)
                     .onChange(of: text.wrappedValue) { _, newValue in
@@ -728,7 +742,9 @@ struct StudyTopicDetailView: View {
                     .font(font)
                     .foregroundColor(color)
                     .tint(AquinasTheme.Colors.secondaryMuted)
+                    .lineSpacing(lineSpacing)
                     .lineLimit(lineLimit)
+                    .scrollDisabled(true)
                     .fixedSize(horizontal: false, vertical: true)
                     .onChange(of: text.wrappedValue) { _, newValue in
                         guard newValue.contains("\n") else { return }
@@ -740,6 +756,7 @@ struct StudyTopicDetailView: View {
                     }
             }
         }
+        .frame(minHeight: minimumHeight, alignment: .topLeading)
     }
 
     private func persistDrafts() {
@@ -1091,13 +1108,13 @@ private struct StudyTopicCard: View {
         .padding(24)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(AquinasTheme.Colors.componentBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
         )
         .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .trim(from: 0, to: isShowingLongPressFeedback ? 1 : 0)
                 .stroke(
                     AquinasTheme.Colors.border,
@@ -1107,7 +1124,7 @@ private struct StudyTopicCard: View {
                 .padding(1)
                 .allowsHitTesting(false)
         }
-        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .onTapGesture(perform: onSelect)
         .onLongPressGesture(
             minimumDuration: longPressDuration,
@@ -1203,6 +1220,186 @@ private struct StudyTopicFilesSection: View {
             }
         }
         .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+}
+
+private struct StudyTopicTitleTextView: View {
+    let placeholder: String
+    @Binding var text: String
+    @Binding var isFocused: Bool
+    var lineSpacing: CGFloat
+
+    @State private var measuredHeight: CGFloat = 64
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            AutoSizingStudyTopicTitleTextView(
+                text: $text,
+                isFocused: $isFocused,
+                measuredHeight: $measuredHeight,
+                lineSpacing: lineSpacing
+            )
+            .frame(height: measuredHeight)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if text.isEmpty {
+                Text(placeholder)
+                    .font(.baskervilleHeadingXLarge)
+                    .lineSpacing(lineSpacing)
+                    .foregroundColor(AquinasTheme.Colors.primaryReadable.opacity(0.5))
+                    .padding(.vertical, 12)
+                    .allowsHitTesting(false)
+            }
+        }
+        .frame(minHeight: measuredHeight, alignment: .topLeading)
+    }
+}
+
+private struct AutoSizingStudyTopicTitleTextView: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var isFocused: Bool
+    @Binding var measuredHeight: CGFloat
+    var lineSpacing: CGFloat
+
+    func makeUIView(context: Context) -> UITextView {
+        let textView = StudyTopicSizingTextView()
+        textView.delegate = context.coordinator
+        textView.backgroundColor = .clear
+        textView.isOpaque = false
+        textView.isScrollEnabled = false
+        textView.showsVerticalScrollIndicator = false
+        textView.showsHorizontalScrollIndicator = false
+        textView.textContainer.lineFragmentPadding = 0
+        textView.textContainerInset = UIEdgeInsets(top: 12, left: 0, bottom: 12, right: 0)
+        textView.textContainer.lineBreakMode = .byWordWrapping
+        textView.textContainer.widthTracksTextView = true
+        textView.returnKeyType = .done
+        textView.tintColor = UIColor(AquinasTheme.Colors.secondaryMuted)
+        textView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        textView.setContentCompressionResistancePriority(.required, for: .vertical)
+        textView.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        textView.setContentHuggingPriority(.required, for: .vertical)
+        textView.onBoundsChange = { view in
+            context.coordinator.parent.recalculateHeight(for: view)
+        }
+        applyTextStyle(to: textView)
+        return textView
+    }
+
+    func updateUIView(_ textView: UITextView, context: Context) {
+        context.coordinator.parent = self
+        if textView.text != text {
+            textView.attributedText = attributedTitle(text)
+        }
+        textView.typingAttributes = typingAttributes()
+        textView.textColor = .aquinasPrimaryReadable
+
+        if isFocused, !textView.isFirstResponder {
+            DispatchQueue.main.async {
+                textView.becomeFirstResponder()
+            }
+        } else if !isFocused, textView.isFirstResponder {
+            textView.resignFirstResponder()
+        }
+
+        recalculateHeight(for: textView)
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView textView: UITextView, context: Context) -> CGSize? {
+        guard let proposedWidth = proposal.width, proposedWidth > 8 else { return nil }
+        let height = measuredHeight(for: textView, width: proposedWidth)
+        updateMeasuredHeight(height)
+        return CGSize(width: proposedWidth, height: height)
+    }
+
+    private func applyTextStyle(to textView: UITextView) {
+        textView.attributedText = attributedTitle(text)
+        textView.typingAttributes = typingAttributes()
+    }
+
+    private func attributedTitle(_ string: String) -> NSAttributedString {
+        NSAttributedString(string: string, attributes: typingAttributes())
+    }
+
+    private func typingAttributes() -> [NSAttributedString.Key: Any] {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = lineSpacing
+        paragraph.lineBreakMode = .byWordWrapping
+
+        return [
+            .font: UIFont(name: "LibreBaskerville-Regular", size: 40) ?? UIFont.systemFont(ofSize: 40),
+            .foregroundColor: UIColor.aquinasPrimaryReadable,
+            .paragraphStyle: paragraph
+        ]
+    }
+
+    private func recalculateHeight(for textView: UITextView) {
+        guard textView.bounds.width > 8 else { return }
+        let height = measuredHeight(for: textView, width: textView.bounds.width)
+        updateMeasuredHeight(height)
+    }
+
+    private func measuredHeight(for textView: UITextView, width: CGFloat) -> CGFloat {
+        textView.textContainer.size = CGSize(width: width, height: .greatestFiniteMagnitude)
+        let targetSize = CGSize(width: width, height: .greatestFiniteMagnitude)
+        return ceil(textView.sizeThatFits(targetSize).height)
+    }
+
+    private func updateMeasuredHeight(_ height: CGFloat) {
+        guard abs(measuredHeight - height) > 0.5 else { return }
+        DispatchQueue.main.async {
+            measuredHeight = height
+        }
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: AutoSizingStudyTopicTitleTextView
+
+        init(parent: AutoSizingStudyTopicTitleTextView) {
+            self.parent = parent
+        }
+
+        func textViewDidBeginEditing(_ textView: UITextView) {
+            parent.isFocused = true
+        }
+
+        func textViewDidEndEditing(_ textView: UITextView) {
+            parent.isFocused = false
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            parent.text = textView.text.replacingOccurrences(of: "\n", with: "")
+            parent.recalculateHeight(for: textView)
+        }
+
+        func textView(
+            _ textView: UITextView,
+            shouldChangeTextIn range: NSRange,
+            replacementText replacement: String
+        ) -> Bool {
+            if replacement.contains("\n") {
+                textView.resignFirstResponder()
+                parent.isFocused = false
+                return false
+            }
+            return true
+        }
+    }
+}
+
+private final class StudyTopicSizingTextView: UITextView {
+    var onBoundsChange: ((UITextView) -> Void)?
+    private var lastWidth: CGFloat = 0
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard abs(bounds.width - lastWidth) > 0.5 else { return }
+        lastWidth = bounds.width
+        onBoundsChange?(self)
     }
 }
 

@@ -59,6 +59,7 @@ struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable {
 }
 
 enum AppPage: Equatable {
+    case home
     case conversation
     case openConversations
     case settings
@@ -78,8 +79,8 @@ struct ContentView: View {
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var showCamera: Bool = false
     @State private var collectedDefinitions: [ConceptDefinition] = []
-    @State private var activePage: AppPage = .conversation
-    @State private var displayedPage: AppPage = .conversation
+    @State private var activePage: AppPage = .home
+    @State private var displayedPage: AppPage = .home
     @State private var isPageContentVisible: Bool = true
     @State private var pageContentOffsetY: CGFloat = 0
     @State private var pendingPageTransitionWorkItem: DispatchWorkItem? = nil
@@ -95,13 +96,35 @@ struct ContentView: View {
     @State private var requestedConversationID: UUID? = nil
     @State private var requestedTopicID: UUID? = nil
     @State private var newConversationRequest: Int = 0
+    @State private var pendingNewConversationQuestion: String = ""
+    @State private var pendingNewConversationEyebrow: String = ""
     @State private var newConversationTopicID: UUID? = nil
     @State private var newConversationIsStudyTopic: Bool = false
     @State private var deletedConversationID: UUID? = nil
     @State private var colorSchemeOverride: ColorScheme? = nil
     @State private var requestedForkConcept: ConceptDefinition? = nil
-    @State private var userName: String = ""
+    @AppStorage("aquinas.settings.userName") private var userName: String = ""
     @State private var customInstructions: String = ""
+    @State private var globalInsightSelectionRequest: Int = 0
+    @State private var globalInsightClearSelectionRequest: Int = 0
+    @State private var globalInsightDismissHoverRequest: Int = 0
+    @State private var globalInsightCreateConceptRequest: Int = 0
+    @State private var globalInsightPromotedIDs: [UUID] = []
+    @State private var globalInsightInquireConnectionRequest: Int = 0
+    @State private var globalInsightMidpointEnterRequest: Int = 0
+    @State private var globalInsightMidpointCenterRequest: Int = 0
+    @State private var globalInsightMidpointPlaceRequest: Int = 0
+    @State private var globalInsightHasCanvasHover: Bool = false
+    @State private var globalInsightHasInsightHover: Bool = false
+    @State private var globalInsightSelectedItemCount: Int = 0
+    @State private var globalInsightQuoteTarget: ConceptDefinition? = nil
+    @State private var globalInsightIsMidpointMode: Bool = false
+    @State private var globalInsightIsGenerating: Bool = false
+    @State private var globalInsightIsThinkingEnabled: Bool = false
+    @State private var globalInsightSelectedPersonality: String = "Scholarly"
+    @State private var globalInsightIsPersonalityMenuOpen: Bool = false
+    @State private var globalInsightHighlightedBridge: (UUID, UUID)? = nil
+    @State private var globalInsightHighlightRequest: Int = 0
     @AppStorage("aquinas.settings.conversationFontSize") private var conversationFontSize: ConversationFontSizeOption = .small
     @State private var inputTextAlignment: InputTextAlignmentOption = .center
     @State private var inputFont: ConversationFontOption = .serif
@@ -127,9 +150,22 @@ struct ContentView: View {
         return collectedDefinitions.filter { !seenIDs.contains($0.id) }.count
     }
 
+    private var globalInsightContextWordCount: Int {
+        collectedDefinitions
+            .flatMap { [$0.word, $0.meaning, $0.example] }
+            .joined(separator: " ")
+            .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+            .count
+    }
+
     @ViewBuilder private var insightTreePage: some View {
         InsightTreeView(
             insights: collectedDefinitions,
+            selectionRequest: globalInsightSelectionRequest,
+            clearSelectionRequest: globalInsightClearSelectionRequest,
+            dismissHoverRequest: globalInsightDismissHoverRequest,
+            createConceptRequest: globalInsightCreateConceptRequest,
+            promotedInsightIDs: globalInsightPromotedIDs,
             onRemoveInsight: { def in
                 withAnimation { collectedDefinitions.removeAll { $0.id == def.id } }
             },
@@ -142,9 +178,72 @@ struct ContentView: View {
                     activePage = .conversation
                 }
             },
+            onQuoteInsight: { globalInsightQuoteTarget = $0 },
+            onSelectionStateChange: { globalInsightHasCanvasHover = $0 },
+            onInsightSelectionStateChange: { globalInsightHasInsightHover = $0 },
+            onSelectedCanvasItemCountChange: { globalInsightSelectedItemCount = $0 },
+            onPromotedInsightIDsChange: { globalInsightPromotedIDs = $0 },
+            savedConceptIDs: Set(collectedDefinitions.map(\.id)),
+            onToggleSavedConcept: { concept in
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                    if collectedDefinitions.contains(where: { $0.id == concept.id }) {
+                        collectedDefinitions.removeAll { $0.id == concept.id }
+                    } else {
+                        collectedDefinitions.append(concept)
+                    }
+                }
+            },
+            inquireConnectionRequest: globalInsightInquireConnectionRequest,
+            onInquireConnectionConcepts: { first, _ in
+                requestedForkConcept = first
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                    activePage = .conversation
+                }
+            },
+            midpointEnterRequest: globalInsightMidpointEnterRequest,
+            midpointCenterRequest: globalInsightMidpointCenterRequest,
+            midpointPlaceRequest: globalInsightMidpointPlaceRequest,
+            highlightedInsightPair: globalInsightHighlightedBridge,
+            highlightPairRequest: globalInsightHighlightRequest,
+            startsMidpointForHighlightedPair: true,
+            onMidpointModeChange: { globalInsightIsMidpointMode = $0 },
+            onMidpointGeneratingChange: { globalInsightIsGenerating = $0 },
             inputFont: inputFont,
-            conversationFontSize: conversationFontSize
+            conversationFontSize: conversationFontSize,
+            showQuestionBar: false
         )
+        .safeAreaInset(edge: .bottom) {
+            GlobalInsightsModelControls(
+                showFilePicker: $showFilePicker,
+                showPhotoPicker: $showPhotoPicker,
+                showCamera: $showCamera,
+                isThinkingEnabled: $globalInsightIsThinkingEnabled,
+                selectedPersonality: $globalInsightSelectedPersonality,
+                isPersonalityMenuOpen: $globalInsightIsPersonalityMenuOpen,
+                hasCanvasHover: globalInsightHasCanvasHover,
+                hasCanvasInsightHover: globalInsightHasInsightHover,
+                hasSelectedCanvasItems: globalInsightSelectedItemCount > 0,
+                selectedCanvasItemCount: globalInsightSelectedItemCount,
+                isMidpointMode: globalInsightIsMidpointMode,
+                isCanvasInsightLoading: globalInsightIsGenerating,
+                contextWordCount: globalInsightContextWordCount,
+                onSelectCanvasItem: { globalInsightSelectionRequest += 1 },
+                onCreateCanvasConcept: { globalInsightCreateConceptRequest += 1 },
+                onInquireConnection: { globalInsightInquireConnectionRequest += 1 },
+                onQuoteCanvasItem: {
+                    guard let target = globalInsightQuoteTarget else { return }
+                    requestedForkConcept = target
+                    withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                        activePage = .conversation
+                    }
+                },
+                onMidpointConcepts: { globalInsightMidpointEnterRequest += 1 },
+                onMidpointCenter: { globalInsightMidpointCenterRequest += 1 },
+                onMidpointPlace: { globalInsightMidpointPlaceRequest += 1 },
+                onClearCanvasSelection: { globalInsightClearSelectionRequest += 1 },
+                onContextWillOpen: { globalInsightDismissHoverRequest += 1 }
+            )
+        }
         .background(canvasColor)
         .ignoresSafeArea(.container)  // edges/notch only — keyboard safe area is respected
     }
@@ -165,6 +264,8 @@ struct ContentView: View {
             sideMenuActiveConversationID: $sideMenuActiveConversationID,
             requestedConversationID: $requestedConversationID,
             newConversationRequest: $newConversationRequest,
+            pendingNewConversationQuestion: $pendingNewConversationQuestion,
+            pendingNewConversationEyebrow: $pendingNewConversationEyebrow,
             newConversationTopicID: $newConversationTopicID,
             newConversationIsStudyTopic: $newConversationIsStudyTopic,
             deletedConversationID: $deletedConversationID,
@@ -174,6 +275,7 @@ struct ContentView: View {
             inputFont: inputFont,
             responseTextAlignment: responseTextAlignment,
             responseFont: responseFont,
+            userName: userName,
             uploadedFiles: $uploadedFiles,
             showFilePicker: $showFilePicker
         )
@@ -190,6 +292,38 @@ struct ContentView: View {
                     VStack(spacing: 0) {
                         Group {
                             switch displayedPage {
+                            case .home:
+                                HomeDashboardView(
+                                    conversations: sideMenuConversations,
+                                    activeConversationID: sideMenuActiveConversationID,
+                                    savedInsights: collectedDefinitions,
+                                    userName: userName,
+                                    onOpenMenu: {
+                                        dismissKeyboard()
+                                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                                            isGlobalSideMenuOpen = true
+                                        }
+                                    },
+                                    onSelectConversation: { conversation in
+                                        requestedConversationID = conversation.id
+                                        activePage = .conversation
+                                    },
+                                    onNewConversation: {
+                                        newConversationRequest += 1
+                                        activePage = .conversation
+                                    },
+                                    onStartQuestion: { question in
+                                        pendingNewConversationQuestion = question
+                                        pendingNewConversationEyebrow = "QUESTION OF THE DAY"
+                                        newConversationRequest += 1
+                                        activePage = .conversation
+                                    },
+                                    onOpenInsightBridge: { firstID, secondID in
+                                        globalInsightHighlightedBridge = (firstID, secondID)
+                                        globalInsightHighlightRequest += 1
+                                        activePage = .insights
+                                    }
+                                )
                             case .conversation:
                                 conversationView
                                 // ActiveInquiryView(
@@ -230,6 +364,21 @@ struct ContentView: View {
                                     },
                                     onRenameConversation: { conversation, title in
                                         renameConversation(conversation, to: title)
+                                    },
+                                    onPinConversation: { conversation in
+                                        pinConversation(conversation)
+                                    },
+                                    onUnpinConversation: { conversation in
+                                        unpinConversation(conversation)
+                                    },
+                                    onAddConversationToStudyTopic: { conversation, topicID in
+                                        attachConversation(conversation, toStudyTopic: topicID)
+                                    },
+                                    onRemoveConversationFromStudyTopic: { conversation in
+                                        detachConversationFromStudyTopic(conversation)
+                                    },
+                                    onDeleteConversation: { conversation in
+                                        deleteConversation(conversation)
                                     }
                                 )
                             case .settings:
@@ -346,14 +495,28 @@ struct ContentView: View {
                             onRenameConversation: { conversation, title in
                                 renameConversation(conversation, to: title)
                             },
-                            onPinConversation: { _ in /* pin not yet implemented */ },
+                            onPinConversation: { conversation in
+                                pinConversation(conversation)
+                            },
+                            onUnpinConversation: { conversation in
+                                unpinConversation(conversation)
+                            },
                             onAddConversationToStudyTopic: { conversation, topicID in
                                 attachConversation(conversation, toStudyTopic: topicID)
+                            },
+                            onRemoveConversationFromStudyTopic: { conversation in
+                                detachConversationFromStudyTopic(conversation)
                             },
                             onDeleteConversation: { conversation in
                                 deleteConversation(conversation)
                             },
                             newInsightsCount: newInsightsCount,
+                            onOpenHome: {
+                                activePage = .home
+                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                                    isGlobalSideMenuOpen = false
+                                }
+                            },
                             onOpenConversations: {
                                 activePage = .openConversations
                                 withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
@@ -416,8 +579,11 @@ struct ContentView: View {
                             guard abs(value.translation.width) > abs(value.translation.height) else { return }
                             if !isDraggingToOpenMenu {
                                 guard value.translation.width > 0 else { return }
+                                // Require an edge start anywhere in the conversation page (canvas
+                                // OR reading) so dragging a text-selection handle mid-screen
+                                // doesn't open the menu. Other pages keep the full-screen swipe.
                                 let needsEdgeOnly = activePage == .insights
-                                    || (activePage == .conversation && isConversationCanvasMode)
+                                    || activePage == .conversation
                                 if needsEdgeOnly {
                                     guard value.startLocation.x < 30 else { return }
                                 }
@@ -540,6 +706,7 @@ struct ContentView: View {
         }
         .preferredColorScheme(colorSchemeOverride)
         .onAppear {
+            loadShellConversationState()
             displayedPage = activePage
             isPageContentVisible = true
             pageContentOffsetY = 0
@@ -596,11 +763,36 @@ struct ContentView: View {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 
+    private func loadShellConversationState() {
+        guard let snapshot = CurrentConversationsStore.load(),
+              !snapshot.conversations.isEmpty else { return }
+
+        sideMenuConversations = snapshot.conversations
+        let activeID = snapshot.activeConversationID ?? snapshot.conversations.first?.id
+        sideMenuActiveConversationID = activeID
+        sideMenuCurrentTitle = activeID.flatMap { id in
+            snapshot.conversations.first { $0.id == id }?.title
+        } ?? snapshot.conversations.first?.title ?? "New Conversation"
+    }
+
     private func deleteConversation(_ conversation: InquiryConversation) {
         // Remove from the side menu list immediately for snappy feedback.
         sideMenuConversations.removeAll { $0.id == conversation.id }
+
+        if sideMenuActiveConversationID == conversation.id {
+            sideMenuActiveConversationID = sideMenuConversations.first?.id
+            sideMenuCurrentTitle = sideMenuConversations.first?.title ?? "New Conversation"
+        }
+
         // Signal the canvas to remove the thread (and any forks).
         deletedConversationID = conversation.id
+        CurrentConversationsStore.save(
+            InquiryPersistenceSnapshot(
+                conversations: sideMenuConversations,
+                activeConversationID: sideMenuActiveConversationID
+            )
+        )
+
         // If we were on the open-conversations page and nothing's left, go back.
         if activePage == .openConversations && sideMenuConversations.isEmpty {
             activePage = .conversation
@@ -626,6 +818,39 @@ struct ContentView: View {
         }
     }
 
+    private func pinConversation(_ conversation: InquiryConversation) {
+        if let index = sideMenuConversations.firstIndex(where: { $0.id == conversation.id }) {
+            sideMenuConversations[index].isPinned = true
+        }
+        if var snapshot = CurrentConversationsStore.load(),
+           let index = snapshot.conversations.firstIndex(where: { $0.id == conversation.id }) {
+            snapshot.conversations[index].isPinned = true
+            CurrentConversationsStore.save(snapshot)
+        }
+    }
+
+    private func unpinConversation(_ conversation: InquiryConversation) {
+        if let index = sideMenuConversations.firstIndex(where: { $0.id == conversation.id }) {
+            sideMenuConversations[index].isPinned = false
+        }
+        if var snapshot = CurrentConversationsStore.load(),
+           let index = snapshot.conversations.firstIndex(where: { $0.id == conversation.id }) {
+            snapshot.conversations[index].isPinned = false
+            CurrentConversationsStore.save(snapshot)
+        }
+    }
+
+    private func detachConversationFromStudyTopic(_ conversation: InquiryConversation) {
+        if let index = sideMenuConversations.firstIndex(where: { $0.id == conversation.id }) {
+            sideMenuConversations[index].studyTopicID = nil
+        }
+        if var snapshot = CurrentConversationsStore.load(),
+           let index = snapshot.conversations.firstIndex(where: { $0.id == conversation.id }) {
+            snapshot.conversations[index].studyTopicID = nil
+            CurrentConversationsStore.save(snapshot)
+        }
+    }
+
     private func attachConversation(_ conversation: InquiryConversation, toStudyTopic topicID: UUID) {
         // Update in-memory — CurrentConversationView's onChange will pick this up
         // and call persistConversations() if it is currently mounted.
@@ -643,6 +868,64 @@ struct ContentView: View {
             snapshot.conversations[index].studyTopicID = topicID
             CurrentConversationsStore.save(snapshot)
         }
+    }
+}
+
+private struct GlobalInsightsModelControls: View {
+    @Binding var showFilePicker: Bool
+    @Binding var showPhotoPicker: Bool
+    @Binding var showCamera: Bool
+    @Binding var isThinkingEnabled: Bool
+    @Binding var selectedPersonality: String
+    @Binding var isPersonalityMenuOpen: Bool
+    let hasCanvasHover: Bool
+    let hasCanvasInsightHover: Bool
+    let hasSelectedCanvasItems: Bool
+    let selectedCanvasItemCount: Int
+    let isMidpointMode: Bool
+    let isCanvasInsightLoading: Bool
+    let contextWordCount: Int
+    var onSelectCanvasItem: () -> Void
+    var onCreateCanvasConcept: () -> Void
+    var onInquireConnection: () -> Void
+    var onQuoteCanvasItem: () -> Void
+    var onMidpointConcepts: () -> Void
+    var onMidpointCenter: () -> Void
+    var onMidpointPlace: () -> Void
+    var onClearCanvasSelection: () -> Void
+    var onContextWillOpen: () -> Void
+
+    var body: some View {
+        InquiryControlDock(
+            isCanvasMode: true,
+            showFilePicker: $showFilePicker,
+            showPhotoPicker: $showPhotoPicker,
+            showCamera: $showCamera,
+            isThinkingEnabled: $isThinkingEnabled,
+            selectedPersonality: $selectedPersonality,
+            isPersonalityMenuOpen: $isPersonalityMenuOpen,
+            isAtBottom: true,
+            hasCanvasHover: hasCanvasHover,
+            hasCanvasInsightHover: hasCanvasInsightHover,
+            hasSelectedCanvasItems: hasSelectedCanvasItems,
+            selectedCanvasItemCount: selectedCanvasItemCount,
+            onScrollToBottom: {},
+            onViewEntireCanvas: {},
+            onOpenInsights: {},
+            onSelectCanvasItem: onSelectCanvasItem,
+            onCreateCanvasConcept: onCreateCanvasConcept,
+            onInquireConnection: onInquireConnection,
+            onQuoteCanvasItem: onQuoteCanvasItem,
+            onMidpointConcepts: onMidpointConcepts,
+            isMidpointMode: isMidpointMode,
+            isCanvasInsightLoading: isCanvasInsightLoading,
+            onMidpointCenter: onMidpointCenter,
+            onMidpointPlace: onMidpointPlace,
+            onClearCanvasSelection: onClearCanvasSelection,
+            contextWordCount: contextWordCount,
+            onClearConversation: {},
+            onContextWillOpen: onContextWillOpen
+        )
     }
 }
 

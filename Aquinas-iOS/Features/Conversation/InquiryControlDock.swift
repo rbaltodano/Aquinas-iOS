@@ -21,6 +21,7 @@ struct InquiryControlDock: View {
     @Binding var selectedPersonality: String
     @Binding var isPersonalityMenuOpen: Bool
     let isAtBottom: Bool
+    var showsModelControlsInCanvasMode: Bool = false
     var isKeyboardOpen: Bool = false
     var showsSendButton: Bool = false
     var hasCanvasHover: Bool = false
@@ -37,6 +38,11 @@ struct InquiryControlDock: View {
     var onQuoteCanvasItem: () -> Void = {}
     var onMidpointConcepts: () -> Void = {}
     var isMidpointMode: Bool = false
+    /// While a placed midpoint insight is generating, the dock collapses to just the
+    /// context control, which spins and reads "Loading".
+    var isCanvasInsightLoading: Bool = false
+    /// While a Branch-Mode response is generating; spins the context wheel (no "Loading" text).
+    var isResponseLoading: Bool = false
     var onMidpointCenter: () -> Void = {}
     var onMidpointPlace: () -> Void = {}
     var onClearCanvasSelection: () -> Void = {}
@@ -73,12 +79,30 @@ struct InquiryControlDock: View {
         }
     }
 
+    /// While a placed midpoint is generating AND nothing else is hovered/selected, the dock
+    /// collapses to just the spinning "Loading" context control. Hovering another insight
+    /// breaks the collapse so its card + the normal controls return (wheel keeps spinning).
+    private var isLoadingCollapsed: Bool {
+        isCanvasMode && isCanvasInsightLoading && !hasCanvasHover && !hasSelectedCanvasItems
+    }
+
+    private var showsAttachmentControl: Bool {
+        !isCanvasMode || showsModelControlsInCanvasMode
+    }
+
+    private var showsThinkingControl: Bool {
+        !isCanvasMode || showsModelControlsInCanvasMode
+    }
+
     private var controlCount: Int {
+        if isLoadingCollapsed {
+            return 1 // just the context control (spinning, "Loading")
+        }
         if isCanvasMode && isMidpointMode {
             return 2 + 1 // Center + Place + context
         }
-        let attachmentCount = isCanvasMode ? 0 : 1
-        let thinkingCount = isCanvasMode ? 0 : 1
+        let attachmentCount = showsAttachmentControl ? 1 : 0
+        let thinkingCount = showsThinkingControl ? 1 : 0
         let canvasActionCount: Int
         if !isCanvasMode {
             canvasActionCount = 0
@@ -104,23 +128,26 @@ struct InquiryControlDock: View {
     /// keep the same control count but change content width (e.g. the "Add" button ↔ the
     /// "Tap another Insight" hint) — so the capsule resizes with the same spring + scale bump.
     private var controlLayoutKey: String {
-        "\(controlCount)|\(isMidpointMode ? 1 : 0)|\(hasCanvasHover ? 1 : 0)|\(hasCanvasInsightHover ? 1 : 0)|\(selectedCanvasItemCount)|\(showsSendButton ? 1 : 0)"
+        "\(controlCount)|\(isMidpointMode ? 1 : 0)|\(isCanvasInsightLoading ? 1 : 0)|\(hasCanvasHover ? 1 : 0)|\(hasCanvasInsightHover ? 1 : 0)|\(selectedCanvasItemCount)|\(showsSendButton ? 1 : 0)"
     }
 
     var body: some View {
         ZStack(alignment: .top) {
             HStack(alignment: .center, spacing: 24) {
-                if !isCanvasMode {
+                if showsAttachmentControl {
                     attachmentButton
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
 
-                if !isCanvasMode {
+                if showsThinkingControl {
                     thinkingButton
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
 
-                if isCanvasMode && isMidpointMode {
+                if isLoadingCollapsed {
+                    // Generating a placed midpoint, nothing hovered — just the spinning context.
+                    EmptyView()
+                } else if isCanvasMode && isMidpointMode {
                     canvasActionButton(title: "Center", icon: "lines.measurement.horizontal", action: onMidpointCenter)
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                     canvasActionButton(title: "Place", icon: "arrow.down", action: onMidpointPlace)
@@ -213,6 +240,7 @@ struct InquiryControlDock: View {
         }
         .padding(.bottom, isKeyboardOpen ? 8 : 24)
         .animation(.spring(response: 0.42, dampingFraction: 0.86), value: isKeyboardOpen)
+        .animation(.spring(response: 0.42, dampingFraction: 0.86), value: showsSendButton)
         .background(alignment: .bottom) {
             LinearGradient(
                 stops: [
@@ -320,14 +348,29 @@ struct InquiryControlDock: View {
             }
         } label: {
             let contextColor = AquinasTheme.Colors.paragraphText.opacity(0.75)
+            // Hover/selection are Canvas-Mode concepts — ignore them in Branch Mode so the
+            // "Context" label isn't suppressed by stray canvas hover state.
+            let canvasHover = isCanvasMode && hasCanvasHover
+            let canvasSelected = isCanvasMode && hasSelectedCanvasItems
+            // "Loading" only shows in the collapsed state. Hovering another insight (or Branch
+            // Mode) drops the label; the wheel itself keeps spinning regardless.
+            let showLoadingText = isLoadingCollapsed
+            // The wheel spins for canvas insight generation OR a Branch-Mode response.
+            let isWheelSpinning = isCanvasInsightLoading || isResponseLoading
             HStack(spacing: 8) {
-                if hasSelectedCanvasItems {
+                // While generating, "Loading" sits on the opposite side of the context symbol.
+                if showLoadingText {
+                    Text("Loading")
+                        .font(.custom("Figtree-Bold", size: 14))
+                        .transition(.offset(x: 12).combined(with: .opacity))
+                }
+                if canvasSelected && !showLoadingText {
                     Image(systemName: "xmark")
                         .font(.system(size: 14, weight: .semibold))
                 } else {
-                    ContextUsageIcon(progress: contextProgress, color: contextColor)
+                    ContextUsageIcon(progress: contextProgress, color: contextColor, isSpinning: isWheelSpinning)
                 }
-                if !hasCanvasHover && !hasSelectedCanvasItems {
+                if !canvasHover && !canvasSelected && !showLoadingText {
                     Text("Context")
                         .font(.custom("Figtree-Bold", size: 14))
                         .transition(.offset(x: -12).combined(with: .opacity))
@@ -335,8 +378,9 @@ struct InquiryControlDock: View {
             }
             .frame(height: 16, alignment: .center)
             .foregroundColor(contextColor)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: hasCanvasHover)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: hasSelectedCanvasItems)
+            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: canvasHover)
+            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: canvasSelected)
+            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: showLoadingText)
         }
         .buttonStyle(.plain)
     }
@@ -515,18 +559,63 @@ struct InquiryControlDock: View {
 private struct ContextUsageIcon: View {
     let progress: CGFloat
     let color: Color
+    var isSpinning: Bool = false
+
+    private enum Phase { case idle, spinning, settling }
+
+    @State private var phase: Phase = .idle
+    @State private var startDate = Date()
+    @State private var settleAngle: Double = 0   // angle (deg) used while not actively spinning
+    @State private var arc: Double = 0           // 0 = progress ring, 1 = quarter spinner
+    @State private var settleTask: Task<Void, Never>? = nil
+
+    private let revDuration: Double = 1.1         // seconds per revolution
+    private let settleDuration: Double = 1.0
 
     var body: some View {
         ZStack {
             Circle()
                 .stroke(color.opacity(0.35), lineWidth: 1.5)
-            Circle()
-                .trim(from: 0, to: min(max(progress, 0), 1))
-                .stroke(color, style: StrokeStyle(lineWidth: 3, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-                .animation(.easeInOut(duration: 0.65), value: progress)
+            TimelineView(.animation(paused: phase == .idle)) { timeline in
+                let angle = phase == .spinning
+                    ? timeline.date.timeIntervalSince(startDate) * 360.0 / revDuration
+                    : settleAngle
+                let trimEnd = 0.25 * arc + Double(min(max(progress, 0), 1)) * (1 - arc)
+                Circle()
+                    .trim(from: 0, to: trimEnd)
+                    .stroke(color, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                    .rotationEffect(.degrees(-90 + angle))
+            }
         }
         .frame(width: 14, height: 14)
+        .onAppear { if isSpinning { beginSpin() } }
+        .onChange(of: isSpinning) { _, spinning in
+            if spinning { beginSpin() } else { endSpin() }
+        }
+    }
+
+    private func beginSpin() {
+        settleTask?.cancel()
+        startDate = Date()
+        phase = .spinning
+        withAnimation(.easeInOut(duration: 0.3)) { arc = 1 }
+    }
+
+    private func endSpin() {
+        // Continue clockwise to the next upright position, then morph the arc back to the ring.
+        let elapsed = Date().timeIntervalSince(startDate)
+        let current = elapsed * 360.0 / revDuration
+        let target = (current / 360.0).rounded(.up) * 360.0
+        settleAngle = current
+        phase = .settling
+        withAnimation(.easeOut(duration: settleDuration)) {
+            settleAngle = target
+            arc = 0
+        }
+        settleTask = Task {
+            try? await Task.sleep(for: .seconds(settleDuration))
+            if !Task.isCancelled { phase = .idle }
+        }
     }
 }
 
@@ -629,7 +718,7 @@ private struct ContextUsageCard: View {
                         Spacer()
                         Button("Clear", action: onClear)
                     }
-                    .font(.custom("Figtree-SemiBold", size: 14))
+                    .font(.custom("Figtree-Bold", size: 14))
                     .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
                     .buttonStyle(.plain)
                 }
@@ -637,7 +726,7 @@ private struct ContextUsageCard: View {
             }
         }
         .padding(isCompacting ? 14 : 32)
-        .frame(width: isCompacting ? 126 : 315, height: isCompacting ? 44 : nil)
+        .frame(width: isCompacting ? 126 : 355, height: isCompacting ? 44 : nil)
         .background(AquinasTheme.Colors.canvasSecondary)
         .clipShape(RoundedRectangle(cornerRadius: isCompacting ? 22 : 36, style: .continuous))
         .overlay(

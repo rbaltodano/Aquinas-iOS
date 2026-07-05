@@ -67,12 +67,12 @@ struct InsightLibraryPopup: View {
                             } else if value.translation.width > 42 {
                                 showPreviousInsight()
                             }
-                            withAnimation(.spring(response: 0.42, dampingFraction: 0.68)) {
+                            withAnimation(.insightCardBounce) {
                                 dragOffset = 0
                             }
                         }
                 )
-                .animation(.spring(response: 0.42, dampingFraction: 0.68), value: selectedIndex)
+                .animation(.insightCardBounce, value: selectedIndex)
 
                 InsightLibraryPager(
                     selectedIndex: selectedIndex,
@@ -83,8 +83,8 @@ struct InsightLibraryPopup: View {
             }
         }
         .padding(.horizontal, 24)
-        .padding(.top, 24)
-        .padding(.bottom, 12)
+        .padding(.top, 16)
+        .padding(.bottom, 8)
         .frame(maxWidth: .infinity)
         .background(AquinasTheme.Colors.canvas)
         .fixedSize(horizontal: false, vertical: true)
@@ -111,14 +111,14 @@ struct InsightLibraryPopup: View {
 
     private func showPreviousInsight() {
         guard pageCount > 0 else { return }
-        withAnimation(.spring(response: 0.42, dampingFraction: 0.68)) {
+        withAnimation(.insightCardBounce) {
             selectedIndex = max(0, selectedIndex - 1)
         }
     }
 
     private func showNextInsight() {
         guard pageCount > 0 else { return }
-        withAnimation(.spring(response: 0.42, dampingFraction: 0.68)) {
+        withAnimation(.insightCardBounce) {
             selectedIndex = min(pageCount - 1, selectedIndex + 1)
         }
     }
@@ -216,12 +216,12 @@ struct InsightLibraryCard: View {
                 .foregroundColor(AquinasTheme.Colors.paragraphText)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(24)
+        .padding(32)
         .frame(maxWidth: maxWidth)
-        .background(AquinasTheme.Colors.canvas)
-        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .background(AquinasTheme.Colors.canvasSecondary)
+        .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
+            RoundedRectangle(cornerRadius: 36, style: .continuous)
                 .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
         )
         .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 16)

@@ -40,6 +40,8 @@ final class CanvasModeModel {
     var canvasMidpointCenterRequest: Int = 0
     var canvasMidpointPlaceRequest: Int = 0
     var isCanvasMidpointMode: Bool = false
+    /// True while a just-placed midpoint insight is "generating" (loading on the canvas).
+    var isCanvasInsightGenerating: Bool = false
 
     /// Insight IDs the user promoted from the canvas into the conversation.
     var promotedCanvasInsightIDs: [UUID] = []

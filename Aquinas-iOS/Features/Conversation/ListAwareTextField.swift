@@ -17,6 +17,12 @@ import UIKit
 /// `relay.currentText()` just before submitting to get the latest typed value.
 final class TextInputRelay {
     var currentText: () -> String = { "" }
+    /// Replaces the entire buffer (e.g. inserting a picked slash command) and moves
+    /// the caret to the end, without blurring the field. Callers are responsible for
+    /// any follow-up state updates (placeholder emptiness, text-change bubbling).
+    var replaceAll: (String) -> Void = { _ in }
+    /// Moves keyboard focus into the underlying text view.
+    var focus: () -> Void = {}
 }
 
 // MARK: - ListAwareTextField
@@ -54,6 +60,7 @@ struct ListAwareTextField: UIViewRepresentable {
         tv.delegate = context.coordinator
         tv.font = font
         tv.textColor = textColor
+        tv.tintColor = textColor
         tv.textAlignment = textAlignment
         tv.backgroundColor = .clear
         tv.isScrollEnabled = false
@@ -65,12 +72,25 @@ struct ListAwareTextField: UIViewRepresentable {
         tv.autocapitalizationType = .sentences
         tv.returnKeyType = .default
         tv.typingAttributes = makeTypingAttributes()
-        tv.text = text.isEmpty ? nil : text
+        tv.text = text
         // Allow SwiftUI to compress the view horizontally — without this the
         // UITextView demands its ideal (unbounded) width and stretches the layout.
         tv.setContentHuggingPriority(.defaultLow, for: .horizontal)
         tv.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         relay?.currentText = { [weak tv] in tv?.text ?? "" }
+        relay?.replaceAll = { [weak tv] newText in
+            guard let tv else { return }
+            tv.text = newText
+            let end = tv.endOfDocument
+            tv.selectedTextRange = tv.textRange(from: end, to: end)
+            tv.invalidateIntrinsicContentSize()
+        }
+        relay?.focus = { [weak tv] in
+            guard let tv else { return }
+            tv.becomeFirstResponder()
+            let end = tv.endOfDocument
+            tv.selectedTextRange = tv.textRange(from: end, to: end)
+        }
         return tv
     }
 
@@ -101,8 +121,17 @@ struct ListAwareTextField: UIViewRepresentable {
         // Always safe to update visual properties
         if uiView.font != font { uiView.font = font }
         if uiView.textColor != textColor { uiView.textColor = textColor }
+        if uiView.tintColor != textColor { uiView.tintColor = textColor }
         if uiView.backgroundColor != .clear { uiView.backgroundColor = .clear }
-        if uiView.textAlignment != textAlignment { uiView.textAlignment = textAlignment }
+        if uiView.textAlignment != textAlignment {
+            UIView.transition(
+                with: uiView,
+                duration: 0.18,
+                options: [.transitionCrossDissolve, .allowUserInteraction]
+            ) {
+                uiView.textAlignment = textAlignment
+            }
+        }
         if uiView.isEditable == isLocked {
             uiView.isEditable   = !isLocked
             uiView.isSelectable = !isLocked
@@ -118,7 +147,7 @@ struct ListAwareTextField: UIViewRepresentable {
             let bindingText = text
             if (uiView.text ?? "") != bindingText {
                 if bindingText.isEmpty {
-                    uiView.text = nil
+                    uiView.text = ""
                 } else {
                     uiView.attributedText = NSAttributedString(string: bindingText, attributes: makeTypingAttributes())
                 }
@@ -126,6 +155,19 @@ struct ListAwareTextField: UIViewRepresentable {
         }
         // Refresh relay so it always points at the live UITextView.
         relay?.currentText = { [weak uiView] in uiView?.text ?? "" }
+        relay?.replaceAll = { [weak uiView] newText in
+            guard let uiView else { return }
+            uiView.text = newText
+            let end = uiView.endOfDocument
+            uiView.selectedTextRange = uiView.textRange(from: end, to: end)
+            uiView.invalidateIntrinsicContentSize()
+        }
+        relay?.focus = { [weak uiView] in
+            guard let uiView else { return }
+            uiView.becomeFirstResponder()
+            let end = uiView.endOfDocument
+            uiView.selectedTextRange = uiView.textRange(from: end, to: end)
+        }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
@@ -233,14 +275,25 @@ struct ListAwareTextField: UIViewRepresentable {
             tv.invalidateIntrinsicContentSize()
         }
 
+        func textViewShouldEndEditing(_ tv: UITextView) -> Bool {
+            flushText(tv)
+            return true
+        }
+
         func textViewDidEndEditing(_ tv: UITextView) {
-            // Flush once when focus leaves
-            parent.text = tv.text ?? ""
+            // Flush once when focus leaves, then re-sync placeholder visibility with
+            // the final UIKit buffer in case no change event fired during blur.
+            flushText(tv)
+            parent.onTextChange?(tv.text ?? "")
             parent.onFocusChange(false)
         }
 
         func textViewDidBeginEditing(_ tv: UITextView) {
             parent.onFocusChange(true)
+        }
+
+        private func flushText(_ tv: UITextView) {
+            parent.text = tv.text ?? ""
         }
     }
 }

@@ -51,10 +51,10 @@ struct SettingsView: View {
                                         "",
                                         text: $userName,
                                         prompt: Text("John Appleseed")
-                                            .foregroundColor(AquinasTheme.Colors.paragraphText)
+                                            .foregroundColor(AquinasTheme.Colors.placeholderText)
                                     )
                                     .font(.custom("Figtree-Regular", size: 14))
-                                    .foregroundColor(AquinasTheme.Colors.paragraphText)
+                                    .foregroundColor(AquinasTheme.Colors.headingText)
                                     .tint(AquinasTheme.Colors.secondaryMuted)
                                     .multilineTextAlignment(.trailing)
                                     .frame(width: 180, alignment: .trailing)

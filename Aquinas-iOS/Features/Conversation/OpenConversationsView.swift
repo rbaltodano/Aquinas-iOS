@@ -15,10 +15,17 @@ struct OpenConversationsView: View {
     var onSelectConversation: (InquiryConversation) -> Void
     var onNewChat: () -> Void
     var onRenameConversation: (InquiryConversation, String) -> Void
+    var onPinConversation: (InquiryConversation) -> Void
+    var onUnpinConversation: (InquiryConversation) -> Void
+    var onAddConversationToStudyTopic: (InquiryConversation, UUID) -> Void
+    var onRemoveConversationFromStudyTopic: (InquiryConversation) -> Void
+    var onDeleteConversation: (InquiryConversation) -> Void
 
     @State private var searchText = ""
     @State private var activeInsight: ConceptDefinition? = nil
     @State private var conversationBeingRenamed: InquiryConversation? = nil
+    @State private var conversationBeingAddedToStudyTopic: InquiryConversation? = nil
+    @State private var deletingConversationIDs: Set<UUID> = []
     @State private var renameDraft = ""
 
     private var normalizedSearchText: String {
@@ -62,11 +69,34 @@ struct OpenConversationsView: View {
                                         renameDraft = conversation.title
                                         conversationBeingRenamed = conversation
                                     },
+                                    onPin: { conversation in
+                                        onPinConversation(conversation)
+                                    },
+                                    onUnpin: { conversation in
+                                        onUnpinConversation(conversation)
+                                    },
+                                    onAddToStudyTopic: { conversation in
+                                        conversationBeingAddedToStudyTopic = conversation
+                                    },
+                                    onRemoveFromStudyTopic: { conversation in
+                                        onRemoveConversationFromStudyTopic(conversation)
+                                    },
+                                    onDelete: { conversation in
+                                        deleteConversationCard(conversation)
+                                    },
+                                )
+                                .opacity(deletingConversationIDs.contains(conversation.id) ? 0 : 1)
+                                .blur(radius: deletingConversationIDs.contains(conversation.id) ? 12 : 0)
+                                .scaleEffect(deletingConversationIDs.contains(conversation.id) ? 0.96 : 1)
+                                .allowsHitTesting(!deletingConversationIDs.contains(conversation.id))
+                                .animation(
+                                    .easeInOut(duration: 0.22),
+                                    value: deletingConversationIDs.contains(conversation.id)
                                 )
                                 .transition(
                                     .asymmetric(
                                         insertion: .opacity.combined(with: .move(edge: .bottom)),
-                                        removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .top))
+                                        removal: .opacity.combined(with: .scale(scale: 0.96, anchor: .top))
                                     )
                                 )
                             }
@@ -79,6 +109,16 @@ struct OpenConversationsView: View {
                 .padding(.horizontal, 24)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            LinearGradient(
+                colors: [AquinasTheme.Colors.canvas.opacity(0), AquinasTheme.Colors.canvas],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: 350)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            .allowsHitTesting(false)
+            .ignoresSafeArea()
 
             // Sticky side-menu trigger — floats above the scroll content.
             VStack {
@@ -116,9 +156,21 @@ struct OpenConversationsView: View {
         }
         .sheet(item: $activeInsight) { insight in
             ConceptSheetContent(concept: insight, collectedDefinitions: $savedInsights)
-                .presentationDetents([.fraction(0.45)])
+                .presentationDetents([.height(340), .large])
                 .presentationDragIndicator(.visible)
                 .presentationBackground(AquinasTheme.Colors.canvas)
+        }
+        .sheet(item: $conversationBeingAddedToStudyTopic) { conversation in
+            SideMenuStudyTopicPickerSheet(
+                conversation: conversation,
+                onSelectTopic: { topic in
+                    onAddConversationToStudyTopic(conversation, topic.id)
+                    conversationBeingAddedToStudyTopic = nil
+                }
+            )
+            .presentationDetents([.height(420), .large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(AquinasTheme.Colors.canvas)
         }
         .alert("Rename Conversation", isPresented: renamePromptBinding) {
             TextField("Conversation name", text: $renameDraft)
@@ -148,6 +200,19 @@ struct OpenConversationsView: View {
                 }
             }
         )
+    }
+
+    private func deleteConversationCard(_ conversation: InquiryConversation) {
+        guard !deletingConversationIDs.contains(conversation.id) else { return }
+
+        deletingConversationIDs.insert(conversation.id)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
+                onDeleteConversation(conversation)
+            }
+            deletingConversationIDs.remove(conversation.id)
+        }
     }
 
     private func latestAnswer(in conversation: InquiryConversation) -> String {
@@ -265,7 +330,12 @@ struct OpenConversationCard: View {
     let insights: [ConceptDefinition]
     var onSelect: () -> Void
     var onOpenInsight: (ConceptDefinition) -> Void
-    var onRename: (InquiryConversation) -> Void
+    var onRename: ((InquiryConversation) -> Void)? = nil
+    var onPin: ((InquiryConversation) -> Void)? = nil
+    var onUnpin: ((InquiryConversation) -> Void)? = nil
+    var onAddToStudyTopic: ((InquiryConversation) -> Void)? = nil
+    var onRemoveFromStudyTopic: ((InquiryConversation) -> Void)? = nil
+    var onDelete: ((InquiryConversation) -> Void)? = nil
 
     @State private var isExpanded = false
 
@@ -277,26 +347,57 @@ struct OpenConversationCard: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .center, spacing: 12) {
                 Text(conversation.title)
-                    .font(.custom("Figtree-Bold", size: 14))
+                    .font(AquinasTheme.Typography.uiHeading)
                     .foregroundColor(AquinasTheme.Colors.primaryReadable)
                     .lineLimit(1)
                     .truncationMode(.tail)
 
                 Spacer(minLength: 8)
 
-                Menu {
-                    Button("Rename", systemImage: "pencil.line") { onRename(conversation) }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundColor(AquinasTheme.Colors.paragraphText)
-                        .frame(width: 22, height: 22)
+                if hasConversationOptions {
+                    Menu {
+                        if let onRename {
+                            Button("Rename", systemImage: "pencil.line") { onRename(conversation) }
+                        }
+
+                        if conversation.isPinned {
+                            if let onUnpin {
+                                Button("Unpin", systemImage: "pin.slash") { onUnpin(conversation) }
+                            }
+                        } else if let onPin {
+                            Button("Pin", systemImage: "pin") { onPin(conversation) }
+                        }
+
+                        if conversation.studyTopicID != nil {
+                            if let onRemoveFromStudyTopic {
+                                Button("Remove from Study Topic", systemImage: "book.closed") {
+                                    onRemoveFromStudyTopic(conversation)
+                                }
+                            }
+                        } else if let onAddToStudyTopic {
+                            Button("Add to Study Topic", systemImage: "book.closed") {
+                                onAddToStudyTopic(conversation)
+                            }
+                        }
+
+                        if let onDelete {
+                            Divider()
+                            Button("Delete", systemImage: "trash", role: .destructive) {
+                                onDelete(conversation)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundColor(AquinasTheme.Colors.paragraphText)
+                            .frame(width: 22, height: 22)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(11)
+                    .contentShape(Rectangle())
+                    .padding(-11)
+                    .accessibilityLabel("Conversation options")
                 }
-                .buttonStyle(.plain)
-                .padding(11)
-                .contentShape(Rectangle())
-                .padding(-11)
-                .accessibilityLabel("Conversation options")
             }
 
             Text(latestAnswer)
@@ -344,14 +445,23 @@ struct OpenConversationCard: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 24)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(AquinasTheme.Colors.componentBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(AquinasTheme.Colors.canvasSecondary)
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
         )
-        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .onTapGesture(perform: onSelect)
+    }
+
+    private var hasConversationOptions: Bool {
+        onRename != nil ||
+        onPin != nil ||
+        onUnpin != nil ||
+        onAddToStudyTopic != nil ||
+        onRemoveFromStudyTopic != nil ||
+        onDelete != nil
     }
 }
 
@@ -361,12 +471,12 @@ struct InsightLine: View {
     var body: some View {
         HStack(spacing: 7) {
             Image(systemName: "text.bubble.fill")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundColor(AquinasTheme.Colors.lightGreen)
-                .frame(width: 13, height: 13)
+                .frame(width: 14, height: 14)
 
             Text(word)
-                .font(.custom("Figtree-Bold", size: 12))
+                .font(.figtreeHeading2)
                 .foregroundColor(AquinasTheme.Colors.lightGreen)
                 .lineLimit(1)
                 .truncationMode(.tail)

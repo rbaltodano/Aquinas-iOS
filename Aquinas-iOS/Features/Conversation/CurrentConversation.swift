@@ -26,6 +26,8 @@ struct CurrentConversationView: View {
     @Binding var sideMenuActiveConversationID: UUID?
     @Binding var requestedConversationID:      UUID?
     @Binding var newConversationRequest:       Int
+    @Binding var pendingNewConversationQuestion: String
+    @Binding var pendingNewConversationEyebrow: String
     /// Set by ContentView before incrementing `newConversationRequest` when the
     /// user taps "New Conversation" inside a study topic. The new conversation
     /// is tagged with this ID, then the binding is cleared.
@@ -41,6 +43,7 @@ struct CurrentConversationView: View {
     let inputFont: ConversationFontOption
     let responseTextAlignment: ResponseTextAlignmentOption
     let responseFont: ConversationFontOption
+    let userName: String
 
     // MARK: Conversation list (source of truth for side menu)
     @State private var conversations: [InquiryConversation] = []
@@ -58,12 +61,27 @@ struct CurrentConversationView: View {
     // MARK: Scroll / upload helpers
     @State private var externalSubmitTrigger: Int = 0
     @State private var scrollToBottomRequest: Int = 0
+    @State private var scrollToTopRequest: Int = 0
     // Stores the scroll anchor that was most recently focused so the
     // keyboardDidShow handler can re-scroll after the system auto-scroll fires.
     @State private var lastFocusedAnchor: String? = nil
     @State private var miniScrollButtonVisibilityRelay = MiniScrollButtonVisibilityRelay()
+    @State private var isBranchScrolledToTop: Bool = true
     @State private var isKeyboardOpen: Bool = false
     @State private var hasTextToSubmit: Bool = false
+    /// True while the focused composer holds a bare "/token" — shows the slash-command card.
+    @State private var isSlashCommandContext: Bool = false
+    /// Live mirror of the typed "/token" for the picker header. Held as a plain reference so
+    /// per-keystroke updates re-render only the picker, not this whole conversation view.
+    @State private var slashQuery = SlashCommandQuery()
+    /// Command text to insert into the focused field, applied when `insertCommandRequest` bumps.
+    @State private var commandToInsert: String = ""
+    @State private var insertCommandRequest: Int = 0
+    @State private var undiscoveredInsightCount: Int = 0
+    /// Number of branch responses currently generating; drives the context wheel spinner.
+    @State private var pendingResponseCount: Int = 0
+    @State private var activeEmptyPromptEyebrow: String = ""
+    @State private var activeEmptyPromptQuestion: String = ""
     @Binding var uploadedFiles: [UploadedFile]
     @State private var targetSpawnY: CGFloat = 300
     @State private var targetSpawnResponseIndex: Int? = nil
@@ -101,6 +119,25 @@ struct CurrentConversationView: View {
     // MARK: Canvas helpers
     private var activeTitle: String {
         conversations.first { $0.id == activeConversationID }?.title ?? "New Conversation"
+    }
+
+    private var displayUserName: String {
+        let trimmedName = userName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedName.isEmpty ? "Ryan" : trimmedName
+    }
+
+    private var topConversationChromeOpacity: Double {
+        isBranchScrolledToTop && !canvasMode.isTopicCanvasVisible ? 0 : 1
+    }
+
+    private var isNewConversationPromptMode: Bool {
+        guard activeBranches.count == 1, let branch = activeBranches.first else { return false }
+        return !branch.topQuestionSubmitted
+            && branch.parentBranchID == nil
+            && branch.startingConcept == nil
+            && branch.duplicatedResponse == nil
+            && branch.activeChatBlocks.isEmpty
+            && !branch.showBottomInput
     }
 
     private func stableQuestionInsightID(for text: String) -> UUID {
@@ -158,6 +195,12 @@ struct CurrentConversationView: View {
 
     private var hasSelectedCanvasItems: Bool {
         canvasMode.canvasSelectedItemCount > 0
+    }
+
+    private func refreshUndiscoveredInsightCountAfterResponse() {
+        let currentInsightIDs = conversationInsights.map(\.id)
+        _ = InsightDiscoveryStore.markNewInsightsUndiscovered(currentInsightIDs)
+        undiscoveredInsightCount = InsightDiscoveryStore.visibleUndiscoveredCount(for: currentInsightIDs)
     }
 
     private func contextWordCount(in branches: [ChatBranch]) -> Int {
@@ -228,6 +271,19 @@ struct CurrentConversationView: View {
         }
     }
 
+    private func enterCanvasMode() {
+        UIApplication.shared.sendAction(
+            #selector(UIResponder.resignFirstResponder),
+            to: nil,
+            from: nil,
+            for: nil
+        )
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+            isKeyboardOpen = false
+            canvasMode.isTopicCanvasVisible = true
+        }
+    }
+
     private func forkCanvasInsight(_ concept: ConceptDefinition) {
         closeTopicCanvas()
         requestedForkConcept = concept
@@ -263,11 +319,17 @@ struct CurrentConversationView: View {
             onInquireConnectionConcepts: { c1, c2 in
                 canvasMode.canvasConnectionConcepts = (c1, c2)
                 closeTopicCanvas()
+                Task {
+                    try? await Task.sleep(for: .milliseconds(180))
+                    scrollToBottomRequest += 1
+                }
             },
             midpointEnterRequest: canvasMode.canvasMidpointEnterRequest,
             midpointCenterRequest: canvasMode.canvasMidpointCenterRequest,
             midpointPlaceRequest: canvasMode.canvasMidpointPlaceRequest,
             onMidpointModeChange: { canvasMode.isCanvasMidpointMode = $0 },
+            onMidpointGeneratingChange: { canvasMode.isCanvasInsightGenerating = $0 },
+            onUndiscoveredInsightCountChange: { undiscoveredInsightCount = $0 },
             inputFont: inputFont,
             conversationFontSize: conversationFontSize,
             showQuestionBar: false
@@ -296,6 +358,23 @@ struct CurrentConversationView: View {
     }
 
     @ViewBuilder
+    /// The slash-command card shows while the keyboard is up and the composer holds a
+    /// bare "/token", in Branch mode (not the topic canvas).
+    private var showSlashCommandMenu: Bool {
+        isKeyboardOpen && isSlashCommandContext && !canvasMode.isTopicCanvasVisible
+    }
+
+    /// A command was tapped — insert it into the focused field and dismiss the card.
+    private func selectSlashCommand(_ command: SlashCommand) {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        commandToInsert = command.name + " "
+        insertCommandRequest += 1
+        hasTextToSubmit = true
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
+            isSlashCommandContext = false
+        }
+    }
+
     private var bottomInquiryControlDock: some View {
         InquiryControlDock(
             isCanvasMode: canvasMode.isTopicCanvasVisible,
@@ -319,7 +398,13 @@ struct CurrentConversationView: View {
                     isInsightLibraryOpen = true
                 }
             },
-            onSend: { externalSubmitTrigger += 1 },
+            onSend: {
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                    hasTextToSubmit = false
+                    isKeyboardOpen = false
+                }
+                externalSubmitTrigger += 1
+            },
             onSelectCanvasItem: { canvasMode.canvasSelectionRequest += 1 },
             onCreateCanvasConcept: { canvasMode.canvasCreateConceptRequest += 1 },
             onInquireConnection: { canvasMode.canvasInquireConnectionRequest += 1 },
@@ -329,6 +414,8 @@ struct CurrentConversationView: View {
             },
             onMidpointConcepts: { canvasMode.canvasMidpointEnterRequest += 1 },
             isMidpointMode: canvasMode.isCanvasMidpointMode,
+            isCanvasInsightLoading: canvasMode.isCanvasInsightGenerating,
+            isResponseLoading: pendingResponseCount > 0,
             onMidpointCenter: { canvasMode.canvasMidpointCenterRequest += 1 },
             onMidpointPlace: { canvasMode.canvasMidpointPlaceRequest += 1 },
             onClearCanvasSelection: { canvasMode.canvasClearSelectionRequest += 1 },
@@ -352,14 +439,16 @@ struct CurrentConversationView: View {
                 // Top fade gradient, independent of the nav bar.
                 LinearGradient(
                     stops: [
-                        Gradient.Stop(color: Color(red: 0.07, green: 0.06, blue: 0.05).opacity(0.97), location: 0.00),
-                        Gradient.Stop(color: Color(red: 0.07, green: 0.06, blue: 0.05).opacity(0), location: 1.00),
+                        Gradient.Stop(color: AquinasTheme.Colors.canvas.opacity(0.97), location: 0.00),
+                        Gradient.Stop(color: AquinasTheme.Colors.canvas.opacity(0), location: 1.00),
                     ],
                     startPoint: UnitPoint(x: 0.5, y: 0.33),
                     endPoint: UnitPoint(x: 0.5, y: 1)
                 )
                 .frame(height: 150)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .opacity(topConversationChromeOpacity)
+                .animation(.easeInOut(duration: 0.28), value: topConversationChromeOpacity)
                 .allowsHitTesting(false)
 
                 // Bottom fade gradient (hidden in canvas mode)
@@ -387,9 +476,7 @@ struct CurrentConversationView: View {
                 if !canvasMode.isTopicCanvasVisible {
                     RightEdgeCanvasSwipeTrigger {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                            canvasMode.isTopicCanvasVisible = true
-                        }
+                        enterCanvasMode()
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .zIndex(1)
@@ -398,16 +485,14 @@ struct CurrentConversationView: View {
                 // Top bar (replaces simple AquinasNavButton HStack)
                 BranchModeTopBar(
                     isCanvasMode: canvasMode.isTopicCanvasVisible,
-                    title: activeTitle,
+                    title: isNewConversationPromptMode ? "" : activeTitle,
+                    titleOpacity: topConversationChromeOpacity,
+                    insightTreeUpdateCount: undiscoveredInsightCount,
                     isEditingTitle: $isEditingTitle,
                     titleDraft: $titleEditDraft,
                     conversationFontSize: conversationFontSize,
                     onMenuTap: onOpenMenu,
-                    onCanvasTap: {
-                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                            canvasMode.isTopicCanvasVisible = true
-                        }
-                    },
+                    onCanvasTap: enterCanvasMode,
                     onBackTap: {
                         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
                             canvasMode.isTopicCanvasVisible = false
@@ -422,6 +507,7 @@ struct CurrentConversationView: View {
                     }
                 )
                 .zIndex(2)
+                .animation(.easeInOut(duration: 0.28), value: topConversationChromeOpacity)
             }
             .onAppear {
                 viewportSize = geo.size
@@ -459,6 +545,7 @@ struct CurrentConversationView: View {
         )) { _ in
             withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
                 isKeyboardOpen = false
+                isSlashCommandContext = false
             }
         }
         .photosPicker(
@@ -716,7 +803,21 @@ struct CurrentConversationView: View {
         let bottomRunwayHeight = stableViewportHeight * (isKeyboardOpen ? 0.85 : 0.35)
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: false) {
-	                ChatThreadColumn(
+                Color.clear
+                    .frame(width: 1, height: 1)
+                    .background(
+                        GeometryReader { topGeo in
+                            Color.clear
+                                .onAppear {
+                                    updateTopState(for: b.id, minY: topGeo.frame(in: .named("BranchScroll-\(b.id)")).minY)
+                                }
+                                .onChange(of: topGeo.frame(in: .named("BranchScroll-\(b.id)")).minY) { _, newMinY in
+                                    updateTopState(for: b.id, minY: newMinY)
+                                }
+                        }
+                    )
+
+                ChatThreadColumn(
                     branchData: branch,
                     branchAnchor: "branch-top-\(b.id)",
                     targetSpawnY: $targetSpawnY,
@@ -730,6 +831,10 @@ struct CurrentConversationView: View {
                     inputFont: inputFont,
                     responseTextAlignment: responseTextAlignment,
                     responseFont: responseFont,
+                    emptyStateUserName: displayUserName,
+                    emptyStateEyebrow: activeEmptyPromptEyebrow,
+                    emptyStatePromptQuestion: activeEmptyPromptQuestion,
+                    showsThinkingIntro: isThinkingEnabled,
                     onSpawnYChange: { _, _ in },
                     onDuplicateResponse: { text, index in
                         let newBranch = ChatBranch(
@@ -756,18 +861,37 @@ struct CurrentConversationView: View {
                     onBottomInputFocused: {
                         lastFocusedAnchor = "bottom-input-anchor-\(b.id)"
                     },
-	                onActiveInputTextChange: { text in
-	                    guard b.id == effectiveFocusedID else { return }
-	                    hasTextToSubmit = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-	                },
+                    onActiveInputTextChange: { text in
+                        guard b.id == effectiveFocusedID else { return }
+                        hasTextToSubmit = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        // Slash-command context: the field holds a bare "/token" (no space yet).
+                        // Only updates @State on the boundary crossing, so typing stays lag-free.
+                        let slash = text.hasPrefix("/") && !text.contains(" ") && !text.contains("\n")
+                        if slash { slashQuery.text = text }   // re-renders only the picker
+                        if slash != isSlashCommandContext {
+                            withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
+                                isSlashCommandContext = slash
+                            }
+                        }
+                    },
+                    insertCommandRequest: b.id == effectiveFocusedID ? insertCommandRequest : 0,
+                    commandToInsert: commandToInsert,
+                    showsSlashCommandMenu: b.id == effectiveFocusedID && showSlashCommandMenu,
+                    slashCommandQuery: slashQuery,
+                    onSelectSlashCommand: selectSlashCommand,
                     onQuoteHandled: { attachedConcept = nil },
                     connectionConcepts: b.id == effectiveFocusedID ? canvasMode.canvasConnectionConcepts : nil,
                     onConnectionHandled: { canvasMode.canvasConnectionConcepts = nil },
                     onResponseCompleted: {
                         displayedContextWordCount = contextWordCount(in: activeBranches)
+                        pendingResponseCount = max(0, pendingResponseCount - 1)
+                        refreshUndiscoveredInsightCountAfterResponse()
+                    },
+                    onResponseStarted: {
+                        pendingResponseCount += 1
                     }
-	                )
-	                .padding(.horizontal, 16)
+                )
+                .padding(.horizontal, 36)
 
                 // Extra scroll runway lets focused question fields sit higher on screen,
                 // leaving room to see recent responses above the keyboard.
@@ -799,6 +923,12 @@ struct CurrentConversationView: View {
                     proxy.scrollTo("branch-bottom-\(b.id)", anchor: .bottom)
                 }
             }
+            .onChange(of: scrollToTopRequest) { _, _ in
+                guard b.id == effectiveFocusedID else { return }
+                withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
+                    proxy.scrollTo("branch-top-\(b.id)", anchor: .top)
+                }
+            }
             // keyboardDidShow fires AFTER the system's own auto-scroll completes,
             // so this override always wins and places the field at the top.
             .onReceive(NotificationCenter.default.publisher(
@@ -825,62 +955,83 @@ struct CurrentConversationView: View {
         )
     }
 
+    private func updateTopState(for branchID: UUID, minY: CGFloat) {
+        guard branchID == effectiveFocusedID else { return }
+        let atTop = minY >= -8
+        guard isBranchScrolledToTop != atTop else { return }
+        isBranchScrolledToTop = atTop
+    }
+
     // MARK: - Insight sheet
 
     @ViewBuilder
     private func insightSheet(for sheetData: InsightWord) -> some View {
-        VStack(spacing: 0) {
-            if let concept = dynamicDefinition {
-                ConceptSheetContent(
-                    concept: concept,
-                    collectedDefinitions: $collectedDefinitions,
-                    onInquireFurther: {
-                        withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
-                            attachedConcept = concept
-                            if focusedBranchID == nil {
-                                focusedBranchID = activeBranches.first?.id
-                            }
-                        }
-                        Task {
-                            try? await Task.sleep(for: .milliseconds(180))
-                            scrollToBottomRequest += 1
-                        }
-                    },
-                    onNewConversation: {
-                        let newBranch = ChatBranch(
-                            startingConcept: concept,
-                            parentBranchID: effectiveFocusedID,
-                            parentResponseIndex: targetSpawnResponseIndex,
-                            yOffset: targetSpawnY
-                        )
-                        withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
-                            insertBranch(newBranch, after: effectiveFocusedID)
-                        }
+        let isSaved = dynamicDefinition.map { c in
+            collectedDefinitions.contains(where: { $0.word == c.word })
+        } ?? false
+
+        return DynamicInsightSheetCard(
+            word: sheetData.text,
+            concept: dynamicDefinition,
+            isSaved: isSaved,
+            onQuote: {
+                guard let concept = dynamicDefinition else { return }
+                activeSheetWord = nil
+                withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
+                    attachedConcept = concept
+                    if focusedBranchID == nil {
+                        focusedBranchID = activeBranches.first?.id
                     }
+                }
+                Task {
+                    try? await Task.sleep(for: .milliseconds(180))
+                    scrollToBottomRequest += 1
+                }
+            },
+            onFork: {
+                guard let concept = dynamicDefinition else { return }
+                activeSheetWord = nil
+                let newBranch = ChatBranch(
+                    startingConcept: concept,
+                    parentBranchID: effectiveFocusedID,
+                    parentResponseIndex: targetSpawnResponseIndex,
+                    yOffset: targetSpawnY
                 )
-                .transition(.opacity.combined(with: .scale(scale: 0.95)))
-                .onPreferenceChange(InsightSheetContentHeightKey.self) { h in
-                    insightSheetContentHeight = h
+                withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
+                    insertBranch(newBranch, after: effectiveFocusedID)
                 }
-            } else {
-                VStack(spacing: 16) {
-                    ProgressView()
-                        .tint(AquinasTheme.Colors.secondaryMuted)
-                        .scaleEffect(1.2)
-                    Text("Generating insight for \"\(sheetData.text.capitalized)\"…")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(AquinasTheme.Colors.secondaryMuted)
+            },
+            onToggleSaved: {
+                guard let concept = dynamicDefinition else { return }
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                    if collectedDefinitions.contains(where: { $0.word == concept.word }) {
+                        collectedDefinitions.removeAll(where: { $0.word == concept.word })
+                    } else {
+                        collectedDefinitions.append(concept)
+                    }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(AquinasTheme.Colors.canvas)
             }
-        }
+        )
+        .padding(.horizontal, 24)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .top)
+        .background(
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: InsightSheetContentHeightKey.self,
+                    value: geometry.size.height
+                )
+            }
+        )
         .frame(maxWidth: .infinity)
         .background(AquinasTheme.Colors.canvas)
-        .presentationDetents([.height(dynamicDefinition == nil ? 150 : insightSheetHeight)])
+        .onPreferenceChange(InsightSheetContentHeightKey.self) { h in
+            insightSheetContentHeight = h
+        }
+        .presentationDetents([.height(insightSheetHeight)])
         .presentationDragIndicator(.visible)
         .presentationBackground(AquinasTheme.Colors.canvas)
-        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: dynamicDefinition != nil)
+        .animation(.insightCardBounce, value: insightSheetHeight)
     }
 
     // MARK: - Branch management
@@ -946,6 +1097,8 @@ struct CurrentConversationView: View {
         activeBranches = nextBranches
         displayedContextWordCount = contextWordCount(in: nextBranches)
         canvasMode.promotedCanvasInsightIDs = conversation.promotedInsightIDs
+        activeEmptyPromptEyebrow = ""
+        activeEmptyPromptQuestion = ""
         focusedBranchID = activeBranches.first?.id
         publishShellMenuState()
         persistConversations()
@@ -960,6 +1113,9 @@ struct CurrentConversationView: View {
         activeBranches = freshBranches
         focusedBranchID = freshBranches.first?.id
         displayedContextWordCount = 0
+        undiscoveredInsightCount = 0
+        activeEmptyPromptEyebrow = ""
+        activeEmptyPromptQuestion = ""
         canvasMode.promotedCanvasInsightIDs = []
         attachedConcept = nil
         uploadedFiles.removeAll()
@@ -989,22 +1145,38 @@ struct CurrentConversationView: View {
         // Consume any study-topic flag set by a "New Study Topic" action.
         let isStudyTopic = newConversationIsStudyTopic
         newConversationIsStudyTopic = false
+        let pendingQuestion = pendingNewConversationQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pendingEyebrow = pendingNewConversationEyebrow.trimmingCharacters(in: .whitespacesAndNewlines)
+        pendingNewConversationQuestion = ""
+        pendingNewConversationEyebrow = ""
+        let freshBranch = ChatBranch(startingConcept: nil)
         let fresh = InquiryConversation(isStudyTopic: isStudyTopic, studyTopicID: topicID)
         conversations.insert(fresh, at: 0)
         activeConversationID = fresh.id
-        activeBranches = [ChatBranch(startingConcept: nil)]
+        activeBranches = [freshBranch]
+        activeEmptyPromptEyebrow = pendingEyebrow
+        activeEmptyPromptQuestion = pendingQuestion
         displayedContextWordCount = 0
+        hasTextToSubmit = false
         canvasMode.promotedCanvasInsightIDs = []
         focusedBranchID = activeBranches.first?.id
         publishShellMenuState()
         persistConversations()
-        scrollToBottomAfterLayout()
+        scrollToTopAfterLayout()
     }
 
     private func scrollToBottomAfterLayout() {
         Task {
             try? await Task.sleep(for: .milliseconds(120))
             scrollToBottomRequest += 1
+        }
+    }
+
+    private func scrollToTopAfterLayout() {
+        Task {
+            try? await Task.sleep(for: .milliseconds(120))
+            isBranchScrolledToTop = true
+            scrollToTopRequest += 1
         }
     }
 
@@ -1034,6 +1206,8 @@ struct CurrentConversationView: View {
 private struct BranchModeTopBar: View {
     let isCanvasMode: Bool
     let title: String
+    let titleOpacity: Double
+    let insightTreeUpdateCount: Int
     @Binding var isEditingTitle: Bool
     @Binding var titleDraft: String
     let conversationFontSize: ConversationFontSizeOption
@@ -1057,7 +1231,7 @@ private struct BranchModeTopBar: View {
             // Normal mode layout
             HStack(spacing: 0) {
                 AquinasNavButton(onMenuTap: onMenuTap)
-                    .frame(width: 72, alignment: .leading)
+                    .frame(width: 88, alignment: .leading)
                 Spacer(minLength: 8)
                 Group {
                     if isEditingTitle {
@@ -1076,7 +1250,8 @@ private struct BranchModeTopBar: View {
                             .font(.custom("LibreBaskerville-Regular", size: titleFontSize))
                             .foregroundColor(AquinasTheme.Colors.primaryReadable)
                             .lineLimit(1)
-                            .matchedGeometryEffect(id: "conversationTitle", in: titleNamespace, isSource: !isCanvasMode)
+                            .id(title)
+                            .transition(.blurredTitleReplacement)
                             .onTapGesture {
                                 titleDraft = title
                                 isEditingTitle = true
@@ -1085,48 +1260,29 @@ private struct BranchModeTopBar: View {
                     }
                 }
                 .frame(maxWidth: .infinity)
+                .opacity(titleOpacity)
+                .animation(.easeOut(duration: 0.22), value: title)
                 Spacer(minLength: 8)
-                CanvasModeToggleButton(isActive: false, action: onCanvasTap)
-                    .frame(width: 72, alignment: .trailing)
+                CanvasModeToggleButton(isActive: false, updateCount: insightTreeUpdateCount, action: onCanvasTap)
+                    .matchedGeometryEffect(id: "canvasModeButton", in: titleNamespace, isSource: !isCanvasMode)
+                    .frame(width: 88, alignment: .trailing)
             }
             .padding(.horizontal, 24)
             .padding(.top, 24)
             .opacity(isCanvasMode ? 0 : 1)
+            .offset(x: isCanvasMode ? -96 : 0)
+            .allowsHitTesting(!isCanvasMode)
 
             // Canvas mode layout
             HStack {
-                Button(action: onBackTap) {
-                    HStack(alignment: .center, spacing: 16) {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: titleFontSize * 0.8, weight: .semibold))
-                            .opacity(isCanvasMode ? 1 : 0)
-                        Text(title)
-                            .font(.custom("LibreBaskerville-Regular", size: titleFontSize * 0.8))
-                            .lineLimit(1)
-                            .matchedGeometryEffect(id: "conversationTitle", in: titleNamespace, isSource: isCanvasMode)
-                    }
-                    .foregroundColor(AquinasTheme.Colors.primaryReadable)
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 18)
-                    .background(
-                        AquinasTheme.Colors.canvasSecondary
-                            .cornerRadius(48)
-                            .opacity(isCanvasMode ? 1 : 0)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 48)
-                            .inset(by: 0.5)
-                            .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
-                            .opacity(isCanvasMode ? 1 : 0)
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 48))
-                }
-                .buttonStyle(.plain)
-                .opacity(isCanvasMode ? 1 : 0)
+                CanvasModeToggleButton(isActive: true, updateCount: insightTreeUpdateCount, action: onBackTap)
+                    .matchedGeometryEffect(id: "canvasModeButton", in: titleNamespace, isSource: isCanvasMode)
+                    .opacity(isCanvasMode ? 1 : 0)
                 Spacer()
             }
             .padding(.horizontal, 24)
             .padding(.top, 24)
+            .allowsHitTesting(isCanvasMode)
         }
         .frame(maxWidth: .infinity, alignment: .top)
     }

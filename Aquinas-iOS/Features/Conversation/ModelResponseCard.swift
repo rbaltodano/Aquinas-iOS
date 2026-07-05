@@ -15,6 +15,7 @@ struct ModelResponseCard: View {
     let title: String
     let fullText: String
     let shouldAnimateOnAppear: Bool
+    let showsThinkingIntro: Bool
     let responseTextAlignment: ResponseTextAlignmentOption
     let responseFont: ConversationFontOption
     let conversationFontSize: ConversationFontSizeOption
@@ -40,6 +41,7 @@ struct ModelResponseCard: View {
         title: String,
         fullText: String,
         shouldAnimateOnAppear: Bool = true,
+        showsThinkingIntro: Bool = true,
         responseTextAlignment: ResponseTextAlignmentOption = .center,
         responseFont: ConversationFontOption = .sans,
         conversationFontSize: ConversationFontSizeOption = .large,
@@ -49,13 +51,15 @@ struct ModelResponseCard: View {
         self.title = title
         self.fullText = fullText
         self.shouldAnimateOnAppear = shouldAnimateOnAppear
+        self.showsThinkingIntro = showsThinkingIntro
         self.responseTextAlignment = responseTextAlignment
         self.responseFont = responseFont
         self.conversationFontSize = conversationFontSize
         self.onDuplicateBranch = onDuplicateBranch
         self.onFinish = onFinish
-        _isThinking = State(initialValue: shouldAnimateOnAppear)
-        _isThinkingDocked = State(initialValue: !shouldAnimateOnAppear)
+        let shouldShowThinking = shouldAnimateOnAppear && showsThinkingIntro
+        _isThinking = State(initialValue: shouldShowThinking)
+        _isThinkingDocked = State(initialValue: !shouldShowThinking)
         _showTitle = State(initialValue: !shouldAnimateOnAppear)
     }
 
@@ -67,45 +71,47 @@ struct ModelResponseCard: View {
             // centred pill position to left-aligned above the title, never disappearing.
             VStack(alignment: .center, spacing: 16) {
 
-                // ── "Thinking…" / expandable thinking summary ─────────────────
-                Button(action: {
-                    if isThinkingExpanded {
-                        collapseThinking()
-                    } else {
-                        isThinkingCollapsing = false
-                        visibleThinkingLineCount = 0
-                        isThinkingRuleVisible = false
-                        withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
-                            isThinkingExpanded = true
+                if showsThinkingIntro {
+                    // ── "Thinking…" / expandable thinking summary ─────────────
+                    Button(action: {
+                        if isThinkingExpanded {
+                            collapseThinking()
+                        } else {
+                            isThinkingCollapsing = false
+                            visibleThinkingLineCount = 0
+                            isThinkingRuleVisible = false
+                            withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
+                                isThinkingExpanded = true
+                            }
                         }
-                    }
-                }) {
-                    HStack(spacing: 6) {
-                        Text(isThinking ? "Thinking..." : "Show Thinking")
-                            .font(.figtreeParagraphLarge)
-                            .fontWeight(.bold)
-                            .modifier(ThinkingShimmer(isActive: isThinking, color: brandBrown))
-                            .contentTransition(.opacity)
-                            .animation(.easeInOut(duration: 0.2), value: isThinking)
+                    }) {
+                        HStack(spacing: 6) {
+                            Text(isThinking ? "Thinking..." : "Show Thinking")
+                                .font(.figtreeParagraphLarge)
+                                .fontWeight(.bold)
+                                .modifier(ThinkingShimmer(isActive: isThinking, color: brandBrown))
+                                .contentTransition(.opacity)
+                                .animation(.easeInOut(duration: 0.2), value: isThinking)
 
-                        if !isThinking {
-                            Image(systemName: isThinkingExpanded ? "chevron.down" : "chevron.right")
-                                .font(.system(size: 10, weight: .bold))
-                                .foregroundColor(AquinasTheme.Colors.placeholderText)
-                                .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                            if !isThinking {
+                                Image(systemName: isThinkingExpanded ? "chevron.down" : "chevron.right")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundColor(AquinasTheme.Colors.placeholderText)
+                                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                            }
                         }
+                        .contentShape(Rectangle())
                     }
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+                    .disabled(isThinking)
+                    .accessibilityLabel(isThinkingExpanded ? "Hide Thinking" : "Show Thinking")
+                    .frame(
+                        maxWidth: isThinkingDocked ? .infinity : nil,
+                        alignment: isThinkingDocked ? responseTextAlignment.frameAlignment : .center
+                    )
                 }
-                .buttonStyle(.plain)
-                .disabled(isThinking)
-                .accessibilityLabel(isThinkingExpanded ? "Hide Thinking" : "Show Thinking")
-                .frame(
-                    maxWidth: isThinking ? nil : .infinity,
-                    alignment: isThinking ? .center : responseTextAlignment.frameAlignment
-                )
 
-                if !isThinking && isThinkingExpanded {
+                if showsThinkingIntro && !isThinking && isThinkingExpanded {
                     VStack(alignment: .leading, spacing: 16) {
                         VStack(alignment: .leading, spacing: 8) {
                             ForEach(Array(thinkingSummaryLines.enumerated()), id: \.offset) { index, line in
@@ -173,7 +179,7 @@ struct ModelResponseCard: View {
                             .foregroundColor(brandBrown)
                             .multilineTextAlignment(responseTextAlignment.textAlignment)
                             .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
-                            .transition(.streamedTextFade)
+                            .transition(.glideFadeUp)
                     }
 
                     StreamingMessageView(
@@ -189,7 +195,7 @@ struct ModelResponseCard: View {
                 }
             }
             .frame(
-                maxWidth: isThinking ? nil : .infinity,
+                maxWidth: isThinkingDocked ? .infinity : nil,
                 alignment: .center
             )
             .transition(.asymmetric(
@@ -200,10 +206,18 @@ struct ModelResponseCard: View {
                 )
             ))
             .animation(.spring(response: 0.55, dampingFraction: 0.72), value: isThinking)
+            .animation(.spring(response: 0.5, dampingFraction: 0.8), value: isThinkingDocked)
         }
         .frame(maxWidth: .infinity, alignment: .center)
         .task {
             guard shouldAnimateOnAppear else { return }
+            guard showsThinkingIntro else {
+                try? await Task.sleep(for: .milliseconds(80))
+                withAnimation(.easeOut(duration: 0.22)) {
+                    showTitle = true
+                }
+                return
+            }
             // Prototype delay. Replace this with real model streaming state later.
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {

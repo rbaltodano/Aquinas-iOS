@@ -12,6 +12,8 @@ import SwiftUI
 struct RippleTrigger {
     let worldOrigin: CGPoint
     let startTime:   Double   // Date().timeIntervalSinceReferenceDate
+    var strength:    Double = 1   // 1 = normal; >1 reaches farther and hits harder
+    var radiusScale: Double = 1   // scales how far the wave travels, independent of strength
 }
 
 // MARK: - Animated Dot Grid
@@ -100,19 +102,23 @@ struct AnimatedDotGridBackground: View, Animatable {
                 let col = min(Int((size.width  / screenSpacing).rounded(.up)) + 2, 120)
                 let row = min(Int((size.height / screenSpacing).rounded(.up)) + 2, 120)
 
-                let rippleDuration = 2.4
+                let baseRippleDuration = 2.4
 
                 // Precompute the active ripples (screen origin + elapsed time) once per frame.
-                let activeRipples: [(ox: Double, oy: Double, dt: Double)] = ripples.compactMap { ripple in
+                // Stronger ripples last longer and use a higher easing exponent — they shoot
+                // out fast then decelerate dramatically toward the end.
+                let activeRipples: [(ox: Double, oy: Double, dt: Double, strength: Double, duration: Double, exponent: Double, radiusScale: Double)] = ripples.compactMap { ripple in
                     let dt = t - ripple.startTime
-                    guard dt >= 0 && dt < rippleDuration else { return nil }
+                    let duration = baseRippleDuration * (0.5 + 0.9 * ripple.strength)
+                    guard dt >= 0 && dt < duration else { return nil }
+                    let exponent = 4.0 + max(0, ripple.strength - 1) * 3.0
                     let ox = Double(size.width / 2)
                         + Double(ripple.worldOrigin.x) * Double(es)
                         + Double(eo.width)
                     let oy = Double(size.height / 2)
                         - Double(ripple.worldOrigin.y) * Double(es)
                         + Double(eo.height)
-                    return (ox, oy, dt)
+                    return (ox, oy, dt, ripple.strength, duration, exponent, ripple.radiusScale)
                 }
 
                 for c in 0...col {
@@ -126,16 +132,17 @@ struct AnimatedDotGridBackground: View, Animatable {
                         var boost = 0.0
                         for ar in activeRipples {
                             let distance = hypot(Double(sx) - ar.ox, Double(sy) - ar.oy)
-                            let progress = ar.dt / rippleDuration
-                            let waveRadius = 400 * (1 - pow(1 - progress, 4))
-                            let waveWidth = 95.0
+                            let progress = ar.dt / ar.duration
+                            // Stronger ripples travel farther and have a wider, taller crest.
+                            let waveRadius = 400 * ar.strength * ar.radiusScale * (1 - pow(1 - progress, ar.exponent))
+                            let waveWidth = 95.0 * (0.6 + 0.4 * ar.strength)
                             let distanceFromFront = distance - waveRadius
 
                             if distanceFromFront > -waveWidth && distanceFromFront < 8 {
                                 let normalizedDistance = max(-1, distanceFromFront / waveWidth)
                                 let bump = cos(normalizedDistance * Double.pi / 2)
                                 let decay = 1 - pow(progress, 2.2)
-                                boost += bump * bump * decay * rippleBoostScale
+                                boost += bump * bump * decay * rippleBoostScale * ar.strength
                             }
                         }
 

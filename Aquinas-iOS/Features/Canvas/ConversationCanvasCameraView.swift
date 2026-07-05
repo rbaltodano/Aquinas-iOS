@@ -432,9 +432,10 @@ private struct BranchMapPreviewView: View {
     }
 
     private func contextChip(title: String, icon: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon).font(.system(size: 12, weight: .semibold))
-            Text(title).font(.figtreeChipLabel).lineLimit(1)
+        let isInsightChip = icon == "text.bubble" || icon == "text.bubble.fill"
+        return HStack(spacing: 8) {
+            Image(systemName: icon).font(.system(size: isInsightChip ? 14 : 12, weight: .semibold))
+            Text(title).font(isInsightChip ? .figtreeHeading2 : .figtreeChipLabel).lineLimit(1)
         }
         .foregroundColor(AquinasTheme.Colors.darkGreen)
         .padding(.horizontal, 20).padding(.vertical, 16)
@@ -508,9 +509,10 @@ private struct BranchMapPreviewView: View {
             if let concept {
                 HStack(spacing: 8) {
                     Image(systemName: "text.bubble.fill")
+                        .font(.system(size: 14, weight: .semibold))
                     Text(concept.word.capitalized)
+                        .font(.figtreeHeading2)
                 }
-                .font(.figtreeChipLabel)
                 .foregroundColor(AquinasTheme.Colors.darkGreen).lineLimit(1)
                 .opacity(labelOpacity)
             }
@@ -558,10 +560,14 @@ private struct BranchIconPreviewView: View {
                     .lineLimit(1).minimumScaleFactor(0.72).opacity(labelOpacity)
             }
             if let ctx = contextTitle {
+                let isInsightChip = contextIcon == "text.bubble" || contextIcon == "text.bubble.fill"
                 HStack(spacing: 8) {
-                    Image(systemName: contextIcon); Text(ctx)
+                    Image(systemName: contextIcon)
+                        .font(.system(size: isInsightChip ? 14 : 12, weight: .semibold))
+                    Text(ctx)
+                        .font(isInsightChip ? .figtreeHeading2 : .figtreeChipLabel)
                 }
-                .font(.figtreeChipLabel).foregroundColor(AquinasTheme.Colors.darkGreen)
+                .foregroundColor(AquinasTheme.Colors.darkGreen)
                 .lineLimit(1).padding(.horizontal, 16).padding(.vertical, 12)
                 .background(AquinasTheme.Colors.canvas)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))

@@ -18,6 +18,13 @@ final class InsightTreeViewModel: ObservableObject {
     @Published private(set) var nodes: [NodeModel] = []
     @Published private(set) var edges: [EdgeModel] = []
     @Published private(set) var makeNodeChildIDs: Set<UUID> = []
+    /// Node IDs for user-placed midpoints. These render as a bare insight chip (no
+    /// node-concept circle) pinned at their placed position.
+    @Published private(set) var placedMidpointNodeIDs: Set<UUID> = []
+    /// For each placed-midpoint node, the sources it connects to (insight chips / node concepts).
+    @Published private(set) var placedMidpointSources: [UUID: [MidpointSource]] = [:]
+    /// Per-insight bond length (connector radius): shorter = more related to its parent node.
+    @Published private(set) var insightBondLengths: [UUID: CGFloat] = [:]
     @Published var selectedNode: NodeModel?
     @Published var selectedSuggestedNode: NodeModel?
 
@@ -28,12 +35,12 @@ final class InsightTreeViewModel: ObservableObject {
     private var placedMidpoints: [PlacedMidpoint] = []
     private let positionStoreKey = "aquinas.insight-tree.positions.v1"
 
-    /// A user-placed "midpoint" insight: a permanent node pinned at an explicit
-    /// world position, connected by an edge to the nearest selected insight.
+    /// A user-placed "midpoint" insight: a permanent node pinned at an explicit world
+    /// position, connected by an edge to each of the source insights it was spawned from.
     private struct PlacedMidpoint {
         let concept: ConceptDefinition
         let position: CGPoint
-        let nearestInsightID: UUID
+        let sources: [MidpointSource]
     }
 
     init(insights: [ConceptDefinition], promotedInsightIDs: [UUID] = []) {
@@ -75,10 +82,25 @@ final class InsightTreeViewModel: ObservableObject {
         rebuildTree(forceRelayout: true)
     }
 
-    /// Places a new permanent insight node at an explicit world position, pinned
-    /// (never moved by the force layout) and connected to the nearest selected insight.
-    func addPlacedMidpoint(concept: ConceptDefinition, at position: CGPoint, nearestInsightID: UUID) {
-        placedMidpoints.append(PlacedMidpoint(concept: concept, position: position, nearestInsightID: nearestInsightID))
+    /// Commits the canvas's live-simulated positions back into the model and persists them.
+    /// Mutates positions in place without changing the node id set, so the canvas's body
+    /// reconciliation is a no-op (no jump) and next launch restores the live layout.
+    func commitLivePositions(_ positions: [UUID: CGPoint]) {
+        var changed = false
+        for index in nodes.indices {
+            if let p = positions[nodes[index].id], nodes[index].position != p {
+                nodes[index].position = p
+                changed = true
+            }
+        }
+        guard changed else { return }
+        persistPositions(nodes)
+    }
+
+    /// Places a new permanent insight node at an explicit world position, pinned (never moved
+    /// by the force layout) and connected by a line to each source insight it was spawned from.
+    func addPlacedMidpoint(concept: ConceptDefinition, at position: CGPoint, sources: [MidpointSource]) {
+        placedMidpoints.append(PlacedMidpoint(concept: concept, position: position, sources: sources))
         rebuildTree()
     }
 
@@ -178,6 +200,9 @@ final class InsightTreeViewModel: ObservableObject {
             var nextEdges: [EdgeModel] = []
             appendPromotedNodes(to: &nextNodes, edges: &nextEdges, from: embeddedInsights)
             appendPlacedMidpointNodes(to: &nextNodes, edges: &nextEdges)
+            nextNodes = separateOverlaps(nodes: nextNodes)
+            persistPositions(nextNodes)
+            recomputeBondLengths(for: nextNodes)
             let nextIDs = Set(nextNodes.map(\.id))
             let hasNew = !nextIDs.isSubset(of: renderedNodeIDs)
             renderedNodeIDs = nextIDs
@@ -228,6 +253,9 @@ final class InsightTreeViewModel: ObservableObject {
 
         appendPromotedNodes(to: &nextNodes, edges: &nextEdges, from: embeddedInsights)
         appendPlacedMidpointNodes(to: &nextNodes, edges: &nextEdges)
+        nextNodes = separateOverlaps(nodes: nextNodes)
+        persistPositions(nextNodes)
+        recomputeBondLengths(for: nextNodes)
 
         let nextIDs = Set(nextNodes.map(\.id))
         let hasNew = !nextIDs.isSubset(of: renderedNodeIDs)
@@ -237,6 +265,19 @@ final class InsightTreeViewModel: ObservableObject {
             edges = nextEdges
         }
         scene.render(nodes: nodes, edges: edges, animated: hasNew)
+    }
+
+    /// Bond length per visible insight = relatedness (semantic distance) to its parent node's
+    /// centroid embedding. Midpoint nodes (bare center chip) are skipped.
+    private func recomputeBondLengths(for nodes: [NodeModel]) {
+        var lengths: [UUID: CGFloat] = [:]
+        for node in nodes where !placedMidpointNodeIDs.contains(node.id) {
+            for insight in node.insights.prefix(6) {
+                let dist = semanticDistance(insight.embedding ?? [], node.embedding)
+                lengths[insight.id] = insightBondLength(dist)
+            }
+        }
+        insightBondLengths = lengths
     }
 
     private func makeEarlyNodes(from insights: [InsightModel]) -> [NodeModel] {
@@ -301,6 +342,8 @@ final class InsightTreeViewModel: ObservableObject {
             // If the insight already is its own node (canvas early layout), convert it in
             // place so the insight itself becomes the concept — no duplicate node beside it.
             if sourceNode.id == insightID && sourceNode.insights.count == 1 {
+                nodes[sourceIndex].conceptLabel = insight.title
+                nodes[sourceIndex].definition = insight.definition
                 nodes[sourceIndex].insights = childInsights
                 continue
             }
@@ -317,6 +360,7 @@ final class InsightTreeViewModel: ObservableObject {
             let promotedNode = NodeModel(
                 id: promotedNodeID,
                 conceptLabel: insight.title,
+                definition: insight.definition,
                 insights: childInsights,
                 embedding: insight.embedding ?? [],
                 position: restoredPosition(for: promotedNodeID) ?? orbitPos,
@@ -338,10 +382,12 @@ final class InsightTreeViewModel: ObservableObject {
         }
     }
 
-    /// Appends user-placed midpoint nodes at their pinned positions, each connected
-    /// by an edge to the node containing its nearest selected insight. Runs AFTER the
-    /// force layout so these nodes are never relocated.
+    /// Appends user-placed midpoint nodes at their pinned positions, each connected by an edge
+    /// to every source concept it was spawned from. Runs AFTER the force layout so these nodes
+    /// are never relocated.
     private func appendPlacedMidpointNodes(to nodes: inout [NodeModel], edges: inout [EdgeModel]) {
+        placedMidpointNodeIDs = Set(placedMidpoints.map { $0.concept.id })
+        placedMidpointSources = Dictionary(uniqueKeysWithValues: placedMidpoints.map { ($0.concept.id, $0.sources) })
         guard !placedMidpoints.isEmpty else { return }
 
         for placed in placedMidpoints {
@@ -359,19 +405,8 @@ final class InsightTreeViewModel: ObservableObject {
                 suggestedInsights: nil
             )
 
-            if let sourceNode = nodes.first(where: { $0.insights.contains(where: { $0.id == placed.nearestInsightID }) }) {
-                edges.append(
-                    EdgeModel(
-                        id: UUID(),
-                        fromNodeID: sourceNode.id,
-                        toNodeID: nodeID,
-                        distance: 0.18,
-                        isSuggested: false,
-                        showSuggestButton: false
-                    )
-                )
-            }
-
+            // Connector lines are drawn by the canvas directly to each source insight chip /
+            // node concept (see placedMidpointSources), not as generic node-to-node edges.
             nodes.append(placedNode)
         }
     }
@@ -381,8 +416,67 @@ final class InsightTreeViewModel: ObservableObject {
     private func insightOrbitPosition(node: NodeModel, index: Int, count: Int) -> CGPoint {
         let clampedCount = max(count, 1)
         let angle = (CGFloat(index) / CGFloat(clampedCount)) * (.pi * 2) + .pi / 8
-        let radius: CGFloat = node.isSuggested ? 118 : 190
+        let insightID = index < node.insights.count ? node.insights[index].id : nil
+        let radius = insightID.flatMap { insightBondLengths[$0] } ?? 190
         return CGPoint(x: node.position.x + cos(angle) * radius, y: node.position.y + sin(angle) * radius)
+    }
+
+    /// Effective footprint radius of a node (its concept circle + the ring of orbiting chips),
+    /// used to keep whole nodes from overlapping during the separation pass.
+    private func nodeFootprintRadius(_ node: NodeModel) -> CGFloat {
+        if placedMidpointNodeIDs.contains(node.id) { return 70 }   // bare single-chip midpoint
+        let longest = node.insights.prefix(6).map { $0.title.count }.max() ?? 0
+        return insightOrbitRadius(longestTitleChars: longest,
+                                  count: min(node.insights.count, 6),
+                                  isSuggested: node.isSuggested) + 64   // ring + chip extent
+    }
+
+    /// Gently pushes apart only the nodes whose footprints overlap, starting from their current
+    /// positions. Pinned midpoint nodes stay fixed (neighbors move around them). A no-op when
+    /// nothing overlaps, so a settled tree never moves.
+    private func separateOverlaps(nodes: [NodeModel]) -> [NodeModel] {
+        var working = nodes
+        let iterations = 8
+        let padding: CGFloat = 24
+        let maxStep: CGFloat = 12
+        for _ in 0..<iterations {
+            var moved = false
+            for i in working.indices {
+                for j in (i + 1)..<working.count {
+                    let aPinned = placedMidpointNodeIDs.contains(working[i].id)
+                    let bPinned = placedMidpointNodeIDs.contains(working[j].id)
+                    if aPinned && bPinned { continue }
+
+                    var dx = working[j].position.x - working[i].position.x
+                    var dy = working[j].position.y - working[i].position.y
+                    var dist = hypot(dx, dy)
+                    if dist < 0.5 {
+                        dx = .random(in: -1...1); dy = .random(in: -1...1); dist = 1
+                    }
+                    let minDist = nodeFootprintRadius(working[i]) + nodeFootprintRadius(working[j]) + padding
+                    guard dist < minDist else { continue }
+
+                    let overlap = minDist - dist
+                    let ux = dx / dist, uy = dy / dist
+                    func push(_ idx: Int, _ amount: CGFloat) {
+                        let s = min(abs(amount), maxStep) * (amount < 0 ? -1 : 1)
+                        working[idx].position.x += ux * s
+                        working[idx].position.y += uy * s
+                    }
+                    if aPinned {
+                        push(j, overlap)            // only j moves, away from i
+                    } else if bPinned {
+                        push(i, -overlap)           // only i moves, away from j
+                    } else {
+                        push(j, overlap / 2)
+                        push(i, -overlap / 2)
+                    }
+                    moved = true
+                }
+            }
+            if !moved { break }   // converged / nothing overlaps
+        }
+        return working
     }
 
     private func makeNodeChildID(for nodeID: UUID, index: Int) -> UUID {
@@ -531,6 +625,12 @@ func semanticDistance(_ a: [Double], _ b: [Double]) -> Double {
 
 func mapDistanceToLength(_ distance: Double) -> CGFloat {
     80 + CGFloat(distance) * 320
+}
+
+/// Bond length (insight connector radius) from how related an insight is to its parent node.
+/// More related (smaller distance) → shorter bond; floored so close chips don't crowd the node.
+func insightBondLength(_ distance: Double) -> CGFloat {
+    150 + CGFloat(min(max(distance, 0), 1)) * 180   // ~[150, 330]px
 }
 
 private func centroid(_ vectors: [[Double]]) -> [Double] {

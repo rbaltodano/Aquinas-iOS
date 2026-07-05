@@ -13,7 +13,7 @@ enum AquinasTheme {
     // MARK: Colors
     // Canonical visual tokens mirrored from the Figma paint styles.
     enum Colors {
-        static let canvas = Color(light: 0xF4EFE4, lightAlpha: 1.0, dark: 0x120F0C, darkAlpha: 1.0)
+        static let canvas = Color(light: 0xF3EEE2, lightAlpha: 1.0, dark: 0x120F0C, darkAlpha: 1.0)
         static let insightTreeCanvas = canvasSecondary
         /// The canvas colour of the *opposite* mode — dark in light-mode, light in dark-mode.
         static let canvasInverse = Color(light: 0x14110F, dark: 0xF2E7D4)
@@ -110,9 +110,12 @@ enum AquinasTheme {
     enum Typography {
         static let title = Font.custom("LibreBaskerville-Regular", size: 24)
         static let titleLarge = Font.custom("LibreBaskerville-Regular", size: 34)
+        static let titleHome = Font.custom("LibreBaskerville-Regular", size: 40)
+        static let titleXLarge = Font.custom("LibreBaskerville-Regular", size: 40)
         static let heading = Font.custom("LibreBaskerville-Regular", size: 20)
         static let quote = Font.custom("LibreBaskerville-Italic", size: 16)
         static let baskervilleSmall = Font.custom("LibreBaskerville-Bold", size: 12)
+        static let uiDisplayLarge = Font.custom("Figtree-Bold", size: 40)
         static let uiHeading = Font.custom("Figtree-Bold", size: 18)
         static let uiSubheading = Font.custom("Figtree-Bold", size: 14)
         static let uiLabel = Font.custom("Figtree-Bold", size: 12)
@@ -133,6 +136,12 @@ enum AquinasTheme {
         static let controlHeight: CGFloat = 44
         static let iconButtonSize: CGFloat = 44
     }
+}
+
+extension Animation {
+    /// Short, bouncy spring shared by the Insight card's height changes (bars → definition) and
+    /// swiping between saved insights, so both movements feel the same.
+    static let insightCardBounce = Animation.spring(response: 0.17, dampingFraction: 0.6)
 }
 
 extension Color {
@@ -207,9 +216,11 @@ extension Font {
     static let figtreeParagraphLarge = AquinasTheme.Typography.bodyLarge
     static let figtreeParagraphInsight = AquinasTheme.Typography.inlineInsight
     static let figtreeChipLabel = AquinasTheme.Typography.chipLabel
+    static let figtreeHeadingXLarge = AquinasTheme.Typography.uiDisplayLarge
     static let figtreeSmall = Font.custom("Figtree-Regular", size: 12)
 
     // MARK: Libre Baskerville aliases
+    static let baskervilleHeadingXLarge = AquinasTheme.Typography.titleXLarge
     static let baskervilleHeading1 = AquinasTheme.Typography.title
     static let baskervilleHeading2 = AquinasTheme.Typography.heading
     static let baskervilleHeading3 = Font.custom("LibreBaskerville-Regular", size: 14)

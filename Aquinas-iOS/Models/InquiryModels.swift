@@ -56,6 +56,8 @@ struct InquiryConversation: Identifiable, Codable, Equatable {
     /// Non-nil when this conversation lives inside a study topic.
     /// The value is the `id` of the parent topic (`InquiryConversation`).
     var studyTopicID: UUID? = nil
+    /// Pinned conversations sort to the top of Recents and show a pin indicator.
+    var isPinned: Bool = false
     var branches: [ChatBranch] = [ChatBranch(startingConcept: nil)]
     var promotedInsightIDs: [UUID] = []
 
@@ -64,6 +66,7 @@ struct InquiryConversation: Identifiable, Codable, Equatable {
         title: String = "New Conversation",
         isStudyTopic: Bool = false,
         studyTopicID: UUID? = nil,
+        isPinned: Bool = false,
         branches: [ChatBranch] = [ChatBranch(startingConcept: nil)],
         promotedInsightIDs: [UUID] = []
     ) {
@@ -71,6 +74,7 @@ struct InquiryConversation: Identifiable, Codable, Equatable {
         self.title = title
         self.isStudyTopic = isStudyTopic
         self.studyTopicID = studyTopicID
+        self.isPinned = isPinned
         self.branches = branches
         self.promotedInsightIDs = promotedInsightIDs
     }

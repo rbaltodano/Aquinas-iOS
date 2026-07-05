@@ -24,16 +24,20 @@ struct BranchContextChip: View {
     @State private var borderDrawProgress: CGFloat = 0
     @State private var isVisible: Bool = false
 
+    private var isInsightChip: Bool {
+        icon == "text.bubble" || icon == "text.bubble.fill"
+    }
+
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: icon)
-                .font(.system(size: 12, weight: .bold))
+                .font(.system(size: isInsightChip ? 14 : 12, weight: .bold))
                 .foregroundColor(AquinasTheme.Colors.darkGreen)
                 .rotationEffect(icon == "arrow.triangle.branch" ? .degrees(90) : .degrees(0))
                 .id(icon)
                 .sfSymbolDrawOn(delay: appearDelay + 0.25)
             Text(title)
-                .font(.figtreeChipLabel)
+                .font(isInsightChip ? .figtreeHeading2 : .figtreeChipLabel)
                 .foregroundColor(AquinasTheme.Colors.darkGreen)
                 .lineLimit(1)
             if showRemove, let onRemove {
@@ -101,7 +105,7 @@ struct ConnectionContextChip: View {
     var body: some View {
         HStack(spacing: 8) {
             Text(conceptA.word.capitalized)
-                .font(.figtreeChipLabel)
+                .font(.figtreeHeading2)
                 .foregroundColor(AquinasTheme.Colors.darkGreen)
                 .lineLimit(1)
 
@@ -110,7 +114,7 @@ struct ConnectionContextChip: View {
                 .foregroundColor(AquinasTheme.Colors.darkGreen)
 
             Text(conceptB.word.capitalized)
-                .font(.figtreeChipLabel)
+                .font(.figtreeHeading2)
                 .foregroundColor(AquinasTheme.Colors.darkGreen)
                 .lineLimit(1)
 

@@ -34,7 +34,13 @@ struct InsightTreeView: View {
     var midpointEnterRequest: Int = 0
     var midpointCenterRequest: Int = 0
     var midpointPlaceRequest: Int = 0
+    var highlightedInsightPair: (UUID, UUID)? = nil
+    var highlightPairRequest: Int = 0
+    var startsMidpointForHighlightedPair: Bool = false
     var onMidpointModeChange: ((Bool) -> Void)? = nil
+    /// Reports whether a just-placed midpoint insight is currently "generating".
+    var onMidpointGeneratingChange: ((Bool) -> Void)? = nil
+    var onUndiscoveredInsightCountChange: ((Int) -> Void)? = nil
     var inputFont: ConversationFontOption = .serif
     var conversationFontSize: ConversationFontSizeOption = .small
     var showQuestionBar: Bool = true
@@ -45,7 +51,20 @@ struct InsightTreeView: View {
     @State private var selectedInsight: InsightModel?
     @State private var selectedNode: NodeModel?
     @State private var hoveredConcept: ConceptDefinition?
+    /// Insight id of a just-placed midpoint while it "loads" on the canvas.
+    @State private var midpointPlacedInsightID: UUID?
+    /// True only for the card that pops after a midpoint placement, so its body text
+    /// animates in like a streamed model response.
+    @State private var animateMidpointCardText: Bool = false
     @State private var dockedCardDragY: CGFloat = 0
+    /// While Make Node generates children from a docked insight, its card stays up and grows an
+    /// Insight link per child. `makeNodeParentInsightID` is the insight whose card is growing;
+    /// `makeNodeLinkInsightIDs` are the child ids revealed so far (each appended on its haptic).
+    @State private var makeNodeParentInsightID: UUID?
+    @State private var makeNodeLinkInsightIDs: [UUID] = []
+    /// True from the Make Node tap until generation finishes, so the generation zoom-out doesn't
+    /// dismiss the parent card we're growing.
+    @State private var makeNodeGenerating: Bool = false
     @State private var restoreFocusedCameraRequest: Int = 0
     @State private var focusedInsightID: UUID?
     @State private var undoInsight: ConceptDefinition? = nil
@@ -87,7 +106,12 @@ struct InsightTreeView: View {
         midpointEnterRequest: Int = 0,
         midpointCenterRequest: Int = 0,
         midpointPlaceRequest: Int = 0,
+        highlightedInsightPair: (UUID, UUID)? = nil,
+        highlightPairRequest: Int = 0,
+        startsMidpointForHighlightedPair: Bool = false,
         onMidpointModeChange: ((Bool) -> Void)? = nil,
+        onMidpointGeneratingChange: ((Bool) -> Void)? = nil,
+        onUndiscoveredInsightCountChange: ((Int) -> Void)? = nil,
         inputFont: ConversationFontOption = .serif,
         conversationFontSize: ConversationFontSizeOption = .small,
         showQuestionBar: Bool = true
@@ -114,7 +138,12 @@ struct InsightTreeView: View {
         self.midpointEnterRequest          = midpointEnterRequest
         self.midpointCenterRequest         = midpointCenterRequest
         self.midpointPlaceRequest          = midpointPlaceRequest
+        self.highlightedInsightPair        = highlightedInsightPair
+        self.highlightPairRequest          = highlightPairRequest
+        self.startsMidpointForHighlightedPair = startsMidpointForHighlightedPair
         self.onMidpointModeChange          = onMidpointModeChange
+        self.onMidpointGeneratingChange    = onMidpointGeneratingChange
+        self.onUndiscoveredInsightCountChange = onUndiscoveredInsightCountChange
         self.inputFont             = inputFont
         self.conversationFontSize  = conversationFontSize
         self.showQuestionBar       = showQuestionBar
@@ -170,6 +199,9 @@ struct InsightTreeView: View {
                 selectedCanvasTargets: selectedCanvasTargets,
                 selectionPulseRequest: selectionPulseRequest,
                 makeNodeChildIDs: viewModel.makeNodeChildIDs,
+                placedMidpointNodeIDs: viewModel.placedMidpointNodeIDs,
+                placedMidpointSources: viewModel.placedMidpointSources,
+                insightBondLengths: viewModel.insightBondLengths,
                 isHoveringTarget: selectedInsight != nil || selectedNode != nil || hoveredConcept != nil,
                 isMidpointMode: isMidpointMode,
                 midpointCenterRequest: midpointCenterRequest,
@@ -195,6 +227,31 @@ struct InsightTreeView: View {
                 },
                 onMidpointPlaced: { worldPosition, nearestTarget, weights in
                     placeMidpointInsight(at: worldPosition, nearestTarget: nearestTarget, weights: weights)
+                },
+                midpointPlacedInsightID: midpointPlacedInsightID,
+                onMidpointInsightLoaded: { insightID in
+                    revealPlacedMidpointCard(insightID)
+                },
+                onGeneratingChange: { generating in
+                    onMidpointGeneratingChange?(generating)
+                    // Once every child has been revealed, unlock the parent card (its Insight
+                    // links remain until the user dismisses or navigates away).
+                    if !generating { makeNodeGenerating = false }
+                },
+                onMakeNodeChildRevealed: { childID in
+                    appendMakeNodeChildLink(childID)
+                },
+                onPositionsSettled: { positions in
+                    viewModel.commitLivePositions(positions)
+                },
+                onRequestDismissHover: {
+                    // Keep the parent card up while its Make Node children generate — it's
+                    // growing an Insight link per child.
+                    guard !makeNodeGenerating else { return }
+                    dismissDockedInsight()
+                },
+                onUndiscoveredInsightCountChange: { count in
+                    onUndiscoveredInsightCountChange?(count)
                 }
             )
                 .ignoresSafeArea()
@@ -263,8 +320,14 @@ struct InsightTreeView: View {
                     } else if let selectedInsight {
                         DockedInsightTreeCard(
                             insight: selectedInsight,
+                            animateIn: animateMidpointCardText,
+                            linkedInsights: makeNodeLinkInsights,
                             onRemove: { pendingRemoveInsight = selectedInsight },
-                            onFork:   { performForkInsight(selectedInsight) }
+                            onFork:   { performForkInsight(selectedInsight) },
+                            onSelectLinkedInsight: { insight in
+                                focusedInsightID = insight.id
+                                showInsightCard(insight)
+                            }
                         )
                         .offset(y: dockedCardDragY)
                         .gesture(dockedCardDismissGesture)
@@ -276,7 +339,8 @@ struct InsightTreeView: View {
                             onSelectInsight: { insight in
                                 focusedInsightID = insight.id
                                 showInsightCard(insight)
-                            }
+                            },
+                            onFork: { performForkNode(selectedNode) }
                         )
                         .offset(y: dockedCardDragY)
                         .gesture(dockedCardDismissGesture)
@@ -398,6 +462,14 @@ struct InsightTreeView: View {
         .onChange(of: midpointEnterRequest) { _, _ in
             enterMidpointMode()
         }
+        .onChange(of: highlightPairRequest) { _, _ in
+            highlightInsightPair()
+        }
+        .onAppear {
+            if highlightedInsightPair != nil {
+                highlightInsightPair()
+            }
+        }
         .alert("Remove bookmark?", isPresented: Binding(
             get: { pendingRemoveInsight != nil },
             set: { if !$0 { pendingRemoveInsight = nil } }
@@ -422,7 +494,10 @@ struct InsightTreeView: View {
         }
     }
 
-    private func showInsightCard(_ insight: InsightModel) {
+    private func showInsightCard(_ insight: InsightModel, animateText: Bool = false, moveCamera: Bool = true) {
+        // Navigating to any other insight ends the Make Node card growth.
+        if insight.id != makeNodeParentInsightID { clearMakeNodeCardGrowth() }
+        animateMidpointCardText = animateText
         // Keyboard is open — update the chip and ensure it's visible
         if questionBarKeyboardActive {
             withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
@@ -435,7 +510,11 @@ struct InsightTreeView: View {
         playDockedCardHaptic()
         onSelectionStateChange?(true)
         onInsightSelectionStateChange?(true)
-        focusedInsightID = insight.id
+        // The placed-midpoint reveal lets the canvas own the camera (so user input can cancel
+        // it); other taps recenter on the insight as usual.
+        if moveCamera {
+            focusedInsightID = insight.id
+        }
         onQuoteInsight?(concept(for: insight))
 
         withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
@@ -448,6 +527,7 @@ struct InsightTreeView: View {
     }
 
     private func showNodeCard(_ node: NodeModel) {
+        clearMakeNodeCardGrowth()
         playDockedCardHaptic()
         onSelectionStateChange?(true)
         onInsightSelectionStateChange?(true)
@@ -509,9 +589,25 @@ struct InsightTreeView: View {
         onForkInsight?(concept)
     }
 
+    /// Branches a new inquiry from a node concept. Prefers a member insight's saved concept, else
+    /// synthesizes one from the node's own label + definition.
+    private func performForkNode(_ node: NodeModel) {
+        let concept = node.insights.compactMap { insight in insights.first(where: { $0.id == insight.id }) }.first
+            ?? ConceptDefinition(
+                word: node.conceptLabel,
+                partOfSpeech: "",
+                pronunciation: "",
+                meaning: node.definition,
+                example: ""
+            )
+        dismissDockedInsight()
+        onForkInsight?(concept)
+    }
+
     private func dismissDockedInsight() {
         guard selectedInsight != nil || selectedNode != nil || hoveredConcept != nil else { return }
 
+        clearMakeNodeCardGrowth()
         playDockedCardHaptic()
         onSelectionStateChange?(false)
         onInsightSelectionStateChange?(false)
@@ -532,6 +628,7 @@ struct InsightTreeView: View {
     private func dismissDockedCard() {
         guard selectedInsight != nil || selectedNode != nil || hoveredConcept != nil else { return }
 
+        clearMakeNodeCardGrowth()
         playDockedCardHaptic()
         onSelectionStateChange?(false)
         onInsightSelectionStateChange?(false)
@@ -548,6 +645,7 @@ struct InsightTreeView: View {
     private func clearCanvasSelectionSilently() {
         guard selectedInsight != nil || selectedNode != nil || questionBarContextInsight != nil || hoveredConcept != nil else { return }
 
+        clearMakeNodeCardGrowth()
         onSelectionStateChange?(false)
         onInsightSelectionStateChange?(false)
         onQuoteInsight?(nil)
@@ -574,15 +672,22 @@ struct InsightTreeView: View {
     }
 
     private func rehoverTarget(_ target: CanvasSelectionTarget) {
-        switch target {
-        case .insight(let id):
-            guard let insight = viewModel.nodes.flatMap(\.insights).first(where: { $0.id == id }) else { return }
-            showInsightCard(insight)
-        case .node(let id):
-            guard let node = viewModel.nodes.first(where: { $0.id == id }) else { return }
-            showNodeCard(node)
-            if let firstInsight = node.insights.first {
-                focusedInsightID = firstInsight.id
+        // Clear the focus id first, then re-hover on the next runloop. Canceling a selection
+        // often re-targets the insight that's *already* focused (e.g. a single-item selection),
+        // and the canvas only re-centers on a genuine focusedInsightID change — so without the
+        // nil→id transition the camera wouldn't return to hovering the first selected item.
+        focusedInsightID = nil
+        DispatchQueue.main.async {
+            switch target {
+            case .insight(let id):
+                guard let insight = viewModel.nodes.flatMap(\.insights).first(where: { $0.id == id }) else { return }
+                showInsightCard(insight)
+            case .node(let id):
+                guard let node = viewModel.nodes.first(where: { $0.id == id }) else { return }
+                showNodeCard(node)
+                if let firstInsight = node.insights.first {
+                    focusedInsightID = firstInsight.id
+                }
             }
         }
     }
@@ -627,11 +732,64 @@ struct InsightTreeView: View {
         clearCanvasSelectionSilently()
     }
 
+    private func highlightInsightPair() {
+        guard let highlightedInsightPair else { return }
+        let firstTarget = CanvasSelectionTarget.insight(highlightedInsightPair.0)
+        let secondTarget = CanvasSelectionTarget.insight(highlightedInsightPair.1)
+        let availableInsightIDs = Set(viewModel.nodes.flatMap(\.insights).map(\.id))
+        guard availableInsightIDs.contains(highlightedInsightPair.0),
+              availableInsightIDs.contains(highlightedInsightPair.1) else {
+            return
+        }
+
+        if isMidpointMode { exitMidpointMode() }
+        dismissDockedInsight()
+        selectedCanvasTargets = [firstTarget, secondTarget]
+        selectionPulseRequest += 1
+        onSelectedCanvasItemCountChange?(selectedCanvasTargets.count)
+        focusedInsightID = nil
+        DispatchQueue.main.async {
+            focusedInsightID = highlightedInsightPair.1
+            if startsMidpointForHighlightedPair {
+                enterMidpointMode()
+            }
+        }
+    }
+
     private func promoteHoveredInsightToConcept() {
         guard let selectedInsight else { return }
         guard !promotedInsightIDs.contains(selectedInsight.id) else { return }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.8)
+        // Keep this insight's card docked while its children generate; it grows an Insight
+        // link per child, each appended in sync with the child's reveal haptic.
+        makeNodeParentInsightID = selectedInsight.id
+        makeNodeLinkInsightIDs = []
+        makeNodeGenerating = true
         onPromotedInsightIDsChange?(promotedInsightIDs + [selectedInsight.id])
+    }
+
+    /// Called by the canvas as each Make Node child is revealed (on its haptic). Appends an
+    /// Insight link for it to the docked parent card, animated in with the reveal.
+    private func appendMakeNodeChildLink(_ childID: UUID) {
+        guard let parentID = makeNodeParentInsightID,
+              selectedInsight?.id == parentID,
+              !makeNodeLinkInsightIDs.contains(childID) else { return }
+        withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
+            makeNodeLinkInsightIDs.append(childID)
+        }
+    }
+
+    /// Resolved child insights for the links currently growing on the docked parent card.
+    private var makeNodeLinkInsights: [InsightModel] {
+        guard selectedInsight?.id == makeNodeParentInsightID else { return [] }
+        let all = viewModel.nodes.flatMap(\.insights)
+        return makeNodeLinkInsightIDs.compactMap { id in all.first(where: { $0.id == id }) }
+    }
+
+    private func clearMakeNodeCardGrowth() {
+        makeNodeParentInsightID = nil
+        makeNodeLinkInsightIDs = []
+        makeNodeGenerating = false
     }
 
     private func performInquireConnection() {
@@ -663,16 +821,40 @@ struct InsightTreeView: View {
     /// Commits the placed midpoint: builds a "New Insight" concept, pins it on the
     /// canvas connected to the nearest selected insight, then exits midpoint mode.
     private func placeMidpointInsight(at worldPosition: CGPoint, nearestTarget: CanvasSelectionTarget, weights: [Double]) {
-        guard let nearestInsightID = insightID(for: nearestTarget) else { return }
         let sourceConcepts = selectedCanvasTargets.compactMap { concept(for: $0) }
+        // Connect the placed midpoint to every source it was spawned from — to the insight chip
+        // for a selected insight, or the node center for a selected node concept.
+        let sources: [MidpointSource] = selectedCanvasTargets.compactMap { target in
+            guard let id = insightID(for: target) else { return nil }
+            if case .node = target { return MidpointSource(insightID: id, isNode: true) }
+            return MidpointSource(insightID: id, isNode: false)
+        }
         let concept = makeMidpointConcept(weights: weights, targets: sourceConcepts)
 
-        viewModel.addPlacedMidpoint(concept: concept, at: worldPosition, nearestInsightID: nearestInsightID)
+        // The placed node and its single insight both share the concept id.
+        midpointPlacedInsightID = concept.id
+        onMidpointGeneratingChange?(true)
+        viewModel.addPlacedMidpoint(concept: concept, at: worldPosition, sources: sources)
 
         exitMidpointMode()
         selectedCanvasTargets.removeAll()
         onSelectedCanvasItemCountChange?(0)
-        dismissDockedInsight()
+        // Keep the canvas hovering the new insight — the canvas runs its loading
+        // sequence and calls back via revealPlacedMidpointCard to pop the card.
+    }
+
+    /// Called by the canvas once the placed midpoint insight has finished its simulated
+    /// load (icon flash → title reveal → dot pulse). Pops the insight card with its body
+    /// text animating in like a streamed model response.
+    private func revealPlacedMidpointCard(_ insightID: UUID) {
+        guard midpointPlacedInsightID == insightID else { return }
+        midpointPlacedInsightID = nil
+        onMidpointGeneratingChange?(false)
+        // If the user navigated to another insight/node while it generated, don't hijack their card.
+        let viewingOther = (selectedInsight != nil && selectedInsight?.id != insightID) || selectedNode != nil
+        guard !viewingOther else { return }
+        guard let insight = viewModel.nodes.flatMap(\.insights).first(where: { $0.id == insightID }) else { return }
+        showInsightCard(insight, animateText: true, moveCamera: false)
     }
 
     /// Synchronous stub so the node appears pinned immediately. The placed concept is
@@ -719,12 +901,29 @@ struct InsightTreeView: View {
     }
 
     private func quoteTarget(for node: NodeModel) -> ConceptDefinition? {
-        for insight in node.insights {
-            if let concept = concept(for: insight) {
-                return concept
-            }
+        // Quote the Node Concept itself (its label + definition), so the whole grouping can be
+        // pulled back into a conversation — not just one member insight. Promoted nodes carry
+        // their own definition; auto-clustered nodes fall back to a summary of their members.
+        let label = node.conceptLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !label.isEmpty else { return nil }
+
+        let ownDefinition = node.definition.trimmingCharacters(in: .whitespacesAndNewlines)
+        let meaning: String
+        if !ownDefinition.isEmpty {
+            meaning = ownDefinition
+        } else {
+            let titles = node.insights.prefix(6).map(\.title).filter { !$0.isEmpty }
+            meaning = titles.isEmpty ? "" : "A grouping of related insights: " + titles.joined(separator: ", ") + "."
         }
-        return nil
+
+        return ConceptDefinition(
+            id: node.id,
+            word: label,
+            partOfSpeech: "",
+            pronunciation: "",
+            meaning: meaning,
+            example: ""
+        )
     }
 }
 
@@ -736,10 +935,17 @@ enum CanvasSelectionTarget: Equatable {
 struct DockedInsightTreeCard: View {
     let insight: InsightModel
 
+    /// When true, the body text fades/transforms/blurs in like a streamed model response.
+    var animateIn: Bool = false
+    /// Insight links grown under the card content while Make Node generates children — each
+    /// appears in sync with its child's reveal haptic.
+    var linkedInsights: [InsightModel] = []
     var onRemove: (() -> Void)? = nil
     var onFork:   (() -> Void)? = nil
+    var onSelectLinkedInsight: ((InsightModel) -> Void)? = nil
 
     @Environment(\.colorScheme) private var colorScheme
+    @State private var textRevealed = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -774,8 +980,36 @@ struct DockedInsightTreeCard: View {
                 .lineSpacing(12)
                 .foregroundColor(AquinasTheme.Colors.paragraphText)
                 .fixedSize(horizontal: false, vertical: true)
+                .modifier(GlideFadeModifier(isActive: animateIn && !textRevealed))
+
+            // Insight links grown one-by-one as Make Node reveals each child (on its haptic).
+            if !linkedInsights.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(linkedInsights, id: \.id) { linked in
+                        DockedInsightLinkRow(insight: linked) { onSelectLinkedInsight?($0) }
+                    }
+                }
+                .padding(.top, 4)
+            }
+
+            Text("Swipe up for more information")
+                .font(.figtreeSmall)
+                .foregroundColor(AquinasTheme.Colors.placeholderText)
         }
-        .padding(32)
+        .onAppear {
+            // The border + background fade in with the card; 0.15s later the body text
+            // animates in (blur/fade/transform), like a streamed model response.
+            guard animateIn else { return }
+            textRevealed = false
+            withAnimation(.easeOut(duration: 0.8).delay(0.3)) {
+                textRevealed = true
+            }
+        }
+        // Trim the bottom: the definition's .lineSpacing(12) leaves trailing space below the
+        // last line, so a full 32 there reads as noticeably more space than the 32 up top.
+        .padding(.horizontal, 32)
+        .padding(.top, 32)
+        .padding(.bottom, 20)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(insightTreeInsightColor)
         .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
@@ -783,17 +1017,23 @@ struct DockedInsightTreeCard: View {
             RoundedRectangle(cornerRadius: 36, style: .continuous)
                 .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
         )
-        .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 16)
+        .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 0)
     }
 }
 
+/// A node concept's docked card. Renders identically to `DockedInsightTreeCard` (icon + title +
+/// action buttons + definition), then lists links to its child/member insights underneath.
 private struct DockedNodeTreeCard: View {
     let node: NodeModel
 
+    var isSaved: Bool = false
     var onSelectInsight: (InsightModel) -> Void
+    var onToggleSaved: (() -> Void)? = nil
+    var onFork: (() -> Void)? = nil
 
     @Environment(\.colorScheme) private var colorScheme
 
+    /// Fallback body when a node carries no definition of its own (auto clustered concepts).
     private var summaryText: String {
         let titles = node.insights.prefix(3).map(\.title)
         guard !titles.isEmpty else {
@@ -803,47 +1043,54 @@ private struct DockedNodeTreeCard: View {
         return "\(node.conceptLabel) gathers related insights around \(titles.joined(separator: ", "))."
     }
 
+    private var bodyText: String {
+        node.definition.isEmpty ? summaryText : node.definition
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            HStack {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .center, spacing: 8) {
+                DockedCardTextBubbleIcon(size: 12, delay: 0.18, color: AquinasTheme.Colors.darkGreen)
+
                 Text(node.conceptLabel)
                     .font(.custom("Figtree-Bold", size: 18))
                     .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
 
                 Spacer()
 
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundColor(AquinasTheme.Colors.placeholderText)
+                ResponseButtons(
+                    isSaved: isSaved,
+                    canCopy: true,
+                    canFork: onFork != nil,
+                    copyText: bodyText,
+                    tintColor: AquinasTheme.Colors.placeholderText,
+                    saveTintColor: AquinasTheme.Colors.accentRed,
+                    onSave: onToggleSaved,
+                    onFork: onFork
+                )
             }
 
-            Text(summaryText)
+            Text(bodyText)
                 .font(.figtreeParagraph)
-                .lineSpacing(8)
+                .lineSpacing(12)
                 .foregroundColor(AquinasTheme.Colors.paragraphText)
-                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
 
-            VStack(alignment: .leading, spacing: 16) {
-                ForEach(Array(node.insights.enumerated()), id: \.element.id) { index, insight in
-                    Button {
-                        onSelectInsight(insight)
-                    } label: {
-                        HStack(spacing: 12) {
-                            DockedCardTextBubbleIcon(size: 14, delay: 0.18 + (Double(index) * 0.04), color: AquinasTheme.Colors.darkGreen)
-
-                            Text(insight.title)
-                                .font(.custom("Figtree-Bold", size: 16))
-                                .foregroundColor(AquinasTheme.Colors.darkGreen)
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.72)
-
-                            Spacer(minLength: 0)
-                        }
-                        .contentShape(Rectangle())
+            // Links to the concept's child / member insights.
+            if !node.insights.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(node.insights, id: \.id) { insight in
+                        DockedInsightLinkRow(insight: insight, onTap: onSelectInsight)
                     }
-                    .buttonStyle(.plain)
                 }
+                .padding(.top, 4)
             }
+
+            Text("Swipe up for more information")
+                .font(.figtreeSmall)
+                .foregroundColor(AquinasTheme.Colors.placeholderText)
         }
         .padding(32)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -853,7 +1100,42 @@ private struct DockedNodeTreeCard: View {
             RoundedRectangle(cornerRadius: 36, style: .continuous)
                 .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
         )
-        .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 16)
+        .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 0)
+    }
+}
+
+/// One tappable Insight link row — shared under both the insight and node concept cards for
+/// child/member insights (bubble icon + underlined title in the muted link color). Appears with a
+/// fade/rise/scale insertion so links added mid-animation (Make Node) glide in one at a time.
+private struct DockedInsightLinkRow: View {
+    let insight: InsightModel
+    var onTap: (InsightModel) -> Void
+
+    var body: some View {
+        Button {
+            onTap(insight)
+        } label: {
+            HStack(spacing: 8) {
+                DockedCardTextBubbleIcon(size: 14, delay: 0, color: AquinasTheme.Colors.darkGreen)
+
+                // No minimumScaleFactor: it interacts with the insertion transition below and
+                // locks later-inserted rows at a slightly reduced scale. Fixed size + truncation
+                // keeps every link identical.
+                Text(insight.title)
+                    .font(.figtreeParagraph)
+                    .bold()
+                    .foregroundColor(AquinasTheme.Colors.secondaryMuted)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        // Glide in with a fade + gentle rise. No .scale here — scaling the row makes the text's
+        // layout resolve at a smaller size and it stays shrunk after the transition settles.
+        .transition(.opacity.combined(with: .offset(y: 10)))
     }
 }
 
@@ -899,6 +1181,10 @@ private struct DockedConceptCard: View {
                     .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.65))
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            Text("Swipe up for more information")
+                .font(.figtreeSmall)
+                .foregroundColor(AquinasTheme.Colors.placeholderText)
         }
         .padding(32)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -948,7 +1234,7 @@ private struct MidpointPercentCard: View {
     private func row(index: Int, concept: ConceptDefinition) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "text.bubble.fill")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundColor(AquinasTheme.Colors.lightGreen)
             Text(concept.word.capitalized)
                 .font(.custom("Figtree-Bold", size: 14))
