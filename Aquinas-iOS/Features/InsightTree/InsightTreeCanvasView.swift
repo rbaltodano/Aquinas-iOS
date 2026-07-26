@@ -27,6 +27,12 @@ struct InsightTreeCanvasView: View {
     var placedMidpointSources: [UUID: [MidpointSource]] = [:]
     /// Per-insight bond length (connector radius) from relatedness to the parent node.
     var insightBondLengths: [UUID: CGFloat] = [:]
+    /// Semantic (MDS) target position per node. The sim anchors each node here with a weak
+    /// spring so overlap cleanup can't destroy the embedding-driven layout.
+    var layoutTargets: [UUID: CGPoint] = [:]
+    /// Normalized [0,1] depth per node (1 = nearest) from the third MDS component,
+    /// driving the 2.5D depth cues. Missing entries render at full depth.
+    var nodeDepths: [UUID: Double] = [:]
     var isHoveringTarget: Bool = false
     var isMidpointMode: Bool = false
     var midpointCenterRequest: Int = 0
@@ -103,19 +109,25 @@ struct InsightTreeCanvasView: View {
     @State private var displayLink: DisplayLinkDriver? = nil
     @State private var lastTickAt: CFTimeInterval = 0
     @State private var simFramesRemaining: Int = 0
+    @State private var simAlphaDecay: Double = 0.08
+    @State private var breezeStartedAt: CFTimeInterval?
+    @State private var breezeDirection = CGVector(dx: 0.92, dy: -0.38)
 
-    // Force constants — mirror InsightTreeViewModel.runForceLayout so the live sim matches the seed.
-    private static let repulsionK: CGFloat = 3600
-    private static let repulsionMinDist: CGFloat = 60
+    // Cleanup-pass constants. Global structure comes from the view model's semantic (MDS)
+    // layout; the sim only anchors nodes to those targets, separates overlaps, and spreads
+    // chip labels — it never invents structure of its own.
+    private static let anchorSpringK: CGFloat = 0.04    // weak pull toward the MDS target
     private static let overlapPadding: CGFloat = 24
     private static let simDamping: CGFloat = 0.62       // lower = settles faster, less wobble
-    private static let simMaxStep: CGFloat = 4          // per-frame move clamp (matches VM)
+    private static let simMaxStep: CGFloat = 4          // per-frame move clamp
     private static let simMaxDt: CFTimeInterval = 1.0 / 30
-    private static let constraintIterations = 4          // rigid edge-length projection passes
     private static let alphaDecay: Double = 0.08
+    private static let updateAlphaDecay: Double = 0.025
+    private static let updateIntensity: Double = 0.28
+    private static let breezeForce: CGFloat = 0.7
     private static let alphaFloor: Double = 0
     private static let jitterAmplitude: CGFloat = 0
-    private static let settleFrameBudget: Int = 150   // longer: node bonds rotate into VSEPR angles
+    private static let settleFrameBudget: Int = 150   // longer: chip bonds rotate into place
     private static let settleVelocityThreshold: CGFloat = 0.02
     // Per-insight "inner tube": when two chips get within this radius they bounce apart.
     // Cross-node overlap also nudges the parent nodes apart.
@@ -123,19 +135,19 @@ struct InsightTreeCanvasView: View {
     private static let insightBubblePadding: CGFloat = 12
     private static let bubblePushK: CGFloat = 0.06
     private static let forceGain: CGFloat = 0.5          // scales summed force → velocity
-    // VSEPR angular spread: every domain around a node — insight bonds AND bonds to neighbor
-    // nodes — repels EQUALLY (`domainK`), settling to maximum separation (2 → 180° linear,
-    // 3 → 120° trigonal, etc.). Both chip bonds AND node-to-node bonds rotate by a DIRECT
-    // clamped angular step (not a force) — a force competes with the generic pairwise node
-    // repulsion and gets drowned out, leaving node-node bond angles barely moving.
+    // Chip-label angular spread: every domain around a node — insight bonds AND the fixed
+    // directions of node-to-node lines — repels EQUALLY (`domainK`), settling chips to
+    // maximum separation from each other and from the lines. Only chip angles move; node
+    // positions are owned by the MDS targets.
     private static let domainK: Double = 1.0
     private static let chipAngGain: Double = 0.4         // viscous angular response speed
     private static let chipMaxAngStep: Double = 0.05     // max radians a bond rotates per frame
     private static let chipAngleEps: Double = 0.12       // softens the 1/Δθ repulsion
-    // Node-to-node bond spreading: a tangential force that swings a neighbor node around the
-    // shared node, run through the damped velocity pipeline (converges, no fly-off/jitter).
-    private static let edgeTorqueGain: CGFloat = 0.5
-    private static let edgeTorqueMax: CGFloat = 2.5      // clamp the tangential force per bond
+    // 2.5D depth cues from the third MDS component. One switch: false → pure 2D rendering.
+    private static let depthCuesEnabled = true
+    private static let depthMinScale: CGFloat = 0.85     // farthest node's scale
+    private static let depthMinOpacity: Double = 0.75    // farthest node's dimming
+    private static let depthParallaxGain: CGFloat = 0.08 // pan-offset fraction applied by depth
 
     private var activeScale: CGFloat {
         clamp(scale, lower: 0.28, upper: 2.6)
@@ -289,6 +301,15 @@ struct InsightTreeCanvasView: View {
                 // bodies so the tree doesn't jump), then wake the sim.
                 reconcileBodies()
                 reportUndiscoveredInsightCount()
+            }
+            .onChange(of: layoutTargets) { _, _ in
+                // New semantic targets (re-solve after a topology change): wake the sim so
+                // the anchor springs glide nodes to their new positions.
+                startSim(
+                    intensity: Self.updateIntensity,
+                    alphaDecay: Self.updateAlphaDecay,
+                    addsBreeze: true
+                )
             }
             .onChange(of: nodes) { _, newNodes in
                 // Insights added after the initial entrance (Make Node children, placed midpoints):
@@ -717,8 +738,8 @@ struct InsightTreeCanvasView: View {
         ForEach(displayGraphEdges()) { edge in
             if let from = simPosition(of: edge.fromNodeID),
                let to = simPosition(of: edge.toNodeID) {
-                let start = camera.worldToScreen(from, in: size)
-                let end = camera.worldToScreen(to, in: size)
+                let start = depthScreenPosition(from, nodeID: edge.fromNodeID, camera: camera, size: size)
+                let end = depthScreenPosition(to, nodeID: edge.toNodeID, camera: camera, size: size)
 
                 AnimatableLine(start: start, end: end)
                     .stroke(
@@ -755,10 +776,13 @@ struct InsightTreeCanvasView: View {
         let hasSelection = !selectedCanvasTargets.isEmpty
         ForEach(Array(placedMidpointNodeIDs), id: \.self) { placedID in
             if let placedWorld = simPosition(of: placedID), let sources = placedMidpointSources[placedID] {
-                let end = camera.worldToScreen(placedWorld, in: size)
+                let end = depthScreenPosition(placedWorld, nodeID: placedID, camera: camera, size: size)
                 ForEach(Array(sources.enumerated()), id: \.offset) { _, source in
                     if let sourceWorld = midpointSourceEndpoint(source) {
-                        AnimatableLine(start: camera.worldToScreen(sourceWorld, in: size), end: end)
+                        AnimatableLine(
+                            start: depthScreenPosition(sourceWorld, nodeID: owningNodeID(forInsightID: source.insightID), camera: camera, size: size),
+                            end: end
+                        )
                             .stroke(
                                 AquinasTheme.Colors.divider.opacity(0.9),
                                 style: StrokeStyle(lineWidth: 1, lineCap: .round)
@@ -779,10 +803,12 @@ struct InsightTreeCanvasView: View {
         let connectorNodes = displayNodes.filter { !placedMidpointNodeIDs.contains($0.id) }
         ForEach(connectorNodes) { node in
             ForEach(Array(node.insights.prefix(6).enumerated()), id: \.element.id) { index, insight in
-                let start = camera.worldToScreen(node.position, in: size)
-                let end = camera.worldToScreen(
+                let start = depthScreenPosition(node.position, nodeID: node.id, camera: camera, size: size)
+                let end = depthScreenPosition(
                     insightWorldPosition(for: node, index: index, count: min(node.insights.count, 6)),
-                    in: size
+                    nodeID: node.id,
+                    camera: camera,
+                    size: size
                 )
                 // Connector lines stay at a constant opacity regardless of zoom — only the
                 // chip label/background fade with `labelOpacity`, not the lines themselves.
@@ -817,10 +843,12 @@ struct InsightTreeCanvasView: View {
                     }
 
                     ForEach(Array(visibleInsights.enumerated()), id: \.element.id) { index, insight in
-                        let nodePosition = camera.worldToScreen(node.position, in: size)
-                        let insightPosition = camera.worldToScreen(
+                        let nodePosition = depthScreenPosition(node.position, nodeID: node.id, camera: camera, size: size)
+                        let insightPosition = depthScreenPosition(
                             insightWorldPosition(for: node, index: index, count: min(node.insights.count, 6)),
-                            in: size
+                            nodeID: node.id,
+                            camera: camera,
+                            size: size
                         )
 
                         if let selectedInsightIndex {
@@ -871,7 +899,7 @@ struct InsightTreeCanvasView: View {
                             end: camera.worldToScreen(currentWorldPosition, in: size)
                         )
                         .stroke(
-                            AquinasTheme.Colors.accentGreen.opacity(0.8),
+                            AquinasTheme.Colors.lightGreen.opacity(0.8),
                             style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
                         )
                         .frame(width: size.width, height: size.height)
@@ -880,7 +908,7 @@ struct InsightTreeCanvasView: View {
 
                 AnimatableLine(start: activePosition, end: center)
                     .stroke(
-                        AquinasTheme.Colors.accentGreen.opacity(0.8),
+                        AquinasTheme.Colors.lightGreen.opacity(0.8),
                         style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
                     )
                     .frame(width: size.width, height: size.height)
@@ -922,7 +950,7 @@ struct InsightTreeCanvasView: View {
                                     end: camera.worldToScreen(currWorld, in: size),
                                     from: segStart, to: segEnd,
                                     lineWidth: 4,
-                                    color: AquinasTheme.Colors.accentGreen,
+                                    color: AquinasTheme.Colors.lightGreen,
                                     opacity: 0.9
                                 )
                                 .frame(width: size.width, height: size.height)
@@ -936,7 +964,7 @@ struct InsightTreeCanvasView: View {
                                 end: center,
                                 from: segStart, to: segEnd,
                                 lineWidth: 4,
-                                color: AquinasTheme.Colors.accentGreen,
+                                color: AquinasTheme.Colors.lightGreen,
                                 opacity: 0.9
                             )
                             .frame(width: size.width, height: size.height)
@@ -964,8 +992,8 @@ struct InsightTreeCanvasView: View {
                     let targetNodeID = edge.fromNodeID == sourceNodeID ? edge.toNodeID : edge.fromNodeID
 
                     if let targetPos = simPosition(of: targetNodeID) {
-                        let start = camera.worldToScreen(sourcePos, in: size)
-                        let end = camera.worldToScreen(targetPos, in: size)
+                        let start = depthScreenPosition(sourcePos, nodeID: sourceNodeID, camera: camera, size: size)
+                        let end = depthScreenPosition(targetPos, nodeID: targetNodeID, camera: camera, size: size)
 
                         travelingPulseLine(start: start, end: end, progress: progress, lineWidth: 2.2)
                             .frame(width: size.width, height: size.height)
@@ -1259,15 +1287,15 @@ struct InsightTreeCanvasView: View {
             // PolygonShape is animatable so it follows the camera's zoom-out spring.
             if screenPts.count >= 3 {
                 PolygonShape(points: screenPts)
-                    .fill(AquinasTheme.Colors.accentGreen.opacity(0.25))
+                    .fill(AquinasTheme.Colors.lightGreen.opacity(0.25))
                     .allowsHitTesting(false)
 
                 PolygonShape(points: screenPts)
-                    .stroke(AquinasTheme.Colors.accentGreen.opacity(0.85), style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+                    .stroke(AquinasTheme.Colors.lightGreen.opacity(0.85), style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
                     .allowsHitTesting(false)
             } else if screenPts.count == 2 {
                 AnimatableLine(start: screenPts[0], end: screenPts[1])
-                    .stroke(AquinasTheme.Colors.accentGreen.opacity(0.85), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                    .stroke(AquinasTheme.Colors.lightGreen.opacity(0.85), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
                     .frame(width: size.width, height: size.height)
                     .allowsHitTesting(false)
             }
@@ -1328,11 +1356,13 @@ struct InsightTreeCanvasView: View {
             if edge.showSuggestButton,
                let from = simPosition(of: edge.fromNodeID),
                let to = simPosition(of: edge.toNodeID) {
-                let midpoint = CGPoint(
-                    x: (from.x + to.x) / 2,
-                    y: (from.y + to.y) / 2
+                // Midpoint of the depth-parallaxed endpoints, so the button tracks the line.
+                let fromScreen = depthScreenPosition(from, nodeID: edge.fromNodeID, camera: camera, size: size)
+                let toScreen = depthScreenPosition(to, nodeID: edge.toNodeID, camera: camera, size: size)
+                let position = CGPoint(
+                    x: (fromScreen.x + toScreen.x) / 2,
+                    y: (fromScreen.y + toScreen.y) / 2
                 )
-                let position = camera.worldToScreen(midpoint, in: size)
 
                 Button {
                     guard canAcceptTap else { return }
@@ -1374,7 +1404,7 @@ struct InsightTreeCanvasView: View {
         size: CGSize,
         labelOpacity: Double
     ) -> some View {
-        let position = camera.worldToScreen(node.position, in: size)
+        let position = depthScreenPosition(node.position, nodeID: node.id, camera: camera, size: size)
 
         ZStack(alignment: .topTrailing) {
             VStack(spacing: 18) {
@@ -1383,7 +1413,8 @@ struct InsightTreeCanvasView: View {
                     .foregroundStyle(AquinasTheme.Colors.lightGreen)
 
                 Text(node.conceptLabel)
-                    .font(.custom("LibreBaskerville-Regular", size: 18))
+                    .font(.custom("Figtree-Bold", size: 18))
+                    .lineSpacing(8)
                     .foregroundStyle(AquinasTheme.Colors.primaryReadable)
                     .multilineTextAlignment(.center)
                     .lineLimit(2)
@@ -1428,8 +1459,11 @@ struct InsightTreeCanvasView: View {
         .opacity(hasAppeared ? 1 : 0)
         .animation(.spring(response: 0.6, dampingFraction: 0.75).delay(0.1), value: hasAppeared)
         .transition(.scale(scale: 0.88, anchor: .center).combined(with: .opacity))
+        // 2.5D depth: farther nodes render smaller, dimmer, and behind nearer ones.
+        .scaleEffect(depthScale(node.id))
+        .opacity(depthOpacity(node.id))
         .position(position)
-        .zIndex(node.isSuggested ? 20 : 10)
+        .zIndex((node.isSuggested ? 20 : 10) + Double(depthFactor(node.id)) * 5)
     }
 
     /// Two quick medium taps, fired as a generated insight's shockwave bursts out.
@@ -1463,7 +1497,7 @@ struct InsightTreeCanvasView: View {
         // While unsplayed, render at the node center so the child appears to splay out from it.
         let atCenter      = unsplayedInsightIDs.contains(insight.id)
         let renderWorld   = atCenter ? node.position : worldPosition
-        let position      = camera.worldToScreen(renderWorld, in: size)
+        let position      = depthScreenPosition(renderWorld, nodeID: node.id, camera: camera, size: size)
         // Stable per-chip delay (0.05–0.25s) so the title collapse/expand staggers across chips.
 
         return ZStack(alignment: .leading) {
@@ -1526,8 +1560,11 @@ struct InsightTreeCanvasView: View {
         .blur(radius: isVisible ? 0 : 8)
         .animation(.spring(response: 0.6, dampingFraction: 0.75), value: isVisible)
         .transition(.scale(scale: 0.88, anchor: .center).combined(with: .opacity))
+        // 2.5D depth: chips inherit their node's depth so the whole cluster recedes together.
+        .scaleEffect(depthScale(node.id))
+        .opacity(depthOpacity(node.id))
         .position(position)
-        .zIndex(30)
+        .zIndex(30 + Double(depthFactor(node.id)) * 5)
     }
 
     private func insightFocusTarget(for insightID: UUID) -> CGPoint? {
@@ -1628,6 +1665,40 @@ struct InsightTreeCanvasView: View {
         )
     }
 
+    // MARK: - 2.5D Depth Cues
+
+    /// Depth multiplier for a node in [depthMin…, 1]: 1 = nearest (full size/opacity, no
+    /// parallax). Always 1 when the depth layer is disabled or the node has no depth entry.
+    private func depthFactor(_ nodeID: UUID) -> CGFloat {
+        guard Self.depthCuesEnabled else { return 1 }
+        return CGFloat(nodeDepths[nodeID] ?? 1)
+    }
+
+    private func depthScale(_ nodeID: UUID) -> CGFloat {
+        Self.depthMinScale + (1 - Self.depthMinScale) * depthFactor(nodeID)
+    }
+
+    private func depthOpacity(_ nodeID: UUID) -> Double {
+        Self.depthMinOpacity + (1 - Self.depthMinOpacity) * Double(depthFactor(nodeID))
+    }
+
+    /// World → screen with the node's depth parallax applied: farther nodes lag the pan
+    /// slightly, giving the map depth. Degenerates to `worldToScreen` when depth is off.
+    /// Deliberately not reflected in `screenToWorld` (taps), so the gain stays small.
+    private func depthScreenPosition(_ world: CGPoint, nodeID: UUID?, camera: InsightTreeCamera, size: CGSize) -> CGPoint {
+        var p = camera.worldToScreen(world, in: size)
+        guard Self.depthCuesEnabled, let nodeID else { return p }
+        let lag = (depthFactor(nodeID) - 1) * Self.depthParallaxGain
+        p.x += activeOffset.width * lag
+        p.y += activeOffset.height * lag
+        return p
+    }
+
+    /// The node whose orbit an insight chip belongs to (for depth lookups by insight id).
+    private func owningNodeID(forInsightID id: UUID) -> UUID? {
+        nodes.first(where: { $0.insights.contains { $0.id == id } })?.id
+    }
+
     // MARK: - Live Physics Simulation
 
     /// `nodes` with each position replaced by its live simulated position (falls back to the
@@ -1646,11 +1717,6 @@ struct InsightTreeCanvasView: View {
         bodies[id]?.pos ?? nodes.first(where: { $0.id == id })?.position
     }
 
-    /// Mirrors `InsightTreeViewModel.mapDistanceToLength` — semantic distance → spring length.
-    private func springTargetLength(_ distance: Double) -> CGFloat {
-        80 + CGFloat(distance) * 320
-    }
-
     /// Node footprint for the overlap-separation force — its longest bond plus chip extent.
     private func simFootprintRadius(_ node: NodeModel) -> CGFloat {
         if placedMidpointNodeIDs.contains(node.id) { return 70 }
@@ -1658,9 +1724,20 @@ struct InsightTreeCanvasView: View {
         return maxBond + 64
     }
 
-    private func startSim(frameBudget: Int = Self.settleFrameBudget) {
+    private func startSim(
+        intensity: Double = 1,
+        alphaDecay: Double = Self.alphaDecay,
+        addsBreeze: Bool = false,
+        frameBudget: Int = Self.settleFrameBudget
+    ) {
         simFramesRemaining = max(simFramesRemaining, frameBudget)
-        alpha = 1.0
+        alpha = max(alpha, intensity)
+        simAlphaDecay = alphaDecay
+        if addsBreeze {
+            breezeStartedAt = CACurrentMediaTime()
+            let angle = CGFloat.random(in: -0.5...0.5)
+            breezeDirection = CGVector(dx: cos(angle), dy: sin(angle))
+        }
         lastTickAt = 0
         guard displayLink == nil else { return }
         let driver = DisplayLinkDriver()
@@ -1684,14 +1761,25 @@ struct InsightTreeCanvasView: View {
         }
         bodies = frozen
         alpha = 0
+        breezeStartedAt = nil
         stopSim()
     }
 
     /// Seed bodies for new nodes, drop bodies for removed nodes, preserve the rest (no jump),
     /// and wake the sim. Called when the view model's topology changes.
     private func reconcileBodies() {
+        let isInitialLayout = bodies.isEmpty
         let liveIDs = Set(nodes.map(\.id))
         var next = bodies.filter { liveIDs.contains($0.key) }
+        if !isInitialLayout {
+            for (id, var body) in next {
+                body.vel = CGVector(
+                    dx: body.vel.dx * 0.2,
+                    dy: body.vel.dy * 0.2
+                )
+                next[id] = body
+            }
+        }
         for node in nodes where next[node.id] == nil {
             next[node.id] = SimBody(pos: node.position, vel: .zero)
         }
@@ -1709,11 +1797,19 @@ struct InsightTreeCanvasView: View {
         }
         chipAngles = nextAngles
 
-        startSim()
+        if isInitialLayout {
+            startSim()
+        } else {
+            startSim(
+                intensity: Self.updateIntensity,
+                alphaDecay: Self.updateAlphaDecay,
+                addsBreeze: true
+            )
+        }
     }
 
-    /// One integration step. Reads live `bodies` positions, applies the same forces the view
-    /// model's seed layout uses, holds pinned nodes fixed, and writes back once.
+    /// One cleanup step. Anchors each node to its semantic (MDS) target, separates overlapping
+    /// footprints/chips, spreads chip-label angles, holds pinned nodes fixed, and writes back once.
     private func stepSimulation(now: CFTimeInterval) {
         guard !bodies.isEmpty else { return }
         guard simFramesRemaining > 0 else {
@@ -1730,7 +1826,7 @@ struct InsightTreeCanvasView: View {
             pinned.insert(focused)   // keep the open-card node from sliding under its card
         }
 
-        let nodeByID = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
+        let nodeByID = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
         let entries = bodies.map { ($0.key, $0.value) }
         var forces: [UUID: CGVector] = [:]
         var maxChipAngMotion: Double = 0   // keeps the sim awake while chips are still spreading
@@ -1757,38 +1853,46 @@ struct InsightTreeCanvasView: View {
             chipByNode[id] = pts
         }
 
-        // Every domain around a node: its insight bonds AND its bonds to neighbor nodes. VSEPR
-        // repels them all equally — chip bonds rotate the chip angle, edge bonds rotate the
-        // neighbor node tangentially (at fixed bond length), so bond angles are maximized.
-        enum BondKind { case insight(UUID); case edge(neighbor: UUID) }
+        // Every domain around a node: its insight bonds AND the fixed directions of its
+        // node-to-node lines. All domains repel equally, but only chip angles move — node
+        // positions belong to the MDS targets, so line directions act as read-only repellers
+        // that keep chips from sitting on top of edges.
+        enum BondKind { case insight(UUID); case fixedEdge }
         struct Bond { let angle: Double; let kind: BondKind }
         var bondsByNode: [UUID: [Bond]] = [:]
         for ci in chipInfos {
             bondsByNode[ci.nodeID, default: []].append(Bond(angle: ci.angle, kind: .insight(ci.id)))
         }
         // Use the SAME edges that are rendered (displayGraphEdges fabricates a line for the
-        // 2-node / ring fallback), so every visible node-to-node line is a VSEPR domain too.
+        // 2-node / ring fallback), so every visible node-to-node line repels chips too.
         for edge in displayGraphEdges() {
             guard let aPos = bodies[edge.fromNodeID]?.pos, let bPos = bodies[edge.toNodeID]?.pos else { continue }
-            bondsByNode[edge.fromNodeID, default: []].append(Bond(angle: Double(atan2(bPos.y - aPos.y, bPos.x - aPos.x)), kind: .edge(neighbor: edge.toNodeID)))
-            bondsByNode[edge.toNodeID, default: []].append(Bond(angle: Double(atan2(aPos.y - bPos.y, aPos.x - bPos.x)), kind: .edge(neighbor: edge.fromNodeID)))
+            bondsByNode[edge.fromNodeID, default: []].append(Bond(angle: Double(atan2(bPos.y - aPos.y, bPos.x - aPos.x)), kind: .fixedEdge))
+            bondsByNode[edge.toNodeID, default: []].append(Bond(angle: Double(atan2(aPos.y - bPos.y, aPos.x - bPos.x)), kind: .fixedEdge))
         }
 
-        // Repulsion (all pairs) + overlap separation + per-chip bubble collision.
+        // Anchor spring toward the MDS target + overlap separation + per-chip bubble collision.
         for i in entries.indices {
             let (idA, a) = entries[i]
             if pinned.contains(idA) { continue }
             var fx: CGFloat = 0, fy: CGFloat = 0
+            if let target = layoutTargets[idA] {
+                fx += (target.x - a.pos.x) * Self.anchorSpringK
+                fy += (target.y - a.pos.y) * Self.anchorSpringK
+            }
+            if let breezeStartedAt {
+                let elapsed = now - breezeStartedAt
+                let phaseOffset = Double(idA.uuid.0) / 255 * 0.45
+                let wave = CGFloat(sin(elapsed * 2.4 + phaseOffset))
+                fx += breezeDirection.dx * Self.breezeForce * wave
+                fy += breezeDirection.dy * Self.breezeForce * wave
+            }
             for j in entries.indices where j != i {
                 let (idB, b) = entries[j]
                 var dx = a.pos.x - b.pos.x
                 var dy = a.pos.y - b.pos.y
                 var dist = hypot(dx, dy)
                 if dist < 0.5 { dx = .random(in: -1...1); dy = .random(in: -1...1); dist = 1 }
-                let clamped = max(Self.repulsionMinDist, dist)
-                let f = Self.repulsionK / (clamped * clamped)
-                fx += (dx / dist) * f
-                fy += (dy / dist) * f
 
                 if let na = nodeByID[idA], let nb = nodeByID[idB] {
                     let minDist = simFootprintRadius(na) + simFootprintRadius(nb) + Self.overlapPadding
@@ -1822,14 +1926,13 @@ struct InsightTreeCanvasView: View {
             forces[idA] = CGVector(dx: fx, dy: fy)
         }
 
-        // Unified VSEPR bond-angle spread: for every node, all incident domains (insight bonds +
-        // bonds to neighbor nodes) repel each other equally toward maximum separation. Insight
-        // bonds rotate the chip's free angle directly; node-to-node bonds apply a *tangential
-        // force* that swings the neighbor around the shared node through the damped velocity
-        // pipeline. The rigid edge constraint below re-fixes the bond length each frame.
+        // Chip-angle spread: for every node, all incident domains (insight bonds + fixed edge
+        // directions) repel each other equally toward maximum separation, but only insight
+        // bonds move — each accumulates torque and rotates its chip's free angle directly.
         var chipTorque: [UUID: Double] = [:]
         for (_, bonds) in bondsByNode where bonds.count > 1 {
             for ii in bonds.indices {
+                guard case .insight(let id) = bonds[ii].kind else { continue }
                 let bi = bonds[ii]
                 var torque = 0.0
                 for jj in bonds.indices where jj != ii {
@@ -1837,25 +1940,13 @@ struct InsightTreeCanvasView: View {
                     if abs(dθ) < 1e-4 { dθ = .random(in: -0.05...0.05) }
                     torque += Self.domainK * (dθ >= 0 ? 1 : -1) / (abs(dθ) + Self.chipAngleEps)
                 }
-                switch bi.kind {
-                case .insight(let id):
-                    chipTorque[id, default: 0] += torque
-                case .edge(let neighbor):
-                    guard !pinned.contains(neighbor) else { continue }
-                    // Tangential direction (perpendicular to the bond) around the shared node.
-                    let tx = CGFloat(-sin(bi.angle)), ty = CGFloat(cos(bi.angle))
-                    var mag = CGFloat(torque) * Self.edgeTorqueGain
-                    mag = max(-Self.edgeTorqueMax, min(Self.edgeTorqueMax, mag))
-                    forces[neighbor, default: .zero].dx += tx * mag
-                    forces[neighbor, default: .zero].dy += ty * mag
-                }
+                chipTorque[id, default: 0] += torque
             }
         }
-        // Cooling factor (simulated annealing). The VSEPR angular repulsion and pairwise node
-        // repulsion never vanish at equilibrium, so leaving motion uncooled makes bonds oscillate
-        // around the ±π boundary and nodes creep — visible as jitter that only stops when the frame
-        // budget expires. Scaling every frame's displacement by `alpha` (which decays to 0) lets the
-        // layout converge and freeze smoothly.
+        // Cooling factor (simulated annealing). The angular repulsion never vanishes at
+        // equilibrium, so leaving motion uncooled makes bonds oscillate around the ±π boundary —
+        // visible as jitter that only stops when the frame budget expires. Scaling every frame's
+        // displacement by `alpha` (which decays to 0) lets the layout converge and freeze smoothly.
         let cool = alpha
         let coolCG = CGFloat(alpha)
 
@@ -1889,62 +1980,12 @@ struct InsightTreeCanvasView: View {
             maxMove = max(maxMove, hypot(stepX, stepY))
         }
 
-        // Rigid edge constraint: lines keep their fixed target length (no growing/shrinking).
-        // A few projection iterations snap each connected pair back to its target distance.
-        for _ in 0..<Self.constraintIterations {
-            for edge in edges {
-                guard var a = next[edge.fromNodeID], var b = next[edge.toNodeID] else { continue }
-                let aPin = pinned.contains(edge.fromNodeID)
-                let bPin = pinned.contains(edge.toNodeID)
-                if aPin && bPin { continue }
-                var dx = b.pos.x - a.pos.x
-                var dy = b.pos.y - a.pos.y
-                var d = hypot(dx, dy)
-                if d < 0.001 { dx = .random(in: -1...1); dy = .random(in: -1...1); d = 1 }
-                let target = springTargetLength(edge.distance)
-                let corr = (d - target) / d
-                if aPin {
-                    b.pos.x -= dx * corr; b.pos.y -= dy * corr
-                    next[edge.toNodeID] = b
-                } else if bPin {
-                    a.pos.x += dx * corr; a.pos.y += dy * corr
-                    next[edge.fromNodeID] = a
-                } else {
-                    a.pos.x += dx * corr * 0.5; a.pos.y += dy * corr * 0.5
-                    b.pos.x -= dx * corr * 0.5; b.pos.y -= dy * corr * 0.5
-                    next[edge.fromNodeID] = a
-                    next[edge.toNodeID] = b
-                }
-            }
-        }
-
         // Pinned bodies track their authoritative view-model position.
         for id in pinned {
             if let node = nodeByID[id] { next[id]?.pos = node.position }
         }
 
-        // Drift guard: with nothing pinned to anchor the graph, keep the centroid of all
-        // bodies fixed frame-to-frame. This removes any net translation the bond-angle forces
-        // introduce, so the tree spreads in place instead of flying off in one direction.
-        if pinned.isEmpty, !next.isEmpty {
-            var oldSum = CGPoint.zero, newSum = CGPoint.zero
-            for (id, body) in next {
-                newSum.x += body.pos.x; newSum.y += body.pos.y
-                let prev = bodies[id]?.pos ?? body.pos
-                oldSum.x += prev.x; oldSum.y += prev.y
-            }
-            let n = CGFloat(next.count)
-            let shiftX = (oldSum.x - newSum.x) / n
-            let shiftY = (oldSum.y - newSum.y) / n
-            if abs(shiftX) > 0.0001 || abs(shiftY) > 0.0001 {
-                for id in next.keys {
-                    next[id]?.pos.x += shiftX
-                    next[id]?.pos.y += shiftY
-                }
-            }
-        }
-
-        alpha = max(Self.alphaFloor, alpha * (1 - Self.alphaDecay))
+        alpha = max(Self.alphaFloor, alpha * (1 - simAlphaDecay))
         simFramesRemaining -= 1
         // Settle once the actual (cooled) per-frame motion is negligible — both node displacement
         // and chip-angle rotation. Because displacement is cooled by `alpha`, this is reached
@@ -2281,14 +2322,14 @@ private struct MidpointHandle: View {
 
             ZStack(alignment: .bottom) {
                 Circle()
-                    .fill(AquinasTheme.Colors.accentGreen)
+                    .fill(AquinasTheme.Colors.lightGreen)
                     .frame(width: circleSize, height: circleSize)
                     .overlay(Circle().stroke(AquinasTheme.Colors.canvas, lineWidth: 2))
                     .shadow(color: Color.black.opacity(0.25), radius: 4, x: 0, y: 2)
 
                 Image(systemName: "text.bubble.fill")
                     .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(AquinasTheme.Colors.accentGreen)
+                    .foregroundStyle(AquinasTheme.Colors.lightGreen)
                     .shadow(color: Color.black.opacity(0.18), radius: 3, x: 0, y: 1)
                     .opacity(Double(1.0 - phase * 0.5))   // 100% at bottom, 50% at top
                     .offset(y: yOffset)

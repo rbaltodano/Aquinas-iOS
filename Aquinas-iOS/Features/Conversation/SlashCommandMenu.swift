@@ -27,25 +27,28 @@ struct SlashCommand: Identifiable, Equatable {
     var description: String = ""
 }
 
+enum SlashCommandInvocation: Equatable {
+    case compact
+    case clear
+}
+
 extension SlashCommand {
-    /// The command set from the Figma design (node 553:607), in order.
+    /// Commands currently supported by the conversation runtime.
     static let all: [SlashCommand] = [
         SlashCommand(name: "/compact",    description: "Condense the conversation so far"),
-        SlashCommand(name: "/clear",      description: "Start a fresh conversation"),
-        SlashCommand(name: "/summary",    description: "Summarize the discussion"),
-        SlashCommand(name: "/define",     description: "Define a term"),
-        SlashCommand(name: "/argue",      description: "Argue a position"),
-        SlashCommand(name: "/counter",    description: "Give the counterargument"),
-        SlashCommand(name: "/compare",    description: "Compare two ideas"),
-        SlashCommand(name: "/sources",    description: "Cite supporting sources"),
-        SlashCommand(name: "/question",   description: "Pose a guiding question"),
-        SlashCommand(name: "/objections", description: "Raise objections"),
-        SlashCommand(name: "/reply",      description: "Draft a reply"),
-        SlashCommand(name: "/new",        description: "Begin a new topic"),
-        SlashCommand(name: "/topics",     description: "Browse study topics"),
-        SlashCommand(name: "/save",       description: "Save this conversation"),
-        SlashCommand(name: "/help",       description: "Show all commands"),
+        SlashCommand(name: "/clear",      description: "Clear the current conversation"),
     ]
+
+    static func invocation(for text: String) -> SlashCommandInvocation? {
+        switch text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "/compact":
+            return .compact
+        case "/clear":
+            return .clear
+        default:
+            return nil
+        }
+    }
 }
 
 /// The slash-command picker card. Matches the Figma card exactly (24pt padding,

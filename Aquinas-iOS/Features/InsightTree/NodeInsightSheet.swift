@@ -14,7 +14,8 @@ struct NodeInsightSheet: View {
         ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: 24) {
                 Text(node.conceptLabel)
-                    .font(.baskervilleHeading1)
+                    .font(.figtreeDisplay)
+                    .lineSpacing(8)
                     .foregroundColor(AquinasTheme.Colors.primaryReadable)
                     .frame(maxWidth: .infinity, alignment: .leading)
 

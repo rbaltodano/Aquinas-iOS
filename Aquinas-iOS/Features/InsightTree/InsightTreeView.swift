@@ -13,7 +13,9 @@ private let insightTreeInsightColor = AquinasTheme.Colors.canvasSecondary
 
 struct InsightTreeView: View {
     let insights: [ConceptDefinition]
+    let conversationID: UUID?
     var selectionRequest: Int = 0
+    var persistedTreeRefreshRequest: Int = 0
     var clearSelectionRequest: Int = 0
     var dismissHoverRequest: Int = 0
     var createConceptRequest: Int = 0
@@ -44,6 +46,8 @@ struct InsightTreeView: View {
     var inputFont: ConversationFontOption = .serif
     var conversationFontSize: ConversationFontSizeOption = .small
     var showQuestionBar: Bool = true
+    let model: AquinasModel
+    let insightTreeService: InsightTreeService
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -85,7 +89,9 @@ struct InsightTreeView: View {
 
     init(
         insights: [ConceptDefinition],
+        conversationID: UUID? = nil,
         selectionRequest: Int = 0,
+        persistedTreeRefreshRequest: Int = 0,
         clearSelectionRequest: Int = 0,
         dismissHoverRequest: Int = 0,
         createConceptRequest: Int = 0,
@@ -114,10 +120,17 @@ struct InsightTreeView: View {
         onUndiscoveredInsightCountChange: ((Int) -> Void)? = nil,
         inputFont: ConversationFontOption = .serif,
         conversationFontSize: ConversationFontSizeOption = .small,
-        showQuestionBar: Bool = true
+        showQuestionBar: Bool = true,
+        model: AquinasModel = MockAquinasModel(),
+        embeddingProvider: EmbeddingProvider = NLEmbeddingProvider(),
+        insightTreeService: InsightTreeService = BackendInsightTreeService()
     ) {
         self.insights              = insights
+        self.conversationID        = conversationID
+        self.model                 = model
+        self.insightTreeService    = insightTreeService
         self.selectionRequest      = selectionRequest
+        self.persistedTreeRefreshRequest = persistedTreeRefreshRequest
         self.clearSelectionRequest = clearSelectionRequest
         self.dismissHoverRequest   = dismissHoverRequest
         self.createConceptRequest  = createConceptRequest
@@ -147,7 +160,12 @@ struct InsightTreeView: View {
         self.inputFont             = inputFont
         self.conversationFontSize  = conversationFontSize
         self.showQuestionBar       = showQuestionBar
-        _viewModel = StateObject(wrappedValue: InsightTreeViewModel(insights: insights, promotedInsightIDs: promotedInsightIDs))
+        _viewModel = StateObject(wrappedValue: InsightTreeViewModel(
+            insights: insights,
+            promotedInsightIDs: promotedInsightIDs,
+            model: model,
+            embeddingProvider: embeddingProvider
+        ))
     }
 
     private var canvasTertiary: Color {
@@ -202,6 +220,8 @@ struct InsightTreeView: View {
                 placedMidpointNodeIDs: viewModel.placedMidpointNodeIDs,
                 placedMidpointSources: viewModel.placedMidpointSources,
                 insightBondLengths: viewModel.insightBondLengths,
+                layoutTargets: viewModel.layoutTargets,
+                nodeDepths: viewModel.nodeDepths,
                 isHoveringTarget: selectedInsight != nil || selectedNode != nil || hoveredConcept != nil,
                 isMidpointMode: isMidpointMode,
                 midpointCenterRequest: midpointCenterRequest,
@@ -313,15 +333,20 @@ struct InsightTreeView: View {
                                 onForkInsight?(concept)
                             }
                         )
+                        .id(concept.id)
                         .offset(y: dockedCardDragY)
                         .gesture(dockedCardDismissGesture)
-                        .transition(.scale(scale: 0.35, anchor: .bottom).combined(with: .opacity))
+                        .transition(.bottomDockCard)
                         .padding(.horizontal, 10)
                     } else if let selectedInsight {
                         DockedInsightTreeCard(
                             insight: selectedInsight,
+                            isSaved: savedConceptIDs.contains(selectedInsight.id),
                             animateIn: animateMidpointCardText,
                             linkedInsights: makeNodeLinkInsights,
+                            onToggleSaved: {
+                                onToggleSavedConcept?(concept(for: selectedInsight))
+                            },
                             onRemove: { pendingRemoveInsight = selectedInsight },
                             onFork:   { performForkInsight(selectedInsight) },
                             onSelectLinkedInsight: { insight in
@@ -329,9 +354,10 @@ struct InsightTreeView: View {
                                 showInsightCard(insight)
                             }
                         )
+                        .id(selectedInsight.id)
                         .offset(y: dockedCardDragY)
                         .gesture(dockedCardDismissGesture)
-                        .transition(.scale(scale: 0.35, anchor: .bottom).combined(with: .opacity))
+                        .transition(.bottomDockCard)
                         .padding(.horizontal, 10)
                     } else if let selectedNode {
                         DockedNodeTreeCard(
@@ -342,9 +368,10 @@ struct InsightTreeView: View {
                             },
                             onFork: { performForkNode(selectedNode) }
                         )
+                        .id(selectedNode.id)
                         .offset(y: dockedCardDragY)
                         .gesture(dockedCardDismissGesture)
-                        .transition(.scale(scale: 0.35, anchor: .bottom).combined(with: .opacity))
+                        .transition(.bottomDockCard)
                         .padding(.horizontal, 10)
                     }
                 }
@@ -470,7 +497,13 @@ struct InsightTreeView: View {
                 highlightInsightPair()
             }
         }
-        .alert("Remove bookmark?", isPresented: Binding(
+        .task(id: conversationID) {
+            await loadPersistedTree()
+        }
+        .onChange(of: persistedTreeRefreshRequest) { _, _ in
+            Task { await loadPersistedTree() }
+        }
+        .alert("Remove from conversation?", isPresented: Binding(
             get: { pendingRemoveInsight != nil },
             set: { if !$0 { pendingRemoveInsight = nil } }
         )) {
@@ -482,7 +515,7 @@ struct InsightTreeView: View {
                 pendingRemoveInsight = nil
             }
         } message: {
-            Text("This insight will be removed from your Insight Tree. You can undo this immediately after.")
+            Text("This insight will be removed from this conversation’s tree. Its global bookmark is unchanged.")
         }
         .sheet(item: $viewModel.selectedSuggestedNode) { node in
             SuggestedInsightSheet(node: node) {
@@ -530,7 +563,7 @@ struct InsightTreeView: View {
         clearMakeNodeCardGrowth()
         playDockedCardHaptic()
         onSelectionStateChange?(true)
-        onInsightSelectionStateChange?(true)
+        onInsightSelectionStateChange?(false)
         onQuoteInsight?(quoteTarget(for: node))
 
         withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
@@ -568,7 +601,7 @@ struct InsightTreeView: View {
     }
 
     private func performRemoveInsight(_ insight: InsightModel) {
-        guard let concept = insights.first(where: { $0.id == insight.id }) else { return }
+        let concept = concept(for: insight)
         onRemoveInsight?(concept)   // triggers onChange → dismissDockedInsight
         undoTask?.cancel()
         withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
@@ -870,11 +903,12 @@ struct InsightTreeView: View {
         )
     }
 
-    /// Seam for the real model call. Mirrors `requestDynamicDefinition` (CurrentConversation.swift).
-    /// When wired, build a "blend these concepts at these weights" prompt and replace the placed
-    /// concept's contents in place via the view model.
-    private func requestMidpointDefinition(weights: [Double], targets: [ConceptDefinition]) async {
-        // TODO: call the model with the weighted blend prompt and update the placed concept.
+    /// Real model call, not yet wired into `placeMidpointInsight`'s flow — that still commits
+    /// `makeMidpointConcept`'s synchronous placeholder so the node appears pinned immediately.
+    /// This is the seam for replacing the placed concept's contents in place via the view model
+    /// once a real blend result is ready.
+    private func requestMidpointDefinition(weights: [Double], targets: [ConceptDefinition]) async -> ConceptDefinition {
+        await model.blendConcepts(targets, weights: weights)
     }
 
     private func insightID(for target: CanvasSelectionTarget) -> UUID? {
@@ -889,15 +923,92 @@ struct InsightTreeView: View {
     private func concept(for target: CanvasSelectionTarget) -> ConceptDefinition? {
         switch target {
         case .insight(let id):
-            return insights.first(where: { $0.id == id })
+            guard let insight = viewModel.nodes
+                .flatMap(\.insights)
+                .first(where: { $0.id == id }) else {
+                return nil
+            }
+            return concept(for: insight)
         case .node(let id):
             guard let node = viewModel.nodes.first(where: { $0.id == id }) else { return nil }
             return quoteTarget(for: node)
         }
     }
 
-    private func concept(for insight: InsightModel) -> ConceptDefinition? {
+    private func concept(for insight: InsightModel) -> ConceptDefinition {
         insights.first(where: { $0.id == insight.id })
+            ?? ConceptDefinition(
+                id: insight.id,
+                word: insight.title,
+                partOfSpeech: "",
+                pronunciation: "",
+                meaning: insight.definition,
+                example: ""
+            )
+    }
+
+    private func loadPersistedTree() async {
+        guard let conversationID else { return }
+        do {
+            var tree = try await insightTreeService.tree(for: conversationID)
+            guard !Task.isCancelled else { return }
+
+            var didRepairNodeLabel = false
+            for node in tree.nodes where node.needsGeneratedLabel {
+                let descriptions = node.insights.map {
+                    "\($0.title): \($0.definition)"
+                }
+                let label = await model.labelSubject(forTitles: descriptions)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !label.isEmpty else { continue }
+                do {
+                    try await insightTreeService.labelNode(
+                        nodeID: node.id,
+                        in: conversationID,
+                        label: label
+                    )
+                    didRepairNodeLabel = true
+                } catch {
+                    continue
+                }
+            }
+            if didRepairNodeLabel {
+                tree = try await insightTreeService.tree(for: conversationID)
+                guard !Task.isCancelled else { return }
+            }
+            viewModel.applyPersistedTree(tree)
+
+            // One-time/back-online reconciliation for saved concepts already associated with
+            // this conversation before persistent tree consumption was introduced.
+            let storedIDs = Set(tree.nodes.flatMap(\.insights).map(\.id))
+            let missingSavedInsights = insights.filter {
+                savedConceptIDs.contains($0.id) && !storedIDs.contains($0.id)
+            }
+            var didSaveMissingInsight = false
+            for concept in missingSavedInsights {
+                do {
+                    let suggestedNodeLabel = await model.labelSubject(
+                        forTitles: ["\(concept.word): \(concept.meaning)"]
+                    )
+                    try await insightTreeService.save(
+                        concept,
+                        to: conversationID,
+                        suggestedNodeLabel: suggestedNodeLabel
+                    )
+                    didSaveMissingInsight = true
+                } catch {
+                    continue
+                }
+            }
+            if didSaveMissingInsight {
+                tree = try await insightTreeService.tree(for: conversationID)
+                guard !Task.isCancelled else { return }
+                viewModel.applyPersistedTree(tree)
+            }
+        } catch {
+            // The local backend is optional during previews/offline use. Keep the existing
+            // in-memory canvas instead of blanking a usable tree.
+        }
     }
 
     private func quoteTarget(for node: NodeModel) -> ConceptDefinition? {
@@ -934,12 +1045,14 @@ enum CanvasSelectionTarget: Equatable {
 
 struct DockedInsightTreeCard: View {
     let insight: InsightModel
+    var isSaved: Bool = false
 
     /// When true, the body text fades/transforms/blurs in like a streamed model response.
     var animateIn: Bool = false
     /// Insight links grown under the card content while Make Node generates children — each
     /// appears in sync with its child's reveal haptic.
     var linkedInsights: [InsightModel] = []
+    var onToggleSaved: (() -> Void)? = nil
     var onRemove: (() -> Void)? = nil
     var onFork:   (() -> Void)? = nil
     var onSelectLinkedInsight: ((InsightModel) -> Void)? = nil
@@ -961,25 +1074,31 @@ struct DockedInsightTreeCard: View {
                 Spacer()
 
                 ResponseButtons(
-                    isSaved: true,
+                    isSaved: isSaved,
                     canCopy: true,
                     canFork: true,
                     copyText: insight.definition,
                     tintColor: AquinasTheme.Colors.placeholderText,
-                    saveTintColor: AquinasTheme.Colors.accentRed,
-                    onSave: { onRemove?() },
+                    saveTintColor: isSaved ? AquinasTheme.Colors.accentRed : nil,
+                    onSave: onToggleSaved,
                     onFork: { onFork?() }
                 )
+
+                if let onRemove {
+                    Button(action: onRemove) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundColor(AquinasTheme.Colors.placeholderText)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Remove from conversation")
+                }
             }
 
             let definitionText = insight.definition.isEmpty || insight.definition.lowercased() == insight.title.lowercased()
                 ? "This is an example of what an Insight Card will look like, the definition as relates to subject will be here"
                 : insight.definition
-            Text(definitionText)
-                .font(.figtreeParagraph)
-                .lineSpacing(12)
-                .foregroundColor(AquinasTheme.Colors.paragraphText)
-                .fixedSize(horizontal: false, vertical: true)
+            TruncatableParagraph(text: definitionText)
                 .modifier(GlideFadeModifier(isActive: animateIn && !textRevealed))
 
             // Insight links grown one-by-one as Make Node reveals each child (on its haptic).
@@ -991,10 +1110,6 @@ struct DockedInsightTreeCard: View {
                 }
                 .padding(.top, 4)
             }
-
-            Text("Swipe up for more information")
-                .font(.figtreeSmall)
-                .foregroundColor(AquinasTheme.Colors.placeholderText)
         }
         .onAppear {
             // The border + background fade in with the card; 0.15s later the body text
@@ -1072,11 +1187,7 @@ private struct DockedNodeTreeCard: View {
                 )
             }
 
-            Text(bodyText)
-                .font(.figtreeParagraph)
-                .lineSpacing(12)
-                .foregroundColor(AquinasTheme.Colors.paragraphText)
-                .fixedSize(horizontal: false, vertical: true)
+            TruncatableParagraph(text: bodyText)
 
             // Links to the concept's child / member insights.
             if !node.insights.isEmpty {
@@ -1087,10 +1198,6 @@ private struct DockedNodeTreeCard: View {
                 }
                 .padding(.top, 4)
             }
-
-            Text("Swipe up for more information")
-                .font(.figtreeSmall)
-                .foregroundColor(AquinasTheme.Colors.placeholderText)
         }
         .padding(32)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1169,22 +1276,7 @@ private struct DockedConceptCard: View {
             let meaningText = concept.meaning.isEmpty || concept.meaning.lowercased() == concept.word.lowercased()
                 ? "This is an example of what an Insight Card will look like, the definition as relates to subject will be here"
                 : concept.meaning
-            Text(meaningText)
-                .font(.figtreeParagraph)
-                .lineSpacing(12)
-                .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
-                .fixedSize(horizontal: false, vertical: true)
-            if !concept.example.isEmpty {
-                Text("\"\(concept.example)\"")
-                    .font(.custom("LibreBaskerville-Italic", size: 13))
-                    .lineSpacing(8)
-                    .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.65))
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Text("Swipe up for more information")
-                .font(.figtreeSmall)
-                .foregroundColor(AquinasTheme.Colors.placeholderText)
+            TruncatableParagraph(text: meaningText, color: AquinasTheme.Colors.paragraphText.opacity(0.75))
         }
         .padding(32)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1419,23 +1511,10 @@ private struct DockedCardTextBubbleIcon: View {
 
 private struct EmptyInsightTreeView: View {
     var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "brain.head.profile")
-                .font(.system(size: 28, weight: .semibold))
-                .foregroundColor(AquinasTheme.Colors.lightGreen)
-                .sfSymbolDrawOn()
-
-            Text("Insights will gather here")
-                .font(.baskervilleHeading1)
-                .foregroundColor(AquinasTheme.Colors.primaryReadable)
-
-            Text("Save insights from conversations to begin forming Theo's map of connected ideas.")
-                .font(.figtreeParagraph)
-                .lineSpacing(6)
-                .multilineTextAlignment(.center)
-                .foregroundColor(AquinasTheme.Colors.paragraphText)
-                .frame(maxWidth: 280)
-        }
-        .padding(24)
+        AquinasEmptyState(
+            systemImage: "brain.head.profile",
+            title: "Insights will gather here",
+            message: "Save insights from conversations to begin forming Theo's map of connected ideas."
+        )
     }
 }

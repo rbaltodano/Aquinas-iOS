@@ -32,8 +32,8 @@ final class TextInputRelay {
 ///    UITextView's own buffer, so `onChange(of: activeBranches)` never fires while
 ///    typing (eliminating the primary source of typing lag).
 /// 2. Intercepts the Return key (via UITextViewDelegate.shouldChangeTextIn) to
-///    auto-continue ordered lists ("1. ") and unordered lists ("- ") at UIKit speed,
-///    with zero SwiftUI overhead.
+///    submit when `onSubmit` is provided, otherwise auto-continue ordered lists
+///    ("1. ") and unordered lists ("- ") at UIKit speed, with zero SwiftUI overhead.
 /// 3. Flushes text → binding when `submitTrigger` increments (the dock arrow button).
 /// 4. Flushes text → binding on blur (textViewDidEndEditing).
 struct ListAwareTextField: UIViewRepresentable {
@@ -43,6 +43,7 @@ struct ListAwareTextField: UIViewRepresentable {
     @Binding var text: String
     var placeholder: String = ""
     var font: UIFont = UIFont(name: "LibreBaskerville-Regular", size: 16) ?? .systemFont(ofSize: 16)
+    var lineHeight: CGFloat? = nil
     var isLocked: Bool = false
     var textColor: UIColor = .aquinasPrimaryReadable
     var textAlignment: NSTextAlignment = .natural
@@ -52,6 +53,8 @@ struct ListAwareTextField: UIViewRepresentable {
     var relay: TextInputRelay? = nil
     /// Called every time the text changes (for placeholder visibility etc.).
     var onTextChange: ((String) -> Void)? = nil
+    /// Called when Return should submit the current question instead of inserting a newline.
+    var onSubmit: (() -> Void)? = nil
 
     // MARK: - UIViewRepresentable
 
@@ -70,9 +73,12 @@ struct ListAwareTextField: UIViewRepresentable {
         tv.textContainer.lineFragmentPadding = 0
         tv.autocorrectionType = .yes
         tv.autocapitalizationType = .sentences
-        tv.returnKeyType = .default
+        tv.returnKeyType = onSubmit == nil ? .default : .send
         tv.typingAttributes = makeTypingAttributes()
-        tv.text = text
+        tv.attributedText = NSAttributedString(
+            string: text,
+            attributes: makeTypingAttributes()
+        )
         // Allow SwiftUI to compress the view horizontally — without this the
         // UITextView demands its ideal (unbounded) width and stretches the layout.
         tv.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -96,7 +102,12 @@ struct ListAwareTextField: UIViewRepresentable {
 
     private func makeTypingAttributes() -> [NSAttributedString.Key: Any] {
         let style = NSMutableParagraphStyle()
-        style.lineSpacing = font.lineHeight * 0.2
+        if let lineHeight {
+            style.minimumLineHeight = lineHeight
+            style.maximumLineHeight = lineHeight
+        } else {
+            style.lineSpacing = font.lineHeight * 0.2
+        }
         style.alignment = textAlignment
         return [
             .font: font,
@@ -137,7 +148,21 @@ struct ListAwareTextField: UIViewRepresentable {
             uiView.isSelectable = !isLocked
         }
         if !isLocked {
-            uiView.typingAttributes = makeTypingAttributes()
+            let attributes = makeTypingAttributes()
+            uiView.typingAttributes = attributes
+            if !uiView.textStorage.string.isEmpty,
+               let paragraphStyle = attributes[.paragraphStyle] {
+                uiView.textStorage.addAttribute(
+                    .paragraphStyle,
+                    value: paragraphStyle,
+                    range: NSRange(location: 0, length: uiView.textStorage.length)
+                )
+            }
+        }
+        let returnKeyType: UIReturnKeyType = onSubmit == nil ? .default : .send
+        if uiView.returnKeyType != returnKeyType {
+            uiView.returnKeyType = returnKeyType
+            uiView.reloadInputViews()
         }
 
         // Sync binding → UITextView only when NOT focused.
@@ -191,6 +216,12 @@ struct ListAwareTextField: UIViewRepresentable {
 
         func textView(_ tv: UITextView, shouldChangeTextIn range: NSRange, replacementText text: String) -> Bool {
             guard text == "\n" else { return true }
+            if let onSubmit = parent.onSubmit, !parent.isLocked {
+                flushText(tv)
+                parent.onTextChange?(tv.text ?? "")
+                onSubmit()
+                return false
+            }
             guard let fullText = tv.text else { return true }
 
             let nsText = fullText as NSString

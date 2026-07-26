@@ -25,6 +25,11 @@ struct ChatBranch: Identifiable, Codable, Equatable {
     var attachedConcept: ConceptDefinition? = nil
     var branchContextConcept: ConceptDefinition? = nil
     var generatedBranchTitle: String? = nil
+    /// Hidden model context produced by `/compact`. The visible transcript remains untouched.
+    var compactedContext: String? = nil
+    /// Number of `activeChatBlocks` represented by `compactedContext`.
+    /// Optional so conversations persisted before compaction support continue to decode.
+    var compactedThroughBlockCount: Int? = nil
 
     init(
         id: UUID = UUID(),
@@ -60,6 +65,9 @@ struct InquiryConversation: Identifiable, Codable, Equatable {
     var isPinned: Bool = false
     var branches: [ChatBranch] = [ChatBranch(startingConcept: nil)]
     var promotedInsightIDs: [UUID] = []
+    /// When this conversation was created — drives the "Date" filter's day-based grouping in
+    /// Open Conversations. Defaults so existing persisted data without this field decodes safely.
+    var createdAt: Date = Date()
 
     init(
         id: UUID = UUID(),
@@ -68,7 +76,8 @@ struct InquiryConversation: Identifiable, Codable, Equatable {
         studyTopicID: UUID? = nil,
         isPinned: Bool = false,
         branches: [ChatBranch] = [ChatBranch(startingConcept: nil)],
-        promotedInsightIDs: [UUID] = []
+        promotedInsightIDs: [UUID] = [],
+        createdAt: Date = Date()
     ) {
         self.id = id
         self.title = title
@@ -77,6 +86,7 @@ struct InquiryConversation: Identifiable, Codable, Equatable {
         self.isPinned = isPinned
         self.branches = branches
         self.promotedInsightIDs = promotedInsightIDs
+        self.createdAt = createdAt
     }
 }
 

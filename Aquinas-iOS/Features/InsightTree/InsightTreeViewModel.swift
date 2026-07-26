@@ -25,15 +25,38 @@ final class InsightTreeViewModel: ObservableObject {
     @Published private(set) var placedMidpointSources: [UUID: [MidpointSource]] = [:]
     /// Per-insight bond length (connector radius): shorter = more related to its parent node.
     @Published private(set) var insightBondLengths: [UUID: CGFloat] = [:]
+    /// Semantic (MDS) target position per node — the canvas anchors each node to its target
+    /// with a weak spring so overlap cleanup can't destroy the embedding-driven layout.
+    @Published private(set) var layoutTargets: [UUID: CGPoint] = [:]
+    /// Normalized [0,1] depth per node from the third MDS component (1 = nearest),
+    /// consumed by the canvas's 2.5D depth cues.
+    @Published private(set) var nodeDepths: [UUID: Double] = [:]
     @Published var selectedNode: NodeModel?
     @Published var selectedSuggestedNode: NodeModel?
 
     let scene: InsightTreeScene
     private var insights: [InsightModel]
+    private var persistedTree: PersistedInsightTree?
     private var promotedInsightIDs: [UUID]
     private var renderedNodeIDs: Set<UUID> = []
     private var placedMidpoints: [PlacedMidpoint] = []
     private let positionStoreKey = "aquinas.insight-tree.positions.v1"
+    private static let clusterLabelStoreKey = "aquinas.insight-tree.cluster-labels.v1"
+    /// The model boundary for every generative call (subject labels, concept blends). See
+    /// `AquinasModel`'s doc comment — swapping in the real model is one conforming type.
+    private let model: AquinasModel
+    /// The source of insight embedding vectors. See `EmbeddingProvider`'s doc comment.
+    private let embeddingProvider: EmbeddingProvider
+    /// Real Make Node children once generated, keyed by the promoted node's id — checked before
+    /// the synchronous placeholder in `appendPromotedNodes`. Populated by `requestChildren`, which
+    /// requests them once per newly-promoted insight and triggers a rebuild when they arrive.
+    /// Child ids stay deterministic (`makeNodeChildID`) either way, so swapping placeholder → real
+    /// content in place never re-triggers the reveal animation.
+    private var generatedChildInsights: [UUID: [InsightModel]] = [:]
+    private var childGenerationInFlight: Set<UUID> = []
+    private var generatedClusterLabels: [UUID: String] = [:]
+    private var clusterLabelGenerationInFlight: Set<UUID> = []
+    private let localMembershipThreshold = 0.40
 
     /// A user-placed "midpoint" insight: a permanent node pinned at an explicit world
     /// position, connected by an edge to each of the source insights it was spawned from.
@@ -43,9 +66,19 @@ final class InsightTreeViewModel: ObservableObject {
         let sources: [MidpointSource]
     }
 
-    init(insights: [ConceptDefinition], promotedInsightIDs: [UUID] = []) {
-        self.insights = insights.map { InsightModel(concept: $0) }
+    init(
+        insights: [ConceptDefinition],
+        promotedInsightIDs: [UUID] = [],
+        model: AquinasModel = MockAquinasModel(),
+        embeddingProvider: EmbeddingProvider = NLEmbeddingProvider()
+    ) {
+        self.insights = Self.deduplicated(insights.map { InsightModel(concept: $0) })
         self.promotedInsightIDs = promotedInsightIDs
+        self.model = model
+        self.embeddingProvider = embeddingProvider
+        generatedClusterLabels = Self.loadClusterLabels(
+            storageKey: Self.clusterLabelStoreKey
+        )
         scene = InsightTreeScene(size: CGSize(width: 390, height: 844))
         scene.scaleMode = .resizeFill
         scene.backgroundColor = UIColor(AquinasTheme.Colors.canvas)
@@ -53,33 +86,90 @@ final class InsightTreeViewModel: ObservableObject {
             Task { @MainActor in self?.handleTappedNode(node) }
         }
         scene.onSuggestConnection = { [weak self] edge in
-            Task { @MainActor in self?.generateSuggestedNode(for: edge) }
+            Task { @MainActor in await self?.generateSuggestedNode(for: edge) }
         }
 
         rebuildTree()
     }
 
     func updateInsights(_ concepts: [ConceptDefinition], promotedInsightIDs: [UUID]? = nil) {
-        insights = concepts.map { InsightModel(concept: $0) }
+        if persistedTree == nil {
+            insights = Self.deduplicated(concepts.map { InsightModel(concept: $0) })
+        }
         if let promotedInsightIDs {
             self.promotedInsightIDs = promotedInsightIDs
         }
         rebuildTree()
+        if persistedTree == nil {
+            refreshEmbeddingsIfNeeded()
+        }
     }
 
+    func applyPersistedTree(_ tree: PersistedInsightTree) {
+        persistedTree = tree
+        insights = tree.nodes.flatMap { node in
+            node.insights.map { insight in
+                InsightModel(
+                    id: insight.id,
+                    title: insight.title.capitalized,
+                    definition: insight.definition,
+                    conversationID: tree.conversationID,
+                    relatednessToNode: insight.relatedness,
+                    distanceToNode: insight.distance
+                )
+            }
+        }
+        rebuildTree()
+    }
+
+    /// Drops any later entry that repeats an earlier one's id, keeping first-seen order. Callers
+    /// like the per-conversation tree build this list fresh from live conversation state (rather
+    /// than a stable saved-insights store), so a duplicate id can slip in upstream — e.g. two
+    /// synthesized "question" pseudo-insights whose ids happen to coincide. Every downstream step
+    /// (clustering, force layout, position persistence) keys dictionaries by insight/node id and
+    /// fatally crashes on a duplicate key, so this is enforced once, right at the boundary.
+    private static func deduplicated(_ insights: [InsightModel]) -> [InsightModel] {
+        var seen = Set<UUID>()
+        return insights.filter { seen.insert($0.id).inserted }
+    }
+
+    /// Legacy in-memory save entry point. Conversation-scoped saves now flow through
+    /// `InsightTreeService`; this remains available to non-persisted canvas variants.
     func onInsightSaved(_ insight: InsightModel) {
         var savedInsight = insight
         savedInsight.embedding = savedInsight.embedding ?? computeEmbedding(for: "\(insight.title). \(insight.definition)")
+        savedInsight.embeddingVersion = savedInsight.embeddingVersion ?? NLEmbeddingProvider.version
         insights.append(savedInsight)
-        if insights.count % 5 == 0 {
-            recluster()
-        } else {
+        rebuildTree()
+        refreshEmbeddingsIfNeeded()
+    }
+
+    /// Confirms every insight's cached embedding matches the configured `embeddingProvider`,
+    /// recomputing any that are missing or were produced by a different provider (a source swap).
+    /// `rebuildTree`'s own embedding step above is a synchronous same-provider fallback only (it
+    /// keeps the tree usable immediately, including during `init`); this is the versioned,
+    /// async-capable path that becomes load-bearing once a non-`NLEmbeddingProvider` is configured.
+    /// A no-op today: everything `rebuildTree` just tagged already matches, so this rebuilds
+    /// nothing further.
+    private func refreshEmbeddingsIfNeeded() {
+        Task { @MainActor in
+            let corrected = await ensureEmbeddings(for: insights)
+            guard corrected != insights else { return }
+            insights = corrected
             rebuildTree()
         }
     }
 
-    func recluster() {
-        rebuildTree(forceRelayout: true)
+    private func ensureEmbeddings(for insights: [InsightModel]) async -> [InsightModel] {
+        var next = insights
+        for index in next.indices {
+            let stale = next[index].embedding == nil || next[index].embeddingVersion != embeddingProvider.version
+            guard stale else { continue }
+            let text = "\(next[index].title). \(next[index].definition)"
+            next[index].embedding = await embeddingProvider.embed(text)
+            next[index].embeddingVersion = embeddingProvider.version
+        }
+        return next
     }
 
     /// Commits the canvas's live-simulated positions back into the model and persists them.
@@ -113,7 +203,7 @@ final class InsightTreeViewModel: ObservableObject {
             isSuggested: false,
             showSuggestButton: true
         )
-        generateSuggestedNode(for: temporaryEdge)
+        Task { @MainActor in await generateSuggestedNode(for: temporaryEdge) }
     }
 
     func dismissSuggestedNode(_ node: NodeModel) {
@@ -129,7 +219,7 @@ final class InsightTreeViewModel: ObservableObject {
     }
 
     func suggestConnection(for edge: EdgeModel) {
-        generateSuggestedNode(for: edge)
+        Task { @MainActor in await generateSuggestedNode(for: edge) }
     }
 
     private func handleTappedNode(_ node: NodeModel) {
@@ -140,7 +230,7 @@ final class InsightTreeViewModel: ObservableObject {
         }
     }
 
-    private func generateSuggestedNode(for edge: EdgeModel) {
+    private func generateSuggestedNode(for edge: EdgeModel) async {
         guard let from = nodes.first(where: { $0.id == edge.fromNodeID }),
               let to = nodes.first(where: { $0.id == edge.toNodeID }) else {
             return
@@ -157,9 +247,10 @@ final class InsightTreeViewModel: ObservableObject {
         let suggestionInsights = Array(suggestions)
         guard !suggestionInsights.isEmpty else { return }
 
+        let label = await model.labelSubject(forTitles: suggestionInsights.map(\.title))
         let suggestedNode = NodeModel(
             id: UUID(),
-            conceptLabel: makeConceptLabel(from: suggestionInsights.map(\.title)),
+            conceptLabel: label,
             insights: suggestionInsights,
             embedding: centroid(suggestionInsights.compactMap(\.embedding)),
             position: CGPoint(
@@ -180,10 +271,20 @@ final class InsightTreeViewModel: ObservableObject {
         scene.render(nodes: nodes, edges: edges, animated: true)
     }
 
-    private func rebuildTree(forceRelayout: Bool = false) {
+    private func rebuildTree() {
+        if let persistedTree {
+            rebuildPersistedTree(persistedTree)
+            return
+        }
+
+        // Synchronous same-provider fallback: keeps the tree usable immediately (including
+        // during `init`, which can't await). `refreshEmbeddingsIfNeeded`/`ensureEmbeddings` is
+        // the versioned, async-capable path layered on top (see its doc comment).
         let embeddedInsights = insights.map { insight -> InsightModel in
             var copy = insight
-            copy.embedding = copy.embedding ?? computeEmbedding(for: "\(insight.title). \(insight.definition)")
+            guard copy.embedding == nil else { return copy }
+            copy.embedding = computeEmbedding(for: "\(insight.title). \(insight.definition)")
+            copy.embeddingVersion = NLEmbeddingProvider.version
             return copy
         }
         insights = embeddedInsights
@@ -195,64 +296,10 @@ final class InsightTreeViewModel: ObservableObject {
             return (0..<3).map { makeNodeChildID(for: nodeID, index: $0) }
         })
 
-        guard embeddedInsights.count >= 5 else {
-            var nextNodes = makeEarlyNodes(from: embeddedInsights)
-            var nextEdges: [EdgeModel] = []
-            appendPromotedNodes(to: &nextNodes, edges: &nextEdges, from: embeddedInsights)
-            appendPlacedMidpointNodes(to: &nextNodes, edges: &nextEdges)
-            nextNodes = separateOverlaps(nodes: nextNodes)
-            persistPositions(nextNodes)
-            recomputeBondLengths(for: nextNodes)
-            let nextIDs = Set(nextNodes.map(\.id))
-            let hasNew = !nextIDs.isSubset(of: renderedNodeIDs)
-            renderedNodeIDs = nextIDs
-            withAnimation(.spring(response: 0.55, dampingFraction: 0.78)) {
-                nodes = nextNodes
-                edges = nextEdges
-            }
-            scene.render(nodes: nodes, edges: edges, animated: hasNew)
-            return
-        }
-
-        let clusters = makeClusters(from: embeddedInsights)
-        var nextNodes = clusters.enumerated().map { index, cluster in
-            NodeModel(
-                id: stableNodeID(for: cluster),
-                conceptLabel: makeConceptLabel(from: cluster.map(\.title)),
-                insights: cluster,
-                embedding: centroid(cluster.compactMap(\.embedding)),
-                position: restoredPosition(for: stableNodeID(for: cluster)) ?? radialPosition(index: index, count: clusters.count),
-                isSuggested: false,
-                suggestedInsights: nil
-            )
-        }
-
-        var nextEdges: [EdgeModel] = []
-        for leftIndex in nextNodes.indices {
-            for rightIndex in nextNodes.indices where rightIndex > leftIndex {
-                let distance = semanticDistance(nextNodes[leftIndex].embedding, nextNodes[rightIndex].embedding)
-                if nextNodes.count <= 2 || distance < 0.58 {
-                    nextEdges.append(
-                        EdgeModel(
-                            id: UUID(),
-                            fromNodeID: nextNodes[leftIndex].id,
-                            toNodeID: nextNodes[rightIndex].id,
-                            distance: distance,
-                            isSuggested: false,
-                            showSuggestButton: true
-                        )
-                    )
-                }
-            }
-        }
-
-        if forceRelayout || nextNodes.contains(where: { restoredPosition(for: $0.id) == nil }) {
-            nextNodes = runForceLayout(nodes: nextNodes, edges: nextEdges)
-            persistPositions(nextNodes)
-        }
-
+        var (nextNodes, nextEdges) = makeClusteredTree(from: embeddedInsights)
         appendPromotedNodes(to: &nextNodes, edges: &nextEdges, from: embeddedInsights)
         appendPlacedMidpointNodes(to: &nextNodes, edges: &nextEdges)
+        adoptSpawnTargets(for: nextNodes)
         nextNodes = separateOverlaps(nodes: nextNodes)
         persistPositions(nextNodes)
         recomputeBondLengths(for: nextNodes)
@@ -265,6 +312,7 @@ final class InsightTreeViewModel: ObservableObject {
             edges = nextEdges
         }
         scene.render(nodes: nodes, edges: edges, animated: hasNew)
+        requestClusterLabels(for: nextNodes)
     }
 
     /// Bond length per visible insight = relatedness (semantic distance) to its parent node's
@@ -273,44 +321,255 @@ final class InsightTreeViewModel: ObservableObject {
         var lengths: [UUID: CGFloat] = [:]
         for node in nodes where !placedMidpointNodeIDs.contains(node.id) {
             for insight in node.insights.prefix(6) {
-                let dist = semanticDistance(insight.embedding ?? [], node.embedding)
+                let dist = insight.distanceToNode
+                    ?? semanticDistance(insight.embedding ?? [], node.embedding)
                 lengths[insight.id] = insightBondLength(dist)
             }
         }
         insightBondLengths = lengths
     }
 
-    private func makeEarlyNodes(from insights: [InsightModel]) -> [NodeModel] {
-        insights.enumerated().map { index, insight in
-            NodeModel(
-                id: insight.id,
-                conceptLabel: insight.title,
-                insights: [insight],
-                embedding: insight.embedding ?? [],
-                position: radialPosition(index: index, count: max(insights.count, 1)),
+    private func rebuildPersistedTree(_ tree: PersistedInsightTree) {
+        makeNodeChildIDs = Set(promotedInsightIDs.flatMap { insightID -> [UUID] in
+            let nodeID = promotedNodeID(for: insightID)
+            return (0..<3).map { makeNodeChildID(for: nodeID, index: $0) }
+        })
+
+        var builtNodes: [NodeModel] = []
+        var builtEdges: [EdgeModel] = []
+        for storedNode in tree.nodes {
+            let nodeInsights = storedNode.insights.map { insight in
+                InsightModel(
+                    id: insight.id,
+                    title: insight.title.capitalized,
+                    definition: insight.definition,
+                    conversationID: tree.conversationID,
+                    embeddingVersion: "\(tree.embeddingModel).v\(tree.embeddingVersion)",
+                    relatednessToNode: insight.relatedness,
+                    distanceToNode: insight.distance
+                )
+            }
+            let position: CGPoint
+            if let restored = restoredPosition(for: storedNode.id) {
+                position = restored
+            } else if let neighbor = nearestPersistedNeighbor(
+                for: storedNode.id,
+                in: tree.edges,
+                builtNodes: builtNodes
+            ) {
+                let angleSeed = stableUUID(from: "node-placement:\(storedNode.id)").uuid.0
+                let angle = CGFloat(angleSeed) / 255 * (.pi * 2)
+                let length = mapDistanceToLength(neighbor.edge.distance)
+                position = CGPoint(
+                    x: neighbor.node.position.x + cos(angle) * length,
+                    y: neighbor.node.position.y + sin(angle) * length
+                )
+            } else if let previousNode = builtNodes.last {
+                position = chainExtensionPosition(
+                    from: previousNode,
+                    nodes: builtNodes,
+                    edges: builtEdges
+                )
+            } else {
+                position = .zero
+            }
+            let node = NodeModel(
+                id: storedNode.id,
+                conceptLabel: storedNode.label,
+                definition: storedNode.summary,
+                insights: nodeInsights,
+                embedding: [],
+                position: position,
                 isSuggested: false,
                 suggestedInsights: nil
             )
+            builtNodes.append(node)
         }
+
+        let persistedNodeIDs = Set(builtNodes.map(\.id))
+        builtEdges = tree.edges.compactMap { edge in
+            guard persistedNodeIDs.contains(edge.fromNodeID),
+                  persistedNodeIDs.contains(edge.toNodeID) else {
+                return nil
+            }
+            return EdgeModel(
+                id: edge.id,
+                fromNodeID: edge.fromNodeID,
+                toNodeID: edge.toNodeID,
+                distance: edge.distance,
+                isSuggested: false,
+                showSuggestButton: false
+            )
+        }
+
+        appendPromotedNodes(to: &builtNodes, edges: &builtEdges, from: insights)
+        appendPlacedMidpointNodes(to: &builtNodes, edges: &builtEdges)
+        adoptSpawnTargets(for: builtNodes)
+        builtNodes = separateOverlaps(nodes: builtNodes)
+        persistPositions(builtNodes)
+        recomputeBondLengths(for: builtNodes)
+
+        let nextIDs = Set(builtNodes.map(\.id))
+        let hasNew = !nextIDs.isSubset(of: renderedNodeIDs)
+        renderedNodeIDs = nextIDs
+        withAnimation(.spring(response: 0.55, dampingFraction: 0.78)) {
+            nodes = builtNodes
+            edges = builtEdges
+        }
+        scene.render(nodes: nodes, edges: edges, animated: hasNew)
     }
 
-    private func makeClusters(from insights: [InsightModel]) -> [[InsightModel]] {
-        let categories = [
-            "Philosophy": ["philosophy", "aristotle", "virtue", "ethics", "truth", "nihilism", "eudaimonia", "nietzsche"],
-            "Theology": ["theology", "aquinas", "augustine", "gospel", "church", "christian", "baptism", "eucharist", "didache", "prayer"],
-            "Practice": ["fasting", "ritual", "liturgy", "habit", "manual", "discipline", "community"]
-        ]
+    private func nearestPersistedNeighbor(
+        for nodeID: UUID,
+        in edges: [PersistedInsightTreeEdge],
+        builtNodes: [NodeModel]
+    ) -> (node: NodeModel, edge: PersistedInsightTreeEdge)? {
+        let builtByID = Dictionary(uniqueKeysWithValues: builtNodes.map { ($0.id, $0) })
+        return edges
+            .compactMap { edge -> (NodeModel, PersistedInsightTreeEdge)? in
+                if edge.fromNodeID == nodeID, let node = builtByID[edge.toNodeID] {
+                    return (node, edge)
+                }
+                if edge.toNodeID == nodeID, let node = builtByID[edge.fromNodeID] {
+                    return (node, edge)
+                }
+                return nil
+            }
+            .min { $0.1.distance < $1.1.distance }
+    }
 
-        var grouped: [String: [InsightModel]] = [:]
-        for insight in insights {
-            let text = "\(insight.title) \(insight.definition)".lowercased()
-            let category = categories.first { _, keywords in
-                keywords.contains { text.contains($0) }
-            }?.key ?? "Inquiry"
-            grouped[category, default: []].append(insight)
+    /// Groups global-library bookmarks around semantic subject Nodes. Conversation trees use
+    /// backend MiniLM membership; this offline/global fallback stays in the local embedding space.
+    private func makeClusteredTree(
+        from insights: [InsightModel]
+    ) -> (nodes: [NodeModel], edges: [EdgeModel]) {
+        struct Cluster {
+            let id: UUID
+            var insights: [InsightModel]
+            var embedding: [Double]
         }
 
-        return grouped.values.sorted { $0.count > $1.count }
+        var clusters: [Cluster] = []
+        for insight in insights {
+            let embedding = insight.embedding ?? []
+            let best = clusters.indices
+                .map { ($0, cosineSimilarity(embedding, clusters[$0].embedding)) }
+                .max { $0.1 < $1.1 }
+
+            if let best, best.1 >= localMembershipThreshold {
+                clusters[best.0].insights.append(insight)
+                clusters[best.0].embedding = centroid(
+                    clusters[best.0].insights.compactMap(\.embedding)
+                )
+            } else {
+                clusters.append(
+                    Cluster(
+                        id: stableUUID(from: "global-insight-cluster:\(insight.id)"),
+                        insights: [insight],
+                        embedding: embedding
+                    )
+                )
+            }
+        }
+
+        var builtNodes: [NodeModel] = []
+        for cluster in clusters {
+            let nearest = builtNodes.min {
+                semanticDistance($0.embedding, cluster.embedding)
+                    < semanticDistance($1.embedding, cluster.embedding)
+            }
+            let position: CGPoint
+            if let restored = restoredPosition(for: cluster.id) {
+                position = restored
+            } else if let nearest {
+                let angleSeed = stableUUID(
+                    from: "global-cluster-placement:\(cluster.id)"
+                ).uuid.0
+                let angle = CGFloat(angleSeed) / 255 * (.pi * 2)
+                let length = mapDistanceToLength(
+                    semanticDistance(nearest.embedding, cluster.embedding)
+                )
+                position = CGPoint(
+                    x: nearest.position.x + cos(angle) * length,
+                    y: nearest.position.y + sin(angle) * length
+                )
+            } else {
+                position = .zero
+            }
+            builtNodes.append(
+                NodeModel(
+                    id: cluster.id,
+                    conceptLabel: generatedClusterLabels[cluster.id]
+                        ?? provisionalClusterLabel(for: cluster.insights),
+                    insights: cluster.insights,
+                    embedding: cluster.embedding,
+                    position: position,
+                    isSuggested: false,
+                    suggestedInsights: nil
+                )
+            )
+        }
+
+        var builtEdges: [EdgeModel] = []
+        var connected = Set(builtNodes.indices.prefix(1))
+        while connected.count < builtNodes.count {
+            let candidate = connected.flatMap { left in
+                builtNodes.indices
+                    .filter { !connected.contains($0) }
+                    .map { right in
+                        (
+                            left,
+                            right,
+                            semanticDistance(
+                                builtNodes[left].embedding,
+                                builtNodes[right].embedding
+                            )
+                        )
+                    }
+            }
+            .min { $0.2 < $1.2 }
+            guard let candidate else { break }
+            builtEdges.append(
+                EdgeModel(
+                    id: stableUUID(
+                        from: "global-cluster-edge:\(builtNodes[candidate.0].id):\(builtNodes[candidate.1].id)"
+                    ),
+                    fromNodeID: builtNodes[candidate.0].id,
+                    toNodeID: builtNodes[candidate.1].id,
+                    distance: candidate.2,
+                    isSuggested: false,
+                    showSuggestButton: true
+                )
+            )
+            connected.insert(candidate.1)
+        }
+        return (builtNodes, builtEdges)
+    }
+
+    private func provisionalClusterLabel(for insights: [InsightModel]) -> String {
+        insights.count > 1 ? "Related Insights" : "Exploring \(insights[0].title)"
+    }
+
+    private func requestClusterLabels(for clusters: [NodeModel]) {
+        for cluster in clusters
+        where generatedClusterLabels[cluster.id] == nil
+            && clusterLabelGenerationInFlight.insert(cluster.id).inserted {
+            let nodeID = cluster.id
+            let subjects = cluster.insights.map { "\($0.title): \($0.definition)" }
+            Task { @MainActor in
+                let label = await model.labelSubject(forTitles: subjects)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                clusterLabelGenerationInFlight.remove(nodeID)
+                guard !label.isEmpty else { return }
+                generatedClusterLabels[nodeID] = label
+                persistClusterLabels()
+                guard let index = nodes.firstIndex(where: { $0.id == nodeID }) else {
+                    return
+                }
+                nodes[index].conceptLabel = label
+                scene.render(nodes: nodes, edges: edges, animated: false)
+            }
+        }
     }
 
     private func appendPromotedNodes(
@@ -328,15 +587,19 @@ final class InsightTreeViewModel: ObservableObject {
             let sourceNode = nodes[sourceIndex]
             let promotedNodeID = promotedNodeID(for: insightID)
 
-            // Turning an insight into a concept spawns 3 relevant child insights around it.
-            // Placeholder "New Insight" copy until the model fills them in. IDs are stable so
-            // rebuilds don't recreate them (which would re-trigger their load animation).
-            let childInsights = (0..<3).map { childIndex in
+            // Turning an insight into a concept spawns 3 relevant child insights around it. Real
+            // content once `requestChildren` resolves; a synchronous "New Insight" placeholder
+            // until then. IDs are stable either way, so rebuilds — and the placeholder → real
+            // swap — never recreate them (which would re-trigger their load animation).
+            let childInsights = generatedChildInsights[promotedNodeID] ?? (0..<3).map { childIndex in
                 InsightModel(
                     id: makeNodeChildID(for: promotedNodeID, index: childIndex),
                     title: "New Insight",
                     definition: ""
                 )
+            }
+            if generatedChildInsights[promotedNodeID] == nil {
+                requestChildren(for: insight, promotedNodeID: promotedNodeID)
             }
 
             // If the insight already is its own node (canvas early layout), convert it in
@@ -350,11 +613,9 @@ final class InsightTreeViewModel: ObservableObject {
 
             guard !nodes.contains(where: { $0.id == promotedNodeID }) else { continue }
 
-            // Clustered layout: pull the insight out into its own node positioned where its
-            // chip was orbiting, and remove it from the cluster so it isn't shown twice.
-            let visible = Array(sourceNode.insights.prefix(6))
-            let orbitIndex = visible.firstIndex(where: { $0.id == insightID }) ?? 0
-            let orbitPos = insightOrbitPosition(node: sourceNode, index: orbitIndex, count: min(sourceNode.insights.count, 6))
+            // Clustered layout: pull the insight out into its own node, extending the chain from
+            // its source node, and remove it from the cluster so it isn't shown twice.
+            let chainPos = chainExtensionPosition(from: sourceNode, nodes: nodes, edges: edges)
             nodes[sourceIndex].insights.removeAll { $0.id == insightID }
 
             let promotedNode = NodeModel(
@@ -363,7 +624,7 @@ final class InsightTreeViewModel: ObservableObject {
                 definition: insight.definition,
                 insights: childInsights,
                 embedding: insight.embedding ?? [],
-                position: restoredPosition(for: promotedNodeID) ?? orbitPos,
+                position: restoredPosition(for: promotedNodeID) ?? chainPos,
                 isSuggested: false,
                 suggestedInsights: nil
             )
@@ -382,12 +643,40 @@ final class InsightTreeViewModel: ObservableObject {
         }
     }
 
+    /// Requests the real Make Node children from the model, once per promoted node. The
+    /// synchronous "New Insight" placeholder (same stable ids) stays visible until the result
+    /// arrives, then a rebuild swaps in the real content.
+    private func requestChildren(for insight: InsightModel, promotedNodeID: UUID) {
+        guard childGenerationInFlight.insert(promotedNodeID).inserted else { return }
+        let sourceConcept = ConceptDefinition(
+            word: insight.title,
+            partOfSpeech: "",
+            pronunciation: "",
+            meaning: insight.definition,
+            example: ""
+        )
+        Task { @MainActor in
+            let generated = await model.generateChildren(for: sourceConcept)
+            generatedChildInsights[promotedNodeID] = (0..<3).map { index in
+                let concept = index < generated.count
+                    ? generated[index]
+                    : ConceptDefinition(word: "New Insight", partOfSpeech: "", pronunciation: "", meaning: "", example: "")
+                return InsightModel(
+                    id: makeNodeChildID(for: promotedNodeID, index: index),
+                    title: concept.word,
+                    definition: concept.meaning
+                )
+            }
+            rebuildTree()
+        }
+    }
+
     /// Appends user-placed midpoint nodes at their pinned positions, each connected by an edge
     /// to every source concept it was spawned from. Runs AFTER the force layout so these nodes
     /// are never relocated.
     private func appendPlacedMidpointNodes(to nodes: inout [NodeModel], edges: inout [EdgeModel]) {
         placedMidpointNodeIDs = Set(placedMidpoints.map { $0.concept.id })
-        placedMidpointSources = Dictionary(uniqueKeysWithValues: placedMidpoints.map { ($0.concept.id, $0.sources) })
+        placedMidpointSources = Dictionary(placedMidpoints.map { ($0.concept.id, $0.sources) }, uniquingKeysWith: { _, latest in latest })
         guard !placedMidpoints.isEmpty else { return }
 
         for placed in placedMidpoints {
@@ -411,14 +700,64 @@ final class InsightTreeViewModel: ObservableObject {
         }
     }
 
-    /// Orbit position of an insight chip around its node — mirrors the canvas layout
-    /// so a promoted node lands exactly where its chip was.
-    private func insightOrbitPosition(node: NodeModel, index: Int, count: Int) -> CGPoint {
-        let clampedCount = max(count, 1)
-        let angle = (CGFloat(index) / CGFloat(clampedCount)) * (.pi * 2) + .pi / 8
-        let insightID = index < node.insights.count ? node.insights[index].id : nil
-        let radius = insightID.flatMap { insightBondLengths[$0] } ?? 190
-        return CGPoint(x: node.position.x + cos(angle) * radius, y: node.position.y + sin(angle) * radius)
+    /// Where a newly promoted Node Concept spawns: extending the chain it's growing from, one
+    /// link at a time (like a carbon adding onto a lipid tail), rather than orbiting its source
+    /// at a semantically-meaningless angle. The new bond bisects the largest open angular gap
+    /// among `sourceNode`'s existing bonds — maximizing separation (VSEPR-style) — so a simple
+    /// chain naturally continues straight ahead (180° from its one incoming bond) while
+    /// branches off a node with multiple children still spread to the widest angle available.
+    /// A node with no existing bonds — the chain's root — starts growing straight up. This is a
+    /// placeholder: once the model drives relation-based folding between concepts, that will
+    /// replace this simple maximized-angle continuation.
+    private func chainExtensionPosition(from sourceNode: NodeModel, nodes: [NodeModel], edges: [EdgeModel]) -> CGPoint {
+        let bondLength = mapDistanceToLength(0.18)   // matches the promoted-node edge's target length
+
+        let occupiedAngles: [CGFloat] = edges.compactMap { edge in
+            let neighborID: UUID
+            if edge.toNodeID == sourceNode.id { neighborID = edge.fromNodeID }
+            else if edge.fromNodeID == sourceNode.id { neighborID = edge.toNodeID }
+            else { return nil }
+            guard let neighbor = nodes.first(where: { $0.id == neighborID }) else { return nil }
+            return atan2(neighbor.position.y - sourceNode.position.y, neighbor.position.x - sourceNode.position.x)
+        }
+
+        let angle = occupiedAngles.isEmpty ? -.pi / 2 : maximizedGapAngle(among: occupiedAngles)
+
+        return CGPoint(
+            x: sourceNode.position.x + cos(angle) * bondLength,
+            y: sourceNode.position.y + sin(angle) * bondLength
+        )
+    }
+
+    /// The angle that maximizes angular separation from every angle in `angles`: the bisector of
+    /// the largest gap between them going around the circle. With one existing angle this is
+    /// exactly its opposite (180°); with several, it's the widest open gap — the same "maximum
+    /// separation" rule VSEPR uses to spread bonds around an atom.
+    private func maximizedGapAngle(among angles: [CGFloat]) -> CGFloat {
+        let twoPi = CGFloat.pi * 2
+        let sorted = angles.map { normalizedAngle($0) }.sorted()
+        guard sorted.count > 1 else { return normalizedAngle(sorted[0] + .pi) }
+
+        var bestGapStart = sorted[0]
+        var bestGapSize: CGFloat = 0
+        for i in sorted.indices {
+            let start = sorted[i]
+            let end = (i + 1 < sorted.count ? sorted[i + 1] : sorted[0] + twoPi)
+            let gap = end - start
+            if gap > bestGapSize {
+                bestGapSize = gap
+                bestGapStart = start
+            }
+        }
+        return normalizedAngle(bestGapStart + bestGapSize / 2)
+    }
+
+    /// Wraps an angle to [0, 2π).
+    private func normalizedAngle(_ angle: CGFloat) -> CGFloat {
+        let twoPi = CGFloat.pi * 2
+        var a = angle.truncatingRemainder(dividingBy: twoPi)
+        if a < 0 { a += twoPi }
+        return a
     }
 
     /// Effective footprint radius of a node (its concept circle + the ring of orbiting chips),
@@ -480,85 +819,84 @@ final class InsightTreeViewModel: ObservableObject {
     }
 
     private func makeNodeChildID(for nodeID: UUID, index: Int) -> UUID {
-        let digest = SHA256.hash(data: Data("makenode-child:\(nodeID.uuidString):\(index)".utf8))
-        let bytes = Array(digest.prefix(16))
-        let uuidString = String(
-            format: "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5],
-            bytes[6], bytes[7],
-            bytes[8], bytes[9],
-            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
-        )
-        return UUID(uuidString: uuidString) ?? UUID()
+        stableUUID(from: "makenode-child:\(nodeID.uuidString):\(index)")
     }
 
     private func promotedNodeID(for insightID: UUID) -> UUID {
-        let digest = SHA256.hash(data: Data("promoted:\(insightID.uuidString)".utf8))
-        let bytes = Array(digest.prefix(16))
-        let uuidString = String(
-            format: "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5],
-            bytes[6], bytes[7],
-            bytes[8], bytes[9],
-            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
-        )
-        return UUID(uuidString: uuidString) ?? UUID()
+        stableUUID(from: "promoted:\(insightID.uuidString)")
     }
 
-    private func runForceLayout(nodes: [NodeModel], edges: [EdgeModel]) -> [NodeModel] {
+    /// Embedding-driven layout: positions every non-pinned node at its semantic (MDS) target
+    /// so on-screen distance reflects semantic distance. Publishes `layoutTargets` (the raw
+    /// targets, before overlap separation) and `nodeDepths` for the canvas. Nodes without an
+    /// embedding fall back to previous/restored position → graph-neighbor centroid → radial seed.
+    private func runSemanticLayout(nodes: [NodeModel], edges: [EdgeModel]) -> [NodeModel] {
         var working = nodes
-        guard working.count > 1 else { return working }
+        guard working.count > 1 else {
+            layoutTargets = Dictionary(working.map { ($0.id, $0.position) }, uniquingKeysWith: { _, latest in latest })
+            nodeDepths = [:]
+            return working
+        }
 
-        for _ in 0..<200 {
-            var deltas = Dictionary(uniqueKeysWithValues: working.map { ($0.id, CGVector.zero) })
+        var previous: [UUID: CGPoint] = [:]
+        for node in working {
+            previous[node.id] = restoredPosition(for: node.id) ?? node.position
+        }
 
-            for left in working.indices {
-                for right in working.indices where right != left {
-                    let dx = working[left].position.x - working[right].position.x
-                    let dy = working[left].position.y - working[right].position.y
-                    let distance = max(60, hypot(dx, dy))
-                    let force = 3600 / (distance * distance)
-                    deltas[working[left].id]?.dx += (dx / distance) * force
-                    deltas[working[left].id]?.dy += (dy / distance) * force
-                }
+        let result = SemanticLayout.solve(
+            nodes: working,
+            pinnedIDs: placedMidpointNodeIDs,
+            previousPositions: previous
+        )
+
+        var targets: [UUID: CGPoint] = [:]
+        for index in working.indices {
+            let node = working[index]
+            if placedMidpointNodeIDs.contains(node.id) {
+                targets[node.id] = node.position   // user-pinned: never relocated
+                continue
             }
-
-            for edge in edges {
-                guard let fromIndex = working.firstIndex(where: { $0.id == edge.fromNodeID }),
-                      let toIndex = working.firstIndex(where: { $0.id == edge.toNodeID }) else {
-                    continue
-                }
-                let dx = working[toIndex].position.x - working[fromIndex].position.x
-                let dy = working[toIndex].position.y - working[fromIndex].position.y
-                let distance = max(1, hypot(dx, dy))
-                let targetLength = mapDistanceToLength(edge.distance)
-                let pull = (distance - targetLength) * (1 - edge.distance) * 0.003
-                deltas[working[fromIndex].id]?.dx += dx * pull
-                deltas[working[fromIndex].id]?.dy += dy * pull
-                deltas[working[toIndex].id]?.dx -= dx * pull
-                deltas[working[toIndex].id]?.dy -= dy * pull
+            if let solved = result.positions[node.id] {
+                working[index].position = solved
+                targets[node.id] = solved
+                continue
             }
-
-            for index in working.indices {
-                let delta = deltas[working[index].id] ?? .zero
-                working[index].position.x += max(-4, min(4, delta.dx))
-                working[index].position.y += max(-4, min(4, delta.dy))
+            // No embedding: keep the previous position if one exists; otherwise sit near
+            // the centroid of graph neighbors (small deterministic offset breaks ties),
+            // falling back to the radial seed the node already carries.
+            if let prev = previous[node.id] {
+                targets[node.id] = prev
+                working[index].position = prev
+            } else {
+                let neighborIDs = edges.compactMap { edge -> UUID? in
+                    if edge.fromNodeID == node.id { return edge.toNodeID }
+                    if edge.toNodeID == node.id { return edge.fromNodeID }
+                    return nil
+                }
+                let neighborPoints = neighborIDs.compactMap { id in
+                    result.positions[id] ?? previous[id]
+                }
+                if !neighborPoints.isEmpty {
+                    let cx = neighborPoints.reduce(0) { $0 + $1.x } / CGFloat(neighborPoints.count)
+                    let cy = neighborPoints.reduce(0) { $0 + $1.y } / CGFloat(neighborPoints.count)
+                    let offset = CGFloat(index % 4) * 40 + 80
+                    working[index].position = CGPoint(x: cx + offset, y: cy - offset / 2)
+                }
+                targets[node.id] = working[index].position
             }
         }
 
+        layoutTargets = targets
+        nodeDepths = result.depth
         return working
     }
 
-    private func radialPosition(index: Int, count: Int) -> CGPoint {
-        let radius = count <= 2 ? CGFloat(260) : CGFloat(340)
-        let angle = (CGFloat(index) / CGFloat(max(count, 1))) * (.pi * 2)
-        return CGPoint(x: cos(angle) * radius, y: sin(angle) * radius)
-    }
-
-    private func stableNodeID(for insights: [InsightModel]) -> UUID {
-        insights.sorted { $0.title < $1.title }.first?.id ?? UUID()
+    /// Nodes appended after the semantic solve (promoted / placed midpoints) anchor at
+    /// their spawn position until the next rebuild folds them into the MDS solve proper.
+    private func adoptSpawnTargets(for nodes: [NodeModel]) {
+        for node in nodes where layoutTargets[node.id] == nil {
+            layoutTargets[node.id] = node.position
+        }
     }
 
     private func restoredPosition(for id: UUID) -> CGPoint? {
@@ -571,29 +909,54 @@ final class InsightTreeViewModel: ObservableObject {
     }
 
     private func persistPositions(_ nodes: [NodeModel]) {
-        let positions = Dictionary(uniqueKeysWithValues: nodes.map {
+        let positions = Dictionary(nodes.map {
             ($0.id.uuidString, CodablePoint($0.position))
-        })
+        }, uniquingKeysWith: { _, latest in latest })
         if let data = try? JSONEncoder().encode(positions) {
             UserDefaults.standard.set(data, forKey: positionStoreKey)
         }
     }
 
-    private func makeConceptLabel(from titles: [String]) -> String {
-        let stopWords: Set<String> = ["the", "and", "of", "to", "in", "a", "an", "is", "for", "on", "with", "from"]
-        let words = titles
-            .flatMap { $0.lowercased().split(separator: " ") }
-            .map { $0.trimmingCharacters(in: .punctuationCharacters) }
-            .filter { $0.count > 3 && !stopWords.contains($0) }
-
-        let ranked = Dictionary(grouping: words, by: { $0 })
-            .map { ($0.key, $0.value.count) }
-            .sorted { $0.1 > $1.1 }
-            .prefix(2)
-            .map { $0.0.capitalized }
-
-        return ranked.isEmpty ? "Inquiry" : ranked.joined(separator: " ")
+    private static func loadClusterLabels(storageKey: String) -> [UUID: String] {
+        guard let data = UserDefaults.standard.data(forKey: storageKey),
+              let stored = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return [:]
+        }
+        return stored.reduce(into: [:]) { result, entry in
+            guard let id = UUID(uuidString: entry.key) else { return }
+            result[id] = entry.value
+        }
     }
+
+    private func persistClusterLabels() {
+        let stored = Dictionary(
+            uniqueKeysWithValues: generatedClusterLabels.map {
+                ($0.key.uuidString, $0.value)
+            }
+        )
+        guard let data = try? JSONEncoder().encode(stored) else { return }
+        UserDefaults.standard.set(data, forKey: Self.clusterLabelStoreKey)
+    }
+
+}
+
+/// Deterministic UUID from a seed string (SHA-256, truncated to the first 16 bytes formatted as a
+/// standard UUID) — the same input always yields the same id. Callers that need a stable identity
+/// derived from content (a term, a promoted node, a generated child) use this instead of inventing
+/// and tracking their own id-generation scheme. See MODEL-INTEGRATION.md: "Persistent IDs:
+/// generated by application code, never by either model."
+func stableUUID(from seed: String) -> UUID {
+    let digest = SHA256.hash(data: Data(seed.utf8))
+    let bytes = Array(digest.prefix(16))
+    let uuidString = String(
+        format: "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5],
+        bytes[6], bytes[7],
+        bytes[8], bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+    return UUID(uuidString: uuidString) ?? UUID()
 }
 
 func computeEmbedding(for text: String) -> [Double]? {
@@ -623,8 +986,11 @@ func semanticDistance(_ a: [Double], _ b: [Double]) -> Double {
     1.0 - cosineSimilarity(a, b)
 }
 
+let nodeNodeMinLength: CGFloat = 360
+private let nodeNodeDistanceScale: CGFloat = 320
+
 func mapDistanceToLength(_ distance: Double) -> CGFloat {
-    80 + CGFloat(distance) * 320
+    nodeNodeMinLength + CGFloat(max(distance, 0)) * nodeNodeDistanceScale
 }
 
 /// Bond length (insight connector radius) from how related an insight is to its parent node.

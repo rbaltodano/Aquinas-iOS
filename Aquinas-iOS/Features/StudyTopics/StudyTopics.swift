@@ -14,17 +14,22 @@ struct StudyTopic: Identifiable, Codable, Equatable {
     var title: String
     var description: String
     var files: [UploadedFile]
+    /// When this topic was created — drives the "Date" filter's day-based grouping.
+    /// Defaults so existing persisted data without this field decodes safely.
+    var createdAt: Date = Date()
 
     init(
         id: UUID = UUID(),
         title: String = "",
         description: String = "",
-        files: [UploadedFile] = []
+        files: [UploadedFile] = [],
+        createdAt: Date = Date()
     ) {
         self.id = id
         self.title = title
         self.description = description
         self.files = files
+        self.createdAt = createdAt
     }
 }
 
@@ -45,6 +50,51 @@ enum StudyTopicStore {
     }
 }
 
+// MARK: - New Study Topic Prompt
+
+struct NewStudyTopicSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var title: String = ""
+    @State private var description: String = ""
+    @FocusState private var isTitleFocused: Bool
+    var onCreate: (String, String) -> Void
+
+    private var trimmedTitle: String {
+        title.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Name") {
+                    TextField("e.g. Summer Bible Study", text: $title)
+                        .focused($isTitleFocused)
+                }
+                Section("Description") {
+                    TextField("Briefly describe this topic", text: $description, axis: .vertical)
+                        .lineLimit(3...6)
+                }
+            }
+            .navigationTitle("New Study Topic")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", systemImage: "xmark") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Create", systemImage: "checkmark") {
+                        onCreate(trimmedTitle, description.trimmingCharacters(in: .whitespacesAndNewlines))
+                        dismiss()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(trimmedTitle.isEmpty)
+                }
+            }
+            .onAppear { isTitleFocused = true }
+        }
+    }
+}
+
 // MARK: - Study Topics List
 
 struct StudyTopicsView: View {
@@ -58,12 +108,25 @@ struct StudyTopicsView: View {
     var onNewChatInTopic: (UUID) -> Void = { _ in }
     var onAttachConversationToTopic: (InquiryConversation, UUID) -> Void
     var onRenameConversation: (InquiryConversation, String) -> Void
+    var onPinConversation: (InquiryConversation) -> Void
+    var onUnpinConversation: (InquiryConversation) -> Void
+    var onRemoveConversationFromStudyTopic: (InquiryConversation) -> Void
+    var onDeleteConversation: (InquiryConversation) -> Void
     /// When set, the view automatically opens this topic's detail on appear.
     var requestedTopicID: UUID? = nil
+    var onRefresh: () -> Void = {}
+    /// Notifies the parent when a topic's detail view opens/closes, so it can
+    /// disable the global edge-swipe-to-open-sidebar gesture while the local
+    /// swipe-to-go-back gesture below is active.
+    var onDetailVisibilityChange: (Bool) -> Void = { _ in }
 
     @State private var searchText = ""
     @State private var topics: [StudyTopic] = StudyTopicStore.load()
+    @State private var activeFilter: StudyTopicFilter = .recent
     @State private var selectedTopicID: UUID? = nil
+    /// Shared with StudyTopicDetailView so the external back button (below) can close
+    /// the Insight Tree first, before closing the topic detail itself.
+    @State private var topicCanvasMode = CanvasModeModel()
     @State private var topicBeingRenamed: StudyTopic? = nil
     @State private var topicRenameDraft: String = ""
     /// Set to a newly-created topic's ID so the detail view can auto-focus its title field.
@@ -80,7 +143,11 @@ struct StudyTopicsView: View {
     }
 
     private var visibleTopics: [StudyTopic] {
-        topics.filter { topicMatchesSearch($0) }
+        let filtered = topics
+            .filter { activeFilter.matches($0) }
+            .filter { topicMatchesSearch($0) }
+        guard activeFilter == .recent else { return filtered }
+        return filtered.sorted { $0.createdAt > $1.createdAt }
     }
 
     private var normalizedSearchText: String {
@@ -97,6 +164,7 @@ struct StudyTopicsView: View {
                     conversations: conversations,
                     activeConversationID: activeConversationID,
                     savedInsights: $savedInsights,
+                    canvasMode: topicCanvasMode,
                     autoFocusTitle: topic.id == autoFocusTopicID,
                     onUpdateTopic: updateTopic,
                     onSelectConversation: onSelectConversation,
@@ -107,6 +175,10 @@ struct StudyTopicsView: View {
                         onAttachConversationToTopic(conversation, topic.id)
                     },
                     onRenameConversation: onRenameConversation,
+                    onPinConversation: onPinConversation,
+                    onUnpinConversation: onUnpinConversation,
+                    onRemoveConversationFromStudyTopic: onRemoveConversationFromStudyTopic,
+                    onDeleteConversation: onDeleteConversation,
                     onDeleteTopic: {
                         deleteTopic(topic)
                     },
@@ -130,7 +202,11 @@ struct StudyTopicsView: View {
                         onMenuTap: onOpenMenu,
                         onBackTap: {
                             withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                selectedTopicID = nil
+                                if topicCanvasMode.isTopicCanvasVisible {
+                                    topicCanvasMode.isTopicCanvasVisible = false
+                                } else {
+                                    selectedTopicID = nil
+                                }
                             }
                         }
                     )
@@ -145,6 +221,9 @@ struct StudyTopicsView: View {
             .zIndex(20)
         }
         .animation(.spring(response: 0.42, dampingFraction: 0.84), value: selectedTopicID)
+        .onChange(of: selectedTopicID) { _, newValue in
+            onDetailVisibilityChange(newValue != nil)
+        }
         .onAppear {
             guard let id = requestedTopicID,
                   topics.contains(where: { $0.id == id }) else { return }
@@ -249,45 +328,72 @@ struct StudyTopicsView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     Color.clear.frame(height: 72)
 
-                    Text("Study Topics")
-                        .font(.custom("LibreBaskerville-Regular", size: 28))
-                        .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                    VStack(alignment: .center, spacing: 8) {
+                        Text(todayString())
+                            .font(AquinasTheme.Typography.uiLabel)
+                            .foregroundColor(AquinasTheme.Colors.lightGreen)
+
+                        Text("Study Topics")
+                            .font(.custom("LibreBaskerville-Regular", size: 30))
+                            .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.top, 28)
+
+                    StudyTopicsSearchField(
+                        searchText: $searchText,
+                        prompt: Text("Search Study Topcis")
+                    )
                         .padding(.top, 28)
-                        .frame(maxWidth: .infinity, alignment: .center)
 
-                    StudyTopicsSearchField(searchText: $searchText)
-                        .padding(.top, 24)
+                    HStack(spacing: 24) {
+                        ForEach(StudyTopicFilter.allCases) { filter in
+                            Button(action: {
+                                withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                                    activeFilter = filter
+                                }
+                            }) {
+                                Text(filter.label)
+                                    .font(AquinasTheme.Typography.uiSubheading)
+                                    .foregroundColor(
+                                        activeFilter == filter
+                                            ? AquinasTheme.Colors.lightGreen
+                                            : AquinasTheme.Colors.placeholderText
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                        }
 
-                    LazyVStack(spacing: 16) {
-                        ForEach(visibleTopics) { topic in
-                            StudyTopicCard(
-                                topic: topic,
-                                subItems: topicSubItems(for: topic),
-                                onSelect: {
-                                    withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                        selectedTopicID = topic.id
-                                    }
-                                },
-                                onRename: {
-                                    topicRenameDraft = topic.title
-                                    topicBeingRenamed = topic
-                                },
-                                onDelete: { deleteTopic(topic) }
-                            )
-                            .transition(
-                                .asymmetric(
-                                    insertion: .opacity.combined(with: .move(edge: .bottom)),
-                                    removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .top))
-                                )
-                            )
+                        Spacer(minLength: 8)
+                    }
+                    .padding(.top, 16)
+
+                    LazyVStack(alignment: .leading, spacing: 16) {
+                        if visibleTopics.isEmpty {
+                            StudyTopicsEmptyState(hasAnyTopics: !topics.isEmpty)
+                                .padding(.top, 8)
+                        } else if activeFilter == .date {
+                            sectionedTopicList(dateGroupedTopicSections(visibleTopics))
+                                .id("date")
+                                .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                        } else {
+                            ForEach(visibleTopics) { topic in
+                                topicCard(topic)
+                            }
+                            .id("recent")
+                            .transition(.opacity.combined(with: .scale(scale: 0.98)))
                         }
                     }
                     .padding(.top, 48)
                     .padding(.bottom, 120)
                     .animation(.spring(response: 0.34, dampingFraction: 0.86), value: normalizedSearchText)
+                    .animation(.spring(response: 0.34, dampingFraction: 0.86), value: activeFilter)
                 }
                 .padding(.horizontal, 24)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .refreshable {
+                refreshContent()
             }
 
             // FAB
@@ -310,6 +416,77 @@ struct StudyTopicsView: View {
             .padding(.bottom, 24)
             .shadow(color: AquinasTheme.Colors.dropShadow.opacity(0.16), radius: 16, x: 0, y: 10)
         }
+    }
+
+    @ViewBuilder
+    private func topicCard(_ topic: StudyTopic) -> some View {
+        StudyTopicCard(
+            topic: topic,
+            subItems: topicSubItems(for: topic),
+            subItemTitle: { conversationTitle($0) },
+            onSelect: {
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                    selectedTopicID = topic.id
+                }
+            },
+            onRename: {
+                topicRenameDraft = topic.title
+                topicBeingRenamed = topic
+            },
+            onDelete: { deleteTopic(topic) },
+            onSelectSubItem: { conversation in
+                onSelectConversation(conversation)
+            }
+        )
+        .transition(
+            .asymmetric(
+                insertion: .opacity.combined(with: .move(edge: .bottom)),
+                removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .top))
+            )
+        )
+    }
+
+    @ViewBuilder
+    private func sectionedTopicList(_ sections: [StudyTopicSection]) -> some View {
+        ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
+            VStack(alignment: .leading, spacing: 16) {
+                AquinasSectionTitle(section.title)
+
+                ForEach(section.topics) { topic in
+                    topicCard(topic)
+                }
+            }
+
+            if index < sections.count - 1 {
+                AquinasSectionDivider()
+                    .padding(.vertical, 8)
+            }
+        }
+    }
+
+    /// Groups topics by the calendar day they were created, most recent day first.
+    private func dateGroupedTopicSections(_ list: [StudyTopic]) -> [StudyTopicSection] {
+        let calendar = Calendar.current
+        let groups = Dictionary(grouping: list) { calendar.startOfDay(for: $0.createdAt) }
+        return groups.keys.sorted(by: >).map { day in
+            StudyTopicSection(
+                id: "date-\(day.timeIntervalSince1970)",
+                title: dayLabel(for: day),
+                topics: (groups[day] ?? []).sorted { $0.createdAt > $1.createdAt }
+            )
+        }
+    }
+
+    private func dayLabel(for day: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(day) { return "Today" }
+        if calendar.isDateInYesterday(day) { return "Yesterday" }
+        return day.formatted(.dateTime.month(.wide).day().year())
+    }
+
+    private func refreshContent() {
+        topics = StudyTopicStore.load()
+        onRefresh()
     }
 
     private func createStudyTopic() {
@@ -345,16 +522,16 @@ struct StudyTopicsView: View {
         conversations.contains { $0.studyTopicID == topic.id }
     }
 
-    private func topicSubItems(for topic: StudyTopic) -> [String] {
+    private func topicSubItems(for topic: StudyTopic) -> [InquiryConversation] {
         conversations
             .filter { $0.studyTopicID == topic.id }
-            .map { conversationTitle($0) }
-            .filter { !$0.isEmpty }
+            .filter { !conversationTitle($0).isEmpty }
     }
 
     private func topicMatchesSearch(_ topic: StudyTopic) -> Bool {
         guard !normalizedSearchText.isEmpty else { return true }
-        let text = ([displayTitle(for: topic), topic.description] + topicSubItems(for: topic))
+        let subItemTitles = topicSubItems(for: topic).map { conversationTitle($0) }
+        let text = ([displayTitle(for: topic), topic.description] + subItemTitles)
             .joined(separator: " ")
             .lowercased()
         return text.contains(normalizedSearchText)
@@ -363,6 +540,10 @@ struct StudyTopicsView: View {
     private func displayTitle(for topic: StudyTopic) -> String {
         let trimmed = topic.title.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "Untitled Study Topic" : trimmed
+    }
+
+    private func todayString(date: Date = Date()) -> String {
+        date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().year())
     }
 
     private func conversationTitle(_ conversation: InquiryConversation) -> String {
@@ -392,30 +573,52 @@ struct StudyTopicDetailView: View {
     var onNewChat: () -> Void
     var onAttachConversation: (InquiryConversation) -> Void
     var onRenameConversation: (InquiryConversation, String) -> Void
+    var onPinConversation: (InquiryConversation) -> Void
+    var onUnpinConversation: (InquiryConversation) -> Void
+    var onRemoveConversationFromStudyTopic: (InquiryConversation) -> Void
+    var onDeleteConversation: (InquiryConversation) -> Void
     var onDeleteTopic: () -> Void
     var onBack: () -> Void
+    /// Owned by the parent StudyTopicsView so its shared back button can close the
+    /// Insight Tree before closing this detail view.
+    let canvasMode: CanvasModeModel
 
     @State private var activeInsight: ConceptDefinition? = nil
     @State private var pickerActiveInsight: ConceptDefinition? = nil
     @State private var conversationBeingRenamed: InquiryConversation? = nil
+    @State private var deletingConversationIDs: Set<UUID> = []
     @State private var renameDraft = ""
     @State private var isExistingConversationPickerOpen = false
     @State private var titleDraft: String
     @State private var descriptionDraft: String
+    @State private var topicSearchText = ""
     @State private var localFiles: [UploadedFile]
     @State private var isTitleFocused: Bool = false
+
+    // MARK: Insight Tree (Canvas Mode, scoped to this topic's saved insights)
+    @State private var insightSelectedPersonality = "Scholarly"
+    @State private var insightIsPersonalityMenuOpen = false
+    @State private var insightShowFilePicker = false
+    @State private var insightShowPhotoPicker = false
+    @State private var insightShowCamera = false
+    @State private var insightContextCardState = ContextCardState()
 
     init(
         topic: StudyTopic,
         conversations: [InquiryConversation],
         activeConversationID: UUID?,
         savedInsights: Binding<[ConceptDefinition]>,
+        canvasMode: CanvasModeModel,
         autoFocusTitle: Bool = false,
         onUpdateTopic: @escaping (StudyTopic) -> Void,
         onSelectConversation: @escaping (InquiryConversation) -> Void,
         onNewChat: @escaping () -> Void,
         onAttachConversation: @escaping (InquiryConversation) -> Void,
         onRenameConversation: @escaping (InquiryConversation, String) -> Void,
+        onPinConversation: @escaping (InquiryConversation) -> Void,
+        onUnpinConversation: @escaping (InquiryConversation) -> Void,
+        onRemoveConversationFromStudyTopic: @escaping (InquiryConversation) -> Void,
+        onDeleteConversation: @escaping (InquiryConversation) -> Void,
         onDeleteTopic: @escaping () -> Void,
         onBack: @escaping () -> Void,
         onRequestPhotoPicker: @escaping () -> Void = {},
@@ -425,12 +628,17 @@ struct StudyTopicDetailView: View {
         self.conversations = conversations
         self.activeConversationID = activeConversationID
         self._savedInsights = savedInsights
+        self.canvasMode = canvasMode
         self.autoFocusTitle = autoFocusTitle
         self.onUpdateTopic = onUpdateTopic
         self.onSelectConversation = onSelectConversation
         self.onNewChat = onNewChat
         self.onAttachConversation = onAttachConversation
         self.onRenameConversation = onRenameConversation
+        self.onPinConversation = onPinConversation
+        self.onUnpinConversation = onUnpinConversation
+        self.onRemoveConversationFromStudyTopic = onRemoveConversationFromStudyTopic
+        self.onDeleteConversation = onDeleteConversation
         self.onDeleteTopic = onDeleteTopic
         self.onBack = onBack
         self.onRequestPhotoPicker = onRequestPhotoPicker
@@ -449,7 +657,7 @@ struct StudyTopicDetailView: View {
             AquinasTheme.Colors.canvas
                 .ignoresSafeArea()
 
-            let topicConversations = conversations.filter { $0.studyTopicID == topic.id }
+            let topicConversations = filteredTopicConversations
 
             GeometryReader { geometry in
                 ScrollView(showsIndicators: false) {
@@ -505,8 +713,13 @@ struct StudyTopicDetailView: View {
                                     lineLimit: 1...4,
                                     lineSpacing: 7
                                 )
-                                .padding(.leading, 24)
                                 .onChange(of: descriptionDraft) { _, _ in persistDrafts() }
+
+                                StudyTopicsSearchField(
+                                    searchText: $topicSearchText,
+                                    prompt: Text("Search in \(Text(displayTopicTitle).italic())")
+                                )
+                                .padding(.top, 8)
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -536,11 +749,32 @@ struct StudyTopicDetailView: View {
                                             onRename: { conv in
                                                 renameDraft = conv.title
                                                 conversationBeingRenamed = conv
+                                            },
+                                            onPin: { conv in
+                                                onPinConversation(conv)
+                                            },
+                                            onUnpin: { conv in
+                                                onUnpinConversation(conv)
+                                            },
+                                            onRemoveFromStudyTopic: { conv in
+                                                onRemoveConversationFromStudyTopic(conv)
+                                            },
+                                            onDelete: { conv in
+                                                deleteConversationCard(conv)
                                             }
+                                        )
+                                        .opacity(deletingConversationIDs.contains(conversation.id) ? 0 : 1)
+                                        .blur(radius: deletingConversationIDs.contains(conversation.id) ? 12 : 0)
+                                        .transition(
+                                            .asymmetric(
+                                                insertion: .opacity.combined(with: .move(edge: .bottom)),
+                                                removal: .blurFade
+                                            )
                                         )
                                     }
                                 }
                                 .frame(maxWidth: .infinity)
+                                .animation(.spring(response: 0.34, dampingFraction: 0.86), value: normalizedTopicSearchText)
                             }
 
                             Button(action: {
@@ -557,7 +791,7 @@ struct StudyTopicDetailView: View {
                                 .frame(maxWidth: .infinity)
                                 .padding(24)
                                 .overlay(
-                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    RoundedRectangle(cornerRadius: 28, style: .continuous)
                                         .stroke(
                                             AquinasTheme.Colors.darkText.opacity(0.15),
                                             style: StrokeStyle(lineWidth: 1, dash: [5, 4])
@@ -579,31 +813,55 @@ struct StudyTopicDetailView: View {
                 .scrollClipDisabled()
             }
 
-            VStack {
-                Spacer()
-                HStack {
-                    Spacer()
-                    Button(action: onNewChat) {
-                        HStack(spacing: 8) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 12, weight: .bold))
-                                .sfSymbolDrawOn()
-                            Text("New Conversation")
-                                .font(.custom("Figtree-Regular", size: 14))
-                        }
-                        .foregroundColor(AquinasTheme.Colors.canvas)
-                        .padding(.horizontal, 22)
-                        .frame(height: 52)
-                        .background(AquinasTheme.Colors.secondaryMuted)
-                        .clipShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .shadow(color: AquinasTheme.Colors.dropShadow.opacity(0.16), radius: 16, x: 0, y: 10)
-                }
-                .padding(.horizontal, 24)
-                .padding(.bottom, 24)
+            // Insight Tree: saved insights from this topic's conversations.
+            if canvasMode.isTopicCanvasVisible {
+                topicInsightTreeLayer
             }
-            .zIndex(6)
+
+            if !canvasMode.isTopicCanvasVisible {
+                VStack {
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        Button(action: onNewChat) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 12, weight: .bold))
+                                    .sfSymbolDrawOn()
+                                Text("New Conversation")
+                                    .font(.custom("Figtree-Regular", size: 14))
+                            }
+                            .foregroundColor(AquinasTheme.Colors.canvas)
+                            .padding(.horizontal, 22)
+                            .frame(height: 52)
+                            .background(AquinasTheme.Colors.secondaryMuted)
+                            .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .shadow(color: AquinasTheme.Colors.dropShadow.opacity(0.16), radius: 16, x: 0, y: 10)
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 24)
+                }
+                .zIndex(6)
+            }
+
+            // Top-right entry into the topic's Insight Tree. Fades/scales/blurs away once
+            // inside — the shared back button (top-left) handles exiting, so there's no
+            // second "back" affordance competing for the same corner.
+            if !canvasMode.isTopicCanvasVisible {
+                VStack {
+                    HStack {
+                        Spacer()
+                        CanvasModeToggleButton(isActive: false, action: enterInsightTree)
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.top, 24)
+                    Spacer()
+                }
+                .zIndex(7)
+                .transition(.canvasToggleFade)
+            }
 
         }
         .task(id: autoFocusTitle) {
@@ -612,15 +870,29 @@ struct StudyTopicDetailView: View {
             try? await Task.sleep(for: .milliseconds(550))
             isTitleFocused = true
         }
-        // Swipe right to go back.
+        // Swipe right to go back, swipe left to enter the Insight Tree.
         .simultaneousGesture(
             DragGesture(minimumDistance: 18)
                 .onEnded { value in
-                    guard value.translation.width > 60,
-                          abs(value.translation.width) > abs(value.translation.height) else { return }
-                    onBack()
+                    guard abs(value.translation.width) > abs(value.translation.height) else { return }
+                    if value.translation.width > 60 {
+                        if canvasMode.isTopicCanvasVisible {
+                            closeInsightTree()
+                        } else {
+                            onBack()
+                        }
+                    } else if value.translation.width < -60 && !canvasMode.isTopicCanvasVisible {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        enterInsightTree()
+                    }
                 }
         )
+        .safeAreaInset(edge: .bottom) {
+            if canvasMode.isTopicCanvasVisible {
+                insightControlDock
+            }
+        }
+        .contextCardOverlay(insightContextCardState, wordCount: 0)
         .sheet(item: $activeInsight) { insight in
             ConceptSheetContent(concept: insight, collectedDefinitions: $savedInsights)
                 .presentationDetents([.height(340), .large])
@@ -642,7 +914,11 @@ struct StudyTopicDetailView: View {
                 },
                 onRenameConversation: { conversation, title in
                     onRenameConversation(conversation, title)
-                }
+                },
+                onPinConversation: onPinConversation,
+                onUnpinConversation: onUnpinConversation,
+                onRemoveConversationFromStudyTopic: onRemoveConversationFromStudyTopic,
+                onDeleteConversation: onDeleteConversation
             )
             .presentationDetents([.height(420), .large])
             .presentationDragIndicator(.visible)
@@ -688,6 +964,48 @@ struct StudyTopicDetailView: View {
                 }
             }
         )
+    }
+
+    private var displayTopicTitle: String {
+        let trimmedDraft = titleDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedDraft.isEmpty { return trimmedDraft }
+
+        let trimmedTitle = topic.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedTitle.isEmpty ? "Study Topic" : trimmedTitle
+    }
+
+    private var normalizedTopicSearchText: String {
+        topicSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private var filteredTopicConversations: [InquiryConversation] {
+        let topicConversations = conversations.filter { $0.studyTopicID == topic.id }
+        guard !normalizedTopicSearchText.isEmpty else { return topicConversations }
+
+        return topicConversations.filter { conversation in
+            let insightWords = insights(for: conversation).map(\.word).joined(separator: " ")
+            let text = [
+                conversation.title,
+                latestAnswer(in: conversation),
+                insightWords,
+                searchableText(conversation)
+            ].joined(separator: " ").lowercased()
+
+            return text.contains(normalizedTopicSearchText)
+        }
+    }
+
+    private func deleteConversationCard(_ conversation: InquiryConversation) {
+        guard !deletingConversationIDs.contains(conversation.id) else { return }
+
+        deletingConversationIDs.insert(conversation.id)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
+                onDeleteConversation(conversation)
+            }
+            deletingConversationIDs.remove(conversation.id)
+        }
     }
 
     private func placeholderTextField(
@@ -809,9 +1127,157 @@ struct StudyTopicDetailView: View {
         }
         return text
     }
+
+    // MARK: Insight Tree
+
+    /// Saved insights across every conversation attached to this topic, deduplicated by word.
+    private var topicInsights: [ConceptDefinition] {
+        let topicConversations = conversations.filter { $0.studyTopicID == topic.id }
+        var seen = Set<String>()
+        var result: [ConceptDefinition] = []
+        for conversation in topicConversations {
+            for insight in insights(for: conversation) {
+                let key = insight.word.lowercased()
+                if seen.insert(key).inserted {
+                    result.append(insight)
+                }
+            }
+        }
+        return result
+    }
+
+    private func enterInsightTree() {
+        UIApplication.shared.sendAction(
+            #selector(UIResponder.resignFirstResponder),
+            to: nil, from: nil, for: nil
+        )
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+            canvasMode.isTopicCanvasVisible = true
+        }
+    }
+
+    private func closeInsightTree() {
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+            canvasMode.isTopicCanvasVisible = false
+        }
+    }
+
+    /// Forking an insight from the topic canvas starts a new conversation in this topic.
+    private func forkTopicInsight(_ concept: ConceptDefinition) {
+        closeInsightTree()
+        onNewChat()
+    }
+
+    private func toggleSavedInsight(_ concept: ConceptDefinition) {
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+            if savedInsights.contains(where: { $0.id == concept.id }) {
+                savedInsights.removeAll { $0.id == concept.id }
+            } else {
+                savedInsights.append(concept)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var topicInsightTreeLayer: some View {
+        InsightTreeView(
+            insights: topicInsights,
+            selectionRequest: canvasMode.canvasSelectionRequest,
+            clearSelectionRequest: canvasMode.canvasClearSelectionRequest,
+            dismissHoverRequest: canvasMode.canvasDismissHoverRequest,
+            createConceptRequest: canvasMode.canvasCreateConceptRequest,
+            promotedInsightIDs: canvasMode.promotedCanvasInsightIDs,
+            onClose: closeInsightTree,
+            onRemoveInsight: toggleSavedInsight,
+            onRestoreInsight: toggleSavedInsight,
+            onForkInsight: forkTopicInsight,
+            onSelectionStateChange: { canvasMode.hasCanvasHover = $0 },
+            onInsightSelectionStateChange: { canvasMode.hasHoveredCanvasInsight = $0 },
+            onSelectedCanvasItemCountChange: { canvasMode.canvasSelectedItemCount = $0 },
+            onPromotedInsightIDsChange: { canvasMode.promotedCanvasInsightIDs = $0 },
+            savedConceptIDs: Set(savedInsights.map(\.id)),
+            onToggleSavedConcept: toggleSavedInsight,
+            inquireConnectionRequest: canvasMode.canvasInquireConnectionRequest,
+            onInquireConnectionConcepts: { first, _ in forkTopicInsight(first) },
+            midpointEnterRequest: canvasMode.canvasMidpointEnterRequest,
+            midpointCenterRequest: canvasMode.canvasMidpointCenterRequest,
+            midpointPlaceRequest: canvasMode.canvasMidpointPlaceRequest,
+            onMidpointModeChange: { canvasMode.isCanvasMidpointMode = $0 },
+            onMidpointGeneratingChange: { canvasMode.isCanvasInsightGenerating = $0 },
+            showQuestionBar: false
+        )
+        .transition(.move(edge: .trailing).combined(with: .opacity))
+        .zIndex(5)
+    }
+
+    @ViewBuilder
+    private var insightControlDock: some View {
+        InquiryControlDock(
+            isCanvasMode: true,
+            showFilePicker: $insightShowFilePicker,
+            showPhotoPicker: $insightShowPhotoPicker,
+            showCamera: $insightShowCamera,
+            selectedPersonality: $insightSelectedPersonality,
+            isPersonalityMenuOpen: $insightIsPersonalityMenuOpen,
+            isAtBottom: true,
+            hasCanvasHover: canvasMode.hasCanvasHover,
+            hasCanvasInsightHover: canvasMode.hasHoveredCanvasInsight,
+            hasSelectedCanvasItems: canvasMode.canvasSelectedItemCount > 0,
+            selectedCanvasItemCount: canvasMode.canvasSelectedItemCount,
+            onScrollToBottom: {},
+            onViewEntireCanvas: {},
+            onOpenInsights: {},
+            onSelectCanvasItem: { canvasMode.canvasSelectionRequest += 1 },
+            onCreateCanvasConcept: { canvasMode.canvasCreateConceptRequest += 1 },
+            onInquireConnection: { canvasMode.canvasInquireConnectionRequest += 1 },
+            onMidpointConcepts: { canvasMode.canvasMidpointEnterRequest += 1 },
+            isMidpointMode: canvasMode.isCanvasMidpointMode,
+            isCanvasInsightLoading: canvasMode.isCanvasInsightGenerating,
+            onMidpointCenter: { canvasMode.canvasMidpointCenterRequest += 1 },
+            onMidpointPlace: { canvasMode.canvasMidpointPlaceRequest += 1 },
+            onClearCanvasSelection: { canvasMode.canvasClearSelectionRequest += 1 },
+            onContextWillOpen: {
+                if canvasMode.isTopicCanvasVisible { canvasMode.canvasDismissHoverRequest += 1 }
+            },
+            contextCard: insightContextCardState
+        )
+    }
 }
 
 // MARK: - Existing Conversation Picker
+
+private struct AddButtonEntranceModifier: ViewModifier {
+    let scale: CGFloat
+    let opacity: Double
+    let blurRadius: CGFloat
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(scale)
+            .opacity(opacity)
+            .blur(radius: blurRadius)
+    }
+}
+
+private extension AnyTransition {
+    /// Scales down from 1.1 → 1, fades 0 → 1 opacity, and un-blurs 4pt → 0pt.
+    /// Symmetric, so removal automatically plays the same recipe in reverse.
+    static var addButtonEntrance: AnyTransition {
+        .modifier(
+            active: AddButtonEntranceModifier(scale: 1.1, opacity: 0, blurRadius: 4),
+            identity: AddButtonEntranceModifier(scale: 1, opacity: 1, blurRadius: 0)
+        )
+    }
+
+    /// Scales up 5%, blurs by 8pt, and fades to 0 opacity. Symmetric, so the button
+    /// reverses the same recipe on the way back in.
+    static var canvasToggleFade: AnyTransition {
+        .modifier(
+            active: AddButtonEntranceModifier(scale: 1.05, opacity: 0, blurRadius: 8),
+            identity: AddButtonEntranceModifier(scale: 1, opacity: 1, blurRadius: 0)
+        )
+    }
+}
 
 private struct ExistingConversationPickerSheet: View {
     /// Conversations from sideMenuConversations — may be stale or empty if
@@ -822,12 +1288,20 @@ private struct ExistingConversationPickerSheet: View {
     var onSelectConversation: (InquiryConversation) -> Void
     var onOpenInsight: (ConceptDefinition) -> Void
     var onRenameConversation: (InquiryConversation, String) -> Void
+    var onPinConversation: (InquiryConversation) -> Void
+    var onUnpinConversation: (InquiryConversation) -> Void
+    var onRemoveConversationFromStudyTopic: (InquiryConversation) -> Void
+    var onDeleteConversation: (InquiryConversation) -> Void
 
     @State private var searchText = ""
     @State private var conversationBeingRenamed: InquiryConversation? = nil
     @State private var renameDraft = ""
+    @State private var deletingConversationIDs: Set<UUID> = []
     /// Loaded from CurrentConversationsStore on appear as a reliable fallback.
     @State private var storeConversations: [InquiryConversation] = []
+    /// Conversations the user has tapped, pending a single "Add" tap to attach them all.
+    @State private var selectedConversationIDs: Set<UUID> = []
+    @State private var addButtonPulseScale: CGFloat = 1.0
 
     private var normalizedSearchText: String {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -856,51 +1330,101 @@ private struct ExistingConversationPickerSheet: View {
         }
     }
 
+    private var addButtonSuffix: String {
+        selectedConversationIDs.count == 1 ? "Conversation" : "Conversations"
+    }
+
     var body: some View {
-        ScrollView(showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 0) {
-                Text("Add Existing Conversation")
-                    .font(.custom("LibreBaskerville-Regular", size: 24))
-                    .foregroundColor(AquinasTheme.Colors.primaryReadable)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.top, 28)
+        ZStack(alignment: .bottom) {
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Add Existing Conversation")
+                        .font(.custom("LibreBaskerville-Regular", size: 24))
+                        .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.top, 56)
 
-                StudyTopicsSearchField(searchText: $searchText)
-                    .padding(.top, 24)
+                    StudyTopicsSearchField(searchText: $searchText)
+                        .padding(.top, 24)
 
-                if filteredConversations.isEmpty {
-                    Text("No conversations available.")
-                        .font(.custom("Figtree-Regular", size: 14))
-                        .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.5))
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 48)
-                } else {
-                    LazyVStack(spacing: 16) {
-                        ForEach(filteredConversations) { conversation in
-                            OpenConversationCard(
-                                conversation: conversation,
-                                isActive: conversation.id == activeConversationID,
-                                latestAnswer: latestAnswer(in: conversation),
-                                insights: insights(for: conversation),
-                                onSelect: {
-                                    onSelectConversation(conversation)
-                                },
-                                onOpenInsight: onOpenInsight,
-                                onRename: { conversation in
-                                    renameDraft = conversation.title
-                                    conversationBeingRenamed = conversation
-                                }
-                            )
+                    if filteredConversations.isEmpty {
+                        Text("No conversations available.")
+                            .font(.custom("Figtree-Regular", size: 14))
+                            .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.5))
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 48)
+                    } else {
+                        LazyVStack(spacing: 16) {
+                            ForEach(filteredConversations) { conversation in
+                                OpenConversationCard(
+                                    conversation: conversation,
+                                    isActive: conversation.id == activeConversationID,
+                                    latestAnswer: latestAnswer(in: conversation),
+                                    insights: insights(for: conversation),
+                                    onSelect: {
+                                        toggleSelection(conversation)
+                                    },
+                                    onOpenInsight: onOpenInsight,
+                                    onRename: { conversation in
+                                        renameDraft = conversation.title
+                                        conversationBeingRenamed = conversation
+                                    },
+                                    onPin: { conversation in
+                                        onPinConversation(conversation)
+                                    },
+                                    onUnpin: { conversation in
+                                        onUnpinConversation(conversation)
+                                    },
+                                    onAddToStudyTopic: { conversation in
+                                        toggleSelection(conversation)
+                                    },
+                                    onRemoveFromStudyTopic: { conversation in
+                                        onRemoveConversationFromStudyTopic(conversation)
+                                    },
+                                    onDelete: { conversation in
+                                        deleteConversationCard(conversation)
+                                    },
+                                    isSelected: selectedConversationIDs.contains(conversation.id)
+                                )
+                                .opacity(deletingConversationIDs.contains(conversation.id) ? 0 : 1)
+                                .blur(radius: deletingConversationIDs.contains(conversation.id) ? 12 : 0)
+                            }
                         }
+                        .padding(.top, 32)
                     }
-                    .padding(.top, 32)
-                }
 
-                Color.clear.frame(height: 32)
+                    Color.clear.frame(height: 100)
+                }
+                .padding(.horizontal, 24)
             }
-            .padding(.horizontal, 24)
+            .background(AquinasTheme.Colors.canvas)
+
+            if !selectedConversationIDs.isEmpty {
+                Button(action: addSelectedConversations) {
+                    HStack(spacing: 4) {
+                        Text("Add")
+                        Text("\(selectedConversationIDs.count)")
+                            .monospacedDigit()
+                            .contentTransition(.numericText())
+                        Text(addButtonSuffix)
+                    }
+                    .font(.custom("Figtree-Regular", size: 14))
+                    .foregroundColor(AquinasTheme.Colors.canvas)
+                    .padding(.horizontal, 22)
+                    .frame(height: 52)
+                    .background(AquinasTheme.Colors.secondaryMuted)
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .padding(.bottom, 24)
+                .shadow(color: AquinasTheme.Colors.dropShadow.opacity(0.16), radius: 16, x: 0, y: 10)
+                .scaleEffect(addButtonPulseScale)
+                .transition(.addButtonEntrance)
+            }
         }
-        .background(AquinasTheme.Colors.canvas)
+        .onChange(of: selectedConversationIDs.count) { _, _ in
+            triggerAddButtonPulse()
+        }
         .onAppear {
             // Load from the authoritative store so the list is never empty
             // because sideMenuConversations hasn't been published yet this session.
@@ -936,6 +1460,50 @@ private struct ExistingConversationPickerSheet: View {
                 }
             }
         )
+    }
+
+    private func deleteConversationCard(_ conversation: InquiryConversation) {
+        guard !deletingConversationIDs.contains(conversation.id) else { return }
+
+        deletingConversationIDs.insert(conversation.id)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
+                onDeleteConversation(conversation)
+            }
+            deletingConversationIDs.remove(conversation.id)
+        }
+    }
+
+    private func toggleSelection(_ conversation: InquiryConversation) {
+        withAnimation(.spring(response: 0.18, dampingFraction: 0.86)) {
+            if selectedConversationIDs.contains(conversation.id) {
+                selectedConversationIDs.remove(conversation.id)
+            } else {
+                selectedConversationIDs.insert(conversation.id)
+            }
+        }
+    }
+
+    private func addSelectedConversations() {
+        let selected = unattachedConversations.filter { selectedConversationIDs.contains($0.id) }
+        for conversation in selected {
+            onSelectConversation(conversation)
+        }
+        withAnimation(.spring(response: 0.18, dampingFraction: 0.86)) {
+            selectedConversationIDs.removeAll()
+        }
+    }
+
+    private func triggerAddButtonPulse() {
+        withAnimation(.spring(response: 0.22, dampingFraction: 0.52)) {
+            addButtonPulseScale = 1.05
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.68)) {
+                addButtonPulseScale = 1.0
+            }
+        }
     }
 
     private func latestAnswer(in conversation: InquiryConversation) -> String {
@@ -983,6 +1551,7 @@ private struct ExistingConversationPickerSheet: View {
 
 struct StudyTopicsSearchField: View {
     @Binding var searchText: String
+    var prompt: Text = Text("Search")
     @FocusState private var isFocused: Bool
 
     var body: some View {
@@ -992,9 +1561,9 @@ struct StudyTopicsSearchField: View {
                 .foregroundColor(AquinasTheme.Colors.lightGreen)
                 .frame(width: 16, height: 16)
 
-            TextField("Search", text: $searchText)
-                .font(.custom("LibreBaskerville-Regular", size: 14))
-                .foregroundColor(AquinasTheme.Colors.primaryReadable)
+            TextField("", text: $searchText, prompt: prompt)
+                .font(AquinasTheme.Typography.body)
+                .foregroundColor(AquinasTheme.Colors.paragraphText)
                 .tint(AquinasTheme.Colors.secondaryMuted)
                 .submitLabel(.search)
                 .focused($isFocused)
@@ -1011,21 +1580,73 @@ struct StudyTopicsSearchField: View {
     }
 }
 
+// MARK: - Filters
+
+private struct StudyTopicSection: Identifiable {
+    let id: String
+    let title: String
+    let topics: [StudyTopic]
+}
+
+private enum StudyTopicFilter: String, CaseIterable, Identifiable, Equatable {
+    case recent, date
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .recent: return "Recent"
+        case .date: return "Date"
+        }
+    }
+
+    func matches(_ topic: StudyTopic) -> Bool {
+        switch self {
+        case .recent, .date:
+            return true
+        }
+    }
+}
+
+// MARK: - Empty State
+
+private struct StudyTopicsEmptyState: View {
+    let hasAnyTopics: Bool
+
+    var body: some View {
+        if hasAnyTopics {
+            AquinasEmptyState(
+                systemImage: "magnifyingglass",
+                title: "No Matches Found",
+                message: "Try a different search term."
+            )
+        } else {
+            AquinasEmptyState(
+                systemImage: "book.closed",
+                title: "Gather your studies here",
+                message: "Create a study topic to organize conversations, insights, and files around a single subject."
+            )
+        }
+    }
+}
+
 // MARK: - Topic Card (list view)
 
 private struct StudyTopicCard: View {
     let topic: StudyTopic
-    let subItems: [String]
+    let subItems: [InquiryConversation]
+    var subItemTitle: (InquiryConversation) -> String
     var onSelect: () -> Void
     var onRename: () -> Void = {}
     var onDelete: () -> Void = {}
+    var onSelectSubItem: (InquiryConversation) -> Void = { _ in }
 
     @State private var isExpanded = false
     @State private var isShowingLongPressFeedback = false
 
     private let longPressDuration: TimeInterval = 0.25
 
-    private var visibleSubItems: [String] {
+    private var visibleSubItems: [InquiryConversation] {
         isExpanded ? subItems : Array(subItems.prefix(3))
     }
 
@@ -1035,12 +1656,18 @@ private struct StudyTopicCard: View {
             // Header: title + options button
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .center, spacing: 12) {
-                    Text(displayTitle)
-                        .font(.custom("LibreBaskerville-Regular", size: 18))
-                        .foregroundColor(AquinasTheme.Colors.primaryReadable)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .scaleEffect(isShowingLongPressFeedback ? 1.02 : 1, anchor: .leading)
+                    HStack(spacing: 8) {
+                        Image(systemName: "square.stack")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundColor(AquinasTheme.Colors.lightGreen)
+
+                        Text(displayTitle)
+                            .font(.custom("Figtree-Bold", size: 18))
+                            .foregroundColor(AquinasTheme.Colors.lightGreen)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .scaleEffect(isShowingLongPressFeedback ? 1.02 : 1, anchor: .leading)
 
                     Spacer(minLength: 8)
 
@@ -1064,7 +1691,7 @@ private struct StudyTopicCard: View {
                 if !displayDescription.isEmpty {
                     Text(displayDescription)
                         .font(.custom("Figtree-Regular", size: 14))
-                        .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+                        .foregroundColor(AquinasTheme.Colors.paragraphText)
                         .lineSpacing(4)
                         .lineLimit(3)
                         .truncationMode(.tail)
@@ -1075,12 +1702,15 @@ private struct StudyTopicCard: View {
             // Sub-items: branch / question titles
             if !subItems.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(visibleSubItems, id: \.self) { item in
-                        Text(item)
-                            .font(.custom("Figtree-Bold", size: 12))
-                            .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
+                    ForEach(visibleSubItems, id: \.id) { conversation in
+                        Button(action: { onSelectSubItem(conversation) }) {
+                            Text(subItemTitle(conversation))
+                                .font(.custom("Figtree-Bold", size: 14))
+                                .foregroundColor(AquinasTheme.Colors.headingText)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                        .buttonStyle(.plain)
                     }
 
                     if subItems.count > 3 {
@@ -1091,7 +1721,7 @@ private struct StudyTopicCard: View {
                         }) {
                             Image(systemName: "ellipsis")
                                 .font(.system(size: 12, weight: .bold))
-                                .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+                                .foregroundColor(AquinasTheme.Colors.lightGreen)
                                 .frame(width: 34, height: 18)
                                 .background(AquinasTheme.Colors.canvas.opacity(0.72))
                                 .clipShape(Capsule())
@@ -1107,7 +1737,7 @@ private struct StudyTopicCard: View {
         }
         .padding(24)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(AquinasTheme.Colors.componentBackground)
+        .background(AquinasTheme.Colors.canvasSecondary)
         .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 28, style: .continuous)

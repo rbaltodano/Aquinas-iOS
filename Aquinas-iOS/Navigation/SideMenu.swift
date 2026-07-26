@@ -33,25 +33,25 @@ struct SideMenuTriggerButton: View {
 /// Top-right control for quickly moving between focused Branch mode and the wider Canvas view.
 struct CanvasModeToggleButton: View {
     let isActive: Bool
-    var updateCount: Int = 0
+    var updateSignal: Int = 0
     var action: () -> Void
     @State private var pulseScale: CGFloat = 1.0
-    @State private var updateCountTextWidth: CGFloat = 0
+    @State private var updatedTextWidth: CGFloat = 0
     @State private var animatedButtonWidth: CGFloat = 48
-    @State private var animatedCountGap: CGFloat = 0
-    @State private var animatedCountWidth: CGFloat = 0
+    @State private var animatedLabelGap: CGFloat = 0
+    @State private var animatedLabelWidth: CGFloat = 0
+    @State private var isShowingUpdated = false
+    @State private var hapticTrigger = 0
+    @State private var dismissalTask: Task<Void, Never>?
+    @State private var updatedPulseTask: Task<Void, Never>?
 
     private static let collapsedWidth: CGFloat = 48
     private static let activeWidth: CGFloat = 93
-    private static let countGap: CGFloat = 8
+    private static let labelGap: CGFloat = 8
+    private static let updatedTransitionDuration: TimeInterval = 0.28
 
-    private var displayedUpdateCount: String {
-        guard updateCount > 0 else { return "0" }
-        return updateCount > 99 ? "99+" : "\(updateCount)"
-    }
-
-    private var showsUpdateCount: Bool {
-        !isActive && updateCount > 0
+    private var showsUpdatedLabel: Bool {
+        !isActive && isShowingUpdated
     }
 
     var body: some View {
@@ -75,12 +75,12 @@ struct CanvasModeToggleButton: View {
 
                 if !isActive {
                     Color.clear
-                        .frame(width: animatedCountGap)
+                        .frame(width: animatedLabelGap)
 
-                    updateCountText
-                        .frame(width: animatedCountWidth, alignment: .leading)
-                        .opacity(showsUpdateCount && animatedCountWidth > 0 ? 1 : 0)
-                        .blur(radius: showsUpdateCount && animatedCountWidth > 0 ? 0 : 6)
+                    updatedText
+                        .frame(width: animatedLabelWidth, alignment: .leading)
+                        .opacity(showsUpdatedLabel && animatedLabelWidth > 0 ? 1 : 0)
+                        .blur(radius: showsUpdatedLabel && animatedLabelWidth > 0 ? 0 : 8)
                         .clipped()
                 }
 
@@ -103,11 +103,11 @@ struct CanvasModeToggleButton: View {
                     .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
             )
             .animation(.spring(response: 0.42, dampingFraction: 0.84), value: isActive)
-            .animation(.easeInOut(duration: 0.22), value: displayedUpdateCount)
         }
-        .background(updateCountMeasurement)
+        .background(updatedTextMeasurement)
         .buttonStyle(.plain)
         .scaleEffect(pulseScale)
+        .sensoryFeedback(.impact(weight: .light), trigger: hapticTrigger)
         .accessibilityLabel(isActive ? "Return to branch view" : "Open canvas view")
         .onAppear {
             updateButtonLayout(animated: false)
@@ -115,65 +115,108 @@ struct CanvasModeToggleButton: View {
         .onChange(of: isActive) { _, _ in
             updateButtonLayout(animated: true)
         }
-        .onChange(of: updateCount) { oldValue, newValue in
-            guard oldValue != newValue else { return }
-            updateButtonLayout(animated: true)
-            triggerPulse()
+        .onChange(of: updateSignal) { oldValue, newValue in
+            guard newValue > oldValue, !isActive else { return }
+            presentUpdatedFeedback()
+        }
+        .onDisappear {
+            dismissalTask?.cancel()
+            updatedPulseTask?.cancel()
         }
     }
 
-    private var updateCountText: some View {
-                    Text(displayedUpdateCount)
-                        .font(.figtreeChipLabel)
+    private var updatedText: some View {
+        Text("Updated")
+            .font(.figtreeChipLabel)
             .foregroundColor(AquinasTheme.Colors.headingText)
             .lineLimit(1)
-            .monospacedDigit()
             .fixedSize(horizontal: true, vertical: false)
-            .contentTransition(.numericText())
     }
 
-    private var updateCountMeasurement: some View {
-        updateCountText
+    private var updatedTextMeasurement: some View {
+        updatedText
             .hidden()
             .background(
                 GeometryReader { proxy in
                     Color.clear
-                        .preference(key: CanvasModeUpdateCountWidthKey.self, value: proxy.size.width)
+                        .preference(key: CanvasModeUpdatedWidthKey.self, value: proxy.size.width)
                 }
             )
-            .onPreferenceChange(CanvasModeUpdateCountWidthKey.self) { width in
-                updateCountTextWidth = width
-                updateButtonLayout(animated: showsUpdateCount)
+            .onPreferenceChange(CanvasModeUpdatedWidthKey.self) { width in
+                updatedTextWidth = width
+                updateButtonLayout(animated: showsUpdatedLabel)
             }
     }
 
-    private func targetButtonWidth(countWidth: CGFloat) -> CGFloat {
+    private func targetButtonWidth(labelWidth: CGFloat) -> CGFloat {
         if isActive { return Self.activeWidth }
-        if showsUpdateCount { return Self.collapsedWidth + Self.countGap + countWidth }
+        if showsUpdatedLabel { return Self.collapsedWidth + Self.labelGap + labelWidth }
         return Self.collapsedWidth
     }
 
     private func updateButtonLayout(animated: Bool) {
-        let nextCountWidth = showsUpdateCount ? updateCountTextWidth : 0
-        let nextCountGap = showsUpdateCount ? Self.countGap : 0
-        let nextButtonWidth = targetButtonWidth(countWidth: nextCountWidth)
+        let nextLabelWidth = showsUpdatedLabel ? updatedTextWidth : 0
+        let nextLabelGap = showsUpdatedLabel ? Self.labelGap : 0
+        let nextButtonWidth = targetButtonWidth(labelWidth: nextLabelWidth)
 
         let updates = {
-            animatedCountWidth = nextCountWidth
-            animatedCountGap = nextCountGap
+            animatedLabelWidth = nextLabelWidth
+            animatedLabelGap = nextLabelGap
             animatedButtonWidth = nextButtonWidth
         }
 
         if animated {
-            withAnimation(.easeInOut(duration: 0.28), updates)
+            withAnimation(.easeInOut(duration: Self.updatedTransitionDuration), updates)
         } else {
             updates()
+        }
+    }
+
+    private func presentUpdatedFeedback() {
+        dismissalTask?.cancel()
+        withAnimation(.easeInOut(duration: Self.updatedTransitionDuration)) {
+            isShowingUpdated = true
+            updateButtonLayout(animated: false)
+        }
+        hapticTrigger += 1
+        triggerUpdatedTransitionPulse()
+        dismissalTask = Task {
+            do {
+                try await Task.sleep(for: .seconds(5))
+            } catch {
+                return
+            }
+            await MainActor.run {
+                triggerUpdatedTransitionPulse()
+                withAnimation(.easeInOut(duration: Self.updatedTransitionDuration)) {
+                    isShowingUpdated = false
+                    updateButtonLayout(animated: false)
+                }
+            }
         }
     }
 
     private func handleTap() {
         triggerPulse()
         action()
+    }
+
+    private func triggerUpdatedTransitionPulse() {
+        updatedPulseTask?.cancel()
+        let halfDuration = Self.updatedTransitionDuration / 2
+        updatedPulseTask = Task {
+            withAnimation(.easeInOut(duration: halfDuration)) {
+                pulseScale = 1.05
+            }
+            do {
+                try await Task.sleep(for: .seconds(halfDuration))
+            } catch {
+                return
+            }
+            withAnimation(.easeInOut(duration: halfDuration)) {
+                pulseScale = 1
+            }
+        }
     }
 
     private func triggerPulse() {
@@ -188,7 +231,7 @@ struct CanvasModeToggleButton: View {
     }
 }
 
-private struct CanvasModeUpdateCountWidthKey: PreferenceKey {
+private struct CanvasModeUpdatedWidthKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -240,22 +283,25 @@ struct AquinasSideMenu: View {
             ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 24) {
-                    Text(createEditorialTitle(
-                        fullText: currentTitle,
-                        keyword: "The Didache?",
-                        fontSize: 28,
-                        baseColor: AquinasTheme.Colors.primaryReadable,
-                        keywordColor: AquinasTheme.Colors.lightGreen
-                    ))
-                        .lineSpacing(8)
-                        .multilineTextAlignment(.leading)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("CURRENT TOPIC")
+                            .font(.custom("Figtree-Bold", size: 12))
+                            .foregroundColor(AquinasTheme.Colors.lightGreen)
+
+                        Text(currentTitle)
+                            .font(.custom("LibreBaskerville-Regular", size: 28))
+                            .lineSpacing(8)
+                            .foregroundColor(AquinasTheme.Colors.headingText)
+                            .multilineTextAlignment(.leading)
+                            .lineLimit(2)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .opacity(showsTitle ? 1 : 0)
                         .offset(x: showsTitle ? 0 : -24)
 
                     VStack(alignment: .leading, spacing: 24) {
-                        SearchRow(isPresented: isPresented, delay: 0.15)
-
                         VStack(alignment: .leading, spacing: 0) {
                             SideMenuRow(
                                 icon: "house",
@@ -266,24 +312,24 @@ struct AquinasSideMenu: View {
                                 action: onOpenHome
                             )
                             SideMenuRow(
-                                icon: "text.word.spacing",
-                                title: "Conversations",
-                                isActive: activePage == .openConversations,
-                                isPresented: isPresented,
-                                delay: 0.25,
-                                action: onOpenConversations
-                            )
-                            SideMenuRow(
                                 icon: "brain.head.profile",
                                 title: "Insights",
                                 badge: newInsightsCount,
                                 isActive: activePage == .insights,
                                 isPresented: isPresented,
-                                delay: 0.30,
+                                delay: 0.25,
                                 action: onOpenInsights
                             )
                             SideMenuRow(
-                                icon: "text.book.closed",
+                                icon: "text.word.spacing",
+                                title: "Conversations",
+                                isActive: activePage == .openConversations,
+                                isPresented: isPresented,
+                                delay: 0.30,
+                                action: onOpenConversations
+                            )
+                            SideMenuRow(
+                                icon: "square.stack",
                                 title: "Study Topics",
                                 isActive: activePage == .studyTopics,
                                 isPresented: isPresented,
@@ -378,6 +424,20 @@ struct AquinasSideMenu: View {
             .padding(.top, topPadding)
             .padding(.bottom, 88) // reserve space so the last row clears the pinned bar
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            // ── Bottom fade gradient ─────────────────────────────────────────
+            LinearGradient(
+                stops: [
+                    .init(color: AquinasTheme.Colors.canvasSecondary.opacity(0), location: 0),
+                    .init(color: AquinasTheme.Colors.canvasSecondary, location: 1),
+                ],
+                startPoint: UnitPoint(x: 0.5, y: 0),
+                endPoint: UnitPoint(x: 0.5, y: 0.84)
+            )
+            .frame(height: geometry.size.height * 0.38)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            .allowsHitTesting(false)
+            .zIndex(1)
 
             // ── Pinned bottom bar ────────────────────────────────────────────
             HStack(alignment: .center) {
@@ -500,7 +560,9 @@ struct AquinasSideMenu: View {
                 conversation: conversation,
                 onSelectTopic: { topic in
                     onAddConversationToStudyTopic(conversation, topic.id)
-                    conversationBeingAddedToStudyTopic = nil
+                },
+                onRemoveTopic: {
+                    onRemoveConversationFromStudyTopic(conversation)
                 }
             )
             .presentationDetents([.height(420), .large])
@@ -555,9 +617,12 @@ struct AquinasSideMenu: View {
     }
 
     private func runTitleEntrance() {
+        // Keep the current contents intact while the containing panel slides
+        // closed. They are reset only for the next presentation.
+        guard isPresented else { return }
+
         showsTitle = false
         showsOpenConversationsTitle = false
-        guard isPresented else { return }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             withAnimation(.easeOut(duration: 0.32)) {
@@ -568,97 +633,6 @@ struct AquinasSideMenu: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             withAnimation(.easeOut(duration: 0.32)) {
                 showsOpenConversationsTitle = true
-            }
-        }
-    }
-}
-
-private struct SearchRow: View {
-    let isPresented: Bool
-    let delay: TimeInterval
-    @State private var showsIcon = false
-    @State private var showsText = false
-    @State private var showsBackground = false
-    @State private var borderDrawProgress: CGFloat = 0
-    @State private var entranceRunID = UUID()
-
-    var body: some View {
-        HStack(spacing: 24) {
-            Group {
-                if showsIcon {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(AquinasTheme.Colors.lightGreen)
-                        .sfSymbolDrawOn()
-                } else {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 12, weight: .medium))
-                        .hidden()
-                }
-            }
-
-            Text("Search")
-                .font(.custom("LibreBaskerville-Regular", size: 14))
-                .lineSpacing(9)
-                .foregroundColor(AquinasTheme.Colors.placeholderText)
-                .opacity(showsText ? 1 : 0)
-                .offset(x: showsText ? 0 : -10)
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(AquinasTheme.Colors.canvas.opacity(showsBackground ? 1 : 0))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .inset(by: 0.5)
-                .trim(from: 0, to: borderDrawProgress)
-                .stroke(AquinasTheme.Colors.sideMenuSearchBorder, lineWidth: 1)
-        )
-        .onAppear(perform: runEntrance)
-        .onChange(of: isPresented) { oldValue, newValue in
-            runEntrance()
-        }
-    }
-
-    private func runEntrance() {
-        let runID = UUID()
-        entranceRunID = runID
-
-        guard isPresented else {
-            withAnimation(.easeIn(duration: 0.30)) {
-                showsIcon = false
-                showsText = false
-                showsBackground = false
-                borderDrawProgress = 0
-            }
-            return
-        }
-
-        showsIcon = false
-        showsText = false
-        showsBackground = false
-        borderDrawProgress = 0
-
-        withAnimation(.easeOut(duration: 0.25)) {
-            showsBackground = true
-        }
-
-        withAnimation(.easeOut(duration: 0.55)) {
-            borderDrawProgress = 1
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            guard entranceRunID == runID, isPresented else { return }
-            withAnimation(.easeOut(duration: 0.35)) {
-                showsIcon = true
-            }
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.025) {
-            guard entranceRunID == runID, isPresented else { return }
-            withAnimation(.easeOut(duration: 0.30)) {
-                showsText = true
             }
         }
     }
@@ -683,7 +657,7 @@ private struct SideMenuRow: View {
                     if showsIcon {
                         Image(systemName: icon)
                             .font(.system(size: 16, weight: .medium))
-                            .foregroundColor(AquinasTheme.Colors.lightGreen)
+                            .foregroundColor(AquinasTheme.Colors.headingText)
                             .frame(width: 16, height: 16)
                             .sfSymbolDrawOn()
                     } else {
@@ -729,13 +703,9 @@ private struct SideMenuRow: View {
         let runID = UUID()
         entranceRunID = runID
 
-        guard isPresented else {
-            withAnimation(.easeIn(duration: 0.30)) {
-                showsIcon = false
-                showsText = false
-            }
-            return
-        }
+        // The panel owns the dismissal animation. Keeping each row visible
+        // prevents its content from fading away before that animation ends.
+        guard isPresented else { return }
 
         showsIcon = false
         showsText = false
@@ -824,9 +794,9 @@ private struct ConversationMenuRow: View {
                         Button("Pin", systemImage: "pin") { onPin() }
                     }
                     if conversation.studyTopicID != nil {
-                        Button("Remove from Study Topic", systemImage: "book.closed") { onRemoveFromStudyTopic() }
+                        Button("Remove from Study Topic", systemImage: "square.stack") { onRemoveFromStudyTopic() }
                     } else {
-                        Button("Add to Study Topic", systemImage: "book.closed") { onAddToStudyTopic() }
+                        Button("Add to Study Topic", systemImage: "square.stack") { onAddToStudyTopic() }
                     }
                     Divider()
                     Button("Delete", systemImage: "trash", role: .destructive) { onDelete() }
@@ -859,9 +829,9 @@ private struct ConversationMenuRow: View {
                 Button("Pin", systemImage: "pin") { onPin() }
             }
             if conversation.studyTopicID != nil {
-                Button("Remove from Study Topic", systemImage: "book.closed") { onRemoveFromStudyTopic() }
+                Button("Remove from Study Topic", systemImage: "square.stack") { onRemoveFromStudyTopic() }
             } else {
-                Button("Add to Study Topic", systemImage: "book.closed") { onAddToStudyTopic() }
+                Button("Add to Study Topic", systemImage: "square.stack") { onAddToStudyTopic() }
             }
             Divider()
             Button("Delete", systemImage: "trash", role: .destructive) { onDelete() }
@@ -892,12 +862,8 @@ private struct ConversationMenuRow: View {
         let runID = UUID()
         entranceRunID = runID
 
-        guard isPresented else {
-            withAnimation(.easeIn(duration: 0.30)) {
-                isVisible = false
-            }
-            return
-        }
+        // Keep the row rendered while the parent panel is closing.
+        guard isPresented else { return }
 
         isVisible = false
 
@@ -935,9 +901,9 @@ private struct StudyTopicMenuRow: View {
         VStack(alignment: .leading, spacing: 0) {
             // ── Topic header row ─────────────────────────────────────────────
             HStack(spacing: 12) {
-                Image(systemName: "text.book.closed")
+                Image(systemName: "square.stack")
                     .font(.system(size: 16, weight: .medium))
-                    .foregroundColor(AquinasTheme.Colors.accent)
+                    .foregroundColor(AquinasTheme.Colors.lightGreen)
                     .frame(width: 16, height: 16)
                     .sfSymbolDrawOn()
 
@@ -1021,11 +987,6 @@ private struct StudyTopicMenuRow: View {
         .onAppear(perform: runEntrance)
         .onChange(of: isPresented) { _, newValue in
             isShowingLongPressFeedback = false
-            if !newValue {
-                withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
-                    isExpanded = false
-                }
-            }
             runEntrance()
         }
     }
@@ -1039,10 +1000,8 @@ private struct StudyTopicMenuRow: View {
     private func runEntrance() {
         let runID = UUID()
         entranceRunID = runID
-        guard isPresented else {
-            withAnimation(.easeIn(duration: 0.30)) { isVisible = false }
-            return
-        }
+        // Keep the row rendered while the parent panel is closing.
+        guard isPresented else { return }
         isVisible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             guard entranceRunID == runID, isPresented else { return }
@@ -1095,9 +1054,12 @@ private struct TopicConversationRow: View {
 struct SideMenuStudyTopicPickerSheet: View {
     let conversation: InquiryConversation
     var onSelectTopic: (StudyTopic) -> Void
+    var onRemoveTopic: () -> Void = {}
 
     @State private var searchText = ""
     @State private var topics: [StudyTopic] = []
+    @State private var selectedTopicID: UUID?
+    @State private var isShowingNewTopicSheet = false
 
     private var normalizedSearchText: String {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1120,7 +1082,7 @@ struct SideMenuStudyTopicPickerSheet: View {
                     .font(.custom("LibreBaskerville-Regular", size: 24))
                     .foregroundColor(AquinasTheme.Colors.primaryReadable)
                     .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.top, 28)
+                    .padding(.top, 56)
 
                 Text(conversation.title)
                     .font(.custom("Figtree-Regular", size: 14))
@@ -1134,27 +1096,12 @@ struct SideMenuStudyTopicPickerSheet: View {
                     .padding(.top, 24)
 
                 if topics.isEmpty {
-                    // No topics exist at all — offer to create one.
-                    VStack(spacing: 0) {
-                        Button(action: createStudyTopic) {
-                            HStack(spacing: 8) {
-                                Image(systemName: "plus")
-                                    .font(.system(size: 12, weight: .bold))
-                                    .sfSymbolDrawOn()
-                                Text("New Study Topic")
-                                    .font(.custom("Figtree-Regular", size: 14))
-                            }
-                            .foregroundColor(AquinasTheme.Colors.canvas)
-                            .padding(.horizontal, 22)
-                            .frame(height: 52)
-                            .background(AquinasTheme.Colors.secondaryMuted)
-                            .clipShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .shadow(color: AquinasTheme.Colors.dropShadow.opacity(0.16), radius: 16, x: 0, y: 10)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 48)
+                    // No topics exist at all — the dashed "Add New Study Topic" button below covers it.
+                    Text("No study topics yet.")
+                        .font(.custom("Figtree-Regular", size: 14))
+                        .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.5))
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 48)
                 } else if filteredTopics.isEmpty {
                     Text("No matching study topics.")
                         .font(.custom("Figtree-Regular", size: 14))
@@ -1166,12 +1113,35 @@ struct SideMenuStudyTopicPickerSheet: View {
                         ForEach(filteredTopics) { topic in
                             SideMenuStudyTopicPickerCard(
                                 topic: topic,
-                                onSelect: { onSelectTopic(topic) }
+                                isSelected: topic.id == selectedTopicID,
+                                onSelect: { toggleSelection(of: topic) }
                             )
                         }
                     }
                     .padding(.top, 32)
                 }
+
+                Button(action: { isShowingNewTopicSheet = true }) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 10, weight: .bold))
+                            .sfSymbolDrawOn()
+                        Text("Add New Study Topic")
+                            .font(.custom("Figtree-Regular", size: 14))
+                    }
+                    .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.5))
+                    .frame(maxWidth: .infinity)
+                    .padding(24)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(
+                                AquinasTheme.Colors.darkText.opacity(0.15),
+                                style: StrokeStyle(lineWidth: 1, dash: [5, 4])
+                            )
+                    )
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 24)
 
                 Color.clear.frame(height: 32)
             }
@@ -1180,13 +1150,33 @@ struct SideMenuStudyTopicPickerSheet: View {
         .background(AquinasTheme.Colors.canvas)
         .onAppear {
             topics = StudyTopicStore.load()
+            selectedTopicID = conversation.studyTopicID
+        }
+        .sheet(isPresented: $isShowingNewTopicSheet) {
+            NewStudyTopicSheet(onCreate: createAndSelectStudyTopic)
         }
     }
 
-    private func createStudyTopic() {
-        let topic = StudyTopic()
+    private func toggleSelection(of topic: StudyTopic) {
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.8)) {
+            if selectedTopicID == topic.id {
+                selectedTopicID = nil
+                onRemoveTopic()
+            } else {
+                selectedTopicID = topic.id
+                onSelectTopic(topic)
+            }
+        }
+    }
+
+    private func createAndSelectStudyTopic(title: String, description: String) {
+        let topic = StudyTopic(title: title, description: description)
         topics.insert(topic, at: 0)
         StudyTopicStore.save(topics)
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.8)) {
+            selectedTopicID = topic.id
+        }
+        onSelectTopic(topic)
     }
 
     private func displayTitle(for topic: StudyTopic) -> String {
@@ -1197,6 +1187,7 @@ struct SideMenuStudyTopicPickerSheet: View {
 
 private struct SideMenuStudyTopicPickerCard: View {
     let topic: StudyTopic
+    var isSelected: Bool = false
     var onSelect: () -> Void
 
     private var displayTitle: String {
@@ -1232,8 +1223,18 @@ private struct SideMenuStudyTopicPickerCard: View {
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
+                .stroke(isSelected ? AquinasTheme.Colors.lightGreen : AquinasTheme.Colors.controlBorder, lineWidth: isSelected ? 2 : 1)
         )
+        .overlay(alignment: .topTrailing) {
+            if isSelected {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(AquinasTheme.Colors.lightGreen)
+                    .background(AquinasTheme.Colors.componentBackground, in: Circle())
+                    .padding(12)
+                    .transition(.scale(scale: 0.5).combined(with: .opacity))
+            }
+        }
         .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .onTapGesture(perform: onSelect)
     }
@@ -1258,7 +1259,7 @@ private struct FooterDivider: View {
                 .resizable()
                 .scaledToFit()
                 .frame(width: 16, height: 16)
-                .foregroundColor(AquinasTheme.Colors.accent)
+                .foregroundColor(AquinasTheme.Colors.lightGreen)
                 .rotationEffect(.degrees(showsDivider ? 0 : -45))
                 .opacity(showsDivider ? 1 : 0)
 
@@ -1278,12 +1279,8 @@ private struct FooterDivider: View {
         let runID = UUID()
         entranceRunID = runID
 
-        guard isPresented else {
-            withAnimation(.easeIn(duration: 0.30)) {
-                showsDivider = false
-            }
-            return
-        }
+        // Keep the divider in place while the parent panel is closing.
+        guard isPresented else { return }
 
         showsDivider = false
 

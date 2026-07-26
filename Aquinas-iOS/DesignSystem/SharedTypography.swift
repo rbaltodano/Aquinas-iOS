@@ -31,7 +31,7 @@ enum AquinasTheme {
             dark: 0xFFFAF0,
             darkAlpha: 0.25
         )
-        static let lightGreen = Color(light: 0x867E4F, dark: 0xB7AE78)
+        static let lightGreen = Color(light: 0x86803E, dark: 0xB7AE78)
         static let accentGreen = Color(light: 0xA28F1E, dark: 0xB7AE78)
         static let darkGreen = Color(light: 0x6F6844, dark: 0xB7AE78)
         static let primaryBrown = Color(light: 0x4A321C, dark: 0xFFFAF0)
@@ -110,7 +110,7 @@ enum AquinasTheme {
     enum Typography {
         static let title = Font.custom("LibreBaskerville-Regular", size: 24)
         static let titleLarge = Font.custom("LibreBaskerville-Regular", size: 34)
-        static let titleHome = Font.custom("LibreBaskerville-Regular", size: 40)
+        static let titleHome = Font.custom("LibreBaskerville-Regular", size: 36)
         static let titleXLarge = Font.custom("LibreBaskerville-Regular", size: 40)
         static let heading = Font.custom("LibreBaskerville-Regular", size: 20)
         static let quote = Font.custom("LibreBaskerville-Italic", size: 16)
@@ -142,6 +142,71 @@ extension Animation {
     /// Short, bouncy spring shared by the Insight card's height changes (bars → definition) and
     /// swiping between saved insights, so both movements feel the same.
     static let insightCardBounce = Animation.spring(response: 0.17, dampingFraction: 0.6)
+}
+
+extension AnyTransition {
+    /// Shared entrance/removal for cards presented immediately above the bottom control dock.
+    /// The bottom anchor and vertical transform make the card feel connected to its trigger.
+    static var bottomDockCard: AnyTransition {
+        .scale(scale: 0.35, anchor: .bottom)
+            .combined(with: .offset(y: 24))
+            .combined(with: .opacity)
+    }
+}
+
+struct QueuedWorkBreatheModifier: ViewModifier {
+    let isQueued: Bool
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var breathingOpacity: Double = 1
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(isQueued ? breathingOpacity : 1)
+            .task(id: animationState) {
+                await runAnimation()
+            }
+    }
+
+    private var animationState: Int {
+        guard isQueued else { return 0 }
+        return reduceMotion ? 1 : 2
+    }
+
+    private func runAnimation() async {
+        guard isQueued else {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                breathingOpacity = 1
+            }
+            return
+        }
+
+        guard !reduceMotion else {
+            breathingOpacity = 0.75
+            return
+        }
+
+        breathingOpacity = 0.5
+        while !Task.isCancelled {
+            withAnimation(.easeInOut(duration: 0.9)) {
+                breathingOpacity = 1
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(900))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.9)) {
+                breathingOpacity = 0.5
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(900))
+            } catch {
+                return
+            }
+        }
+    }
 }
 
 extension Color {
@@ -360,6 +425,36 @@ extension View {
 
     func sfSymbolDrawOn(delay: TimeInterval = 0) -> some View {
         modifier(SFSymbolDrawOnStyle(delay: delay))
+    }
+}
+
+// MARK: - Section Structure
+
+/// Serif section title used to break scrollable content into manuscript-style sections
+/// (e.g. Home's "Where You Left Off", Open Conversations' "Pinned").
+struct AquinasSectionTitle: View {
+    let title: String
+
+    init(_ title: String) {
+        self.title = title
+    }
+
+    var body: some View {
+        Text(title)
+            .font(.custom("LibreBaskerville-Regular", size: 28))
+            .foregroundColor(AquinasTheme.Colors.primaryReadable)
+            .lineSpacing(7)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Thin centered rule that separates sections, mimicking a page break between manuscript entries.
+struct AquinasSectionDivider: View {
+    var body: some View {
+        Rectangle()
+            .fill(AquinasTheme.Colors.quietBorder)
+            .frame(width: 253, height: 1)
+            .frame(maxWidth: .infinity, alignment: .center)
     }
 }
 

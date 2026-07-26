@@ -26,10 +26,21 @@ struct ChatThreadColumn: View {
     var inputFont: ConversationFontOption = .serif
     var responseTextAlignment: ResponseTextAlignmentOption = .center
     var responseFont: ConversationFontOption = .sans
+    var loadingInsightKey: String? = nil
+    var queuedInsightKeys: Set<String> = []
+    let modelTasks: ModelTaskQueue
+    /// True when another serialized model task is already running at submit time.
+    var isModelBusy: Bool = false
     var emptyStateUserName: String = "Ryan"
     var emptyStateEyebrow: String = ""
+    /// The conversation's study topic name, if it belongs to one — takes priority over
+    /// `emptyStateEyebrow` in the header eyebrow, and makes it tappable to change the topic.
+    var studyTopicTitle: String? = nil
+    var onTapEyebrow: () -> Void = {}
     var emptyStatePromptQuestion: String = ""
     var showsThinkingIntro: Bool = true
+    /// Live conversation title, shown as the root branch's heading (updates on rename).
+    var conversationTitle: String = ""
     var onSpawnYChange: (Int, CGFloat) -> Void
     var onDuplicateResponse: (String, Int) -> Void
     var onDeleteBranch: () -> Void
@@ -44,17 +55,34 @@ struct ChatThreadColumn: View {
     var showsSlashCommandMenu: Bool = false
     var slashCommandQuery: SlashCommandQuery? = nil
     var onSelectSlashCommand: (SlashCommand) -> Void = { _ in }
+    var onExecuteSlashCommand: (SlashCommandInvocation) -> Void = { _ in }
     var onQuoteHandled: () -> Void
     var connectionConcepts: (ConceptDefinition, ConceptDefinition)? = nil
     var onConnectionHandled: (() -> Void)? = nil
-    var onResponseCompleted: () -> Void = {}
+    var onResponseCompleted: (Int) -> Void = { _ in }
     var onResponseStarted: () -> Void = {}
+    var onResponseCancelled: () -> Void = {}
+    var onInsightTap: (String, String) -> Void = { _, _ in }
+
+    private var modelResponseLineHeight: CGFloat {
+        let fontName = responseFont == .sans
+            ? "Figtree-Regular"
+            : "LibreBaskerville-Regular"
+        let font = UIFont(name: fontName, size: conversationFontSize.pointSize)
+            ?? .systemFont(ofSize: conversationFontSize.pointSize)
+        return ceil(font.lineHeight + 8)
+    }
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.aquinasModel) private var aquinasModel
 
     @State private var branchHeadHeight: CGFloat = 0
     @State private var animatedResponseIndices: Set<Int> = []
+    @State private var pendingResponseIndices: Set<Int> = []
+    @State private var streamingResponseIndices: Set<Int> = []
+    @State private var modelQueuedResponseIndices: Set<Int> = []
     @State private var responseThinkingIntroByIndex: [Int: Bool] = [:]
+    @State private var responseThinkingSummaryByIndex: [Int: [String]] = [:]
     @State private var pendingGeneratedTitleQuestion: String? = nil
     @State private var localConnectionConcepts: (ConceptDefinition, ConceptDefinition)?
     @Namespace private var quotedContextChipNamespace
@@ -69,6 +97,19 @@ struct ChatThreadColumn: View {
     @State private var bottomFieldRelay = TextInputRelay()
     /// Which question field last became focused — the target for command insertion.
     @State private var bottomFieldIsActive = false
+    /// Measured single-line width of the submitted top-question text, captured once at submit
+    /// time (not live per-keystroke) — lets `QuestionInputField` hug it afterward, if it fits on
+    /// one line. Shared by whichever top-field variant is showing (they're mutually exclusive).
+    @State private var topFieldSubmittedWidth: CGFloat = 0
+    /// Manually crossfaded copy of `eyebrowDisplayText` — driven by `withAnimation` directly
+    /// rather than `.id()` + `.transition()`, which doesn't reliably fire here (the Text sits
+    /// inside a Button's label, and Button appears to swallow the transition on its content).
+    @State private var displayedEyebrowText: String = ""
+    @State private var isEyebrowTextHidden = false
+    /// Inline rename of the big conversation title shown at the top of the root branch's VStack.
+    @State private var isEditingBigTitle = false
+    @State private var bigTitleDraft = ""
+    @FocusState private var isBigTitleFocused: Bool
 
     /// Placeholder text color resolved directly from the SwiftUI color-scheme environment,
     /// bypassing the Color(UIColor(dynamicProvider:)) conversion which can freeze to the
@@ -77,34 +118,6 @@ struct ChatThreadColumn: View {
         colorScheme == .dark
             ? Color(hex: 0xFFFAF0, alpha: 0.50)
             : Color(hex: 0x4A321C, alpha: 0.50)
-    }
-
-    private var inputAlignmentAnimation: Animation {
-        .spring(response: 0.36, dampingFraction: 0.86)
-    }
-
-    private var inputPlacementAnimation: Animation {
-        .easeInOut(duration: 0.28)
-    }
-
-    private var activeInputFrameAlignment: Alignment {
-        inputTextAlignment == .center ? .leading : inputTextAlignment.frameAlignment
-    }
-
-    private var activeInputTextAlignment: NSTextAlignment {
-        inputTextAlignment == .center ? .natural : inputTextAlignment.nsTextAlignment
-    }
-
-    private func inputFieldIsActive(isFocused: Bool, isEmpty: Bool) -> Bool {
-        isFocused || !isEmpty
-    }
-
-    private func inputFieldMaxWidth(isFocused: Bool, isEmpty: Bool) -> CGFloat? {
-        inputFieldIsActive(isFocused: isFocused, isEmpty: isEmpty) ? .infinity : nil
-    }
-
-    private func inputFieldPlacementAlignment(isFocused: Bool, isEmpty: Bool) -> Alignment {
-        inputFieldIsActive(isFocused: isFocused, isEmpty: isEmpty) ? .leading : .center
     }
 
     @ViewBuilder
@@ -127,13 +140,18 @@ struct ChatThreadColumn: View {
 
     // MARK: Editable Thread Values=
     // readingTopPadding controls how far the branch title sits from the top in Branch mode.
-    // simulatedResponse is temporary prototype content; replace this when the real model is connected.
     private let readingTopPadding: CGFloat = 30
-    private let simulatedResponse = "Thomas Aquinas is one of the most influential figures in western thought. Often referred to as the Doctor Angelicus, he is the primary architect of [Thomism](aq://thomism) THE DIDACHE: THE TEACHING OF THE TWELVE APOSTLES The [Didache](aq://didache) (pronounced DID-ah-kay) is essentially the first-century 'user manual' for the early Christian church. Derived from the Greek word for 'teaching,' this document was written between 50 AD and 100 AD, providing a rare look at how the earliest Christian communities organized their lives. I. THE TWO WAYS The document opens with a moral framework called '[The Two Ways](aq://the-two-ways),' contrasting the Way of Life with the Way of Death. It outlines a strict ethical code, covering everything from communal love to specific social prohibitions. II. RITUAL AND LITURGY The Didache provides the earliest 'how-to' instructions for Christian rituals: • [Baptism](aq://baptism): Prefers 'living' (running) water, but allows for pouring if necessary. • [Fasting](aq://fasting): Suggests specific days of the week (Wednesdays and Fridays). • THE [Eucharist](aq://eucharist): Contains some of the oldest recorded prayers for communion. III. CHURCH STRUCTURE It outlines the qualifications for bishops and deacons and provides a fascinating guide on how to distinguish between genuine [traveling prophets](aq://traveling-prophets) and those seeking personal gain. HISTORICAL IMPACT Lost for centuries and rediscovered in 1873, the Didache serves as a vital bridge between the New Testament era and the formalized Church of later centuries."
 
     // Branch title shown above the first question.
     private var displayBranchTitle: String {
-        branchData.generatedBranchTitle ?? (branchData.parentBranchID == nil ? "New Conversation" : "New Branch")
+        // The root branch's heading mirrors the live conversation title, so renaming the
+        // conversation (or its auto-generated title) updates this in place. Child branches keep
+        // their own generated branch title.
+        if branchData.parentBranchID == nil {
+            let title = conversationTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            return title.isEmpty ? "New Conversation" : title
+        }
+        return branchData.generatedBranchTitle ?? "New Branch"
     }
 
     // Pending uploads only appear in the focused branch.
@@ -176,6 +194,16 @@ struct ChatThreadColumn: View {
 
     private var trimmedEmptyStateEyebrow: String {
         emptyStateEyebrow.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var eyebrowDisplayText: String {
+        if let studyTopicTitle {
+            let trimmed = studyTopicTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed.uppercased() }
+        }
+        // "Question of the Day" conversations get the same "add to study topic" eyebrow as
+        // any other new conversation — no separate eyebrow copy for that state.
+        return "ADD TO STUDY TOPIC"
     }
 
     private var emptyPromptQuestion: String {
@@ -229,27 +257,121 @@ struct ChatThreadColumn: View {
         return words.joined(separator: " ")
     }
 
-    // Prototype model response. Replace with async model call when backend is ready.
+    // Routes through BackendAquinasModel for structured prose and tappable key terms.
     private func appendSimulatedResponse() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            // Insert into animatedResponseIndices BEFORE appending the block.
-            // Both mutations live in different @State owners (ChatThreadColumn vs
-            // the @Binding source in ActiveInquiryView), so SwiftUI can process
-            // them in separate render passes. Committing the index first guarantees
-            // that when the ForEach creates the new card, animatedResponseIndices
-            // already contains it → shouldAnimateOnAppear = true.
-            let responseIndex = branchData.activeChatBlocks.count
-            animatedResponseIndices.insert(responseIndex)
-            responseThinkingIntroByIndex[responseIndex] = showsThinkingIntro
-            onResponseStarted()
+        let context = ConversationContext(
+            compactedContext: branchData.compactedContext,
+            transcript: modelTranscriptForResponse()
+        )
+        let responseIndex = branchData.activeChatBlocks.count
+        let thinkingEnabled = showsThinkingIntro
+
+        animatedResponseIndices.insert(responseIndex)
+        pendingResponseIndices.insert(responseIndex)
+        if isModelBusy || !pendingResponseIndices.subtracting([responseIndex]).isEmpty {
+            modelQueuedResponseIndices.insert(responseIndex)
+        }
+        responseThinkingIntroByIndex[responseIndex] = thinkingEnabled
+        onResponseStarted()
+        withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
+            branchData.activeChatBlocks.append(.text(""))
+        }
+
+        modelTasks.enqueue(
+            kind: .userQuestion(
+                branchID: branchData.id,
+                responseIndex: responseIndex
+            ),
+            onStart: {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    modelQueuedResponseIndices.remove(responseIndex)
+                }
+            },
+            onCancel: {
+                cancelResponse(at: responseIndex)
+            }
+        ) {
+            let response = await aquinasModel.respond(
+                to: context,
+                thinkingEnabled: thinkingEnabled
+            ) { update in
+                guard !Task.isCancelled,
+                      branchData.activeChatBlocks.indices.contains(responseIndex) else {
+                    return
+                }
+                _ = withAnimation(.easeInOut(duration: 0.25)) {
+                    modelQueuedResponseIndices.remove(responseIndex)
+                }
+                switch update {
+                case .generationStarted:
+                    break
+                case .thinkingSummary(let summary):
+                    responseThinkingSummaryByIndex[responseIndex] = summary
+                case .responseText(let streamedText):
+                    guard !streamedText.isEmpty else { return }
+                    streamingResponseIndices.insert(responseIndex)
+                }
+            }
+            guard !Task.isCancelled,
+                  branchData.activeChatBlocks.indices.contains(responseIndex) else {
+                return
+            }
+            modelQueuedResponseIndices.remove(responseIndex)
+            responseThinkingSummaryByIndex[responseIndex] = thinkingEnabled
+                ? response.thinkingSummary
+                : []
             withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
-                branchData.activeChatBlocks.append(.text(simulatedResponse))
+                branchData.activeChatBlocks[responseIndex] = .text(response.annotatedText)
+                pendingResponseIndices.remove(responseIndex)
+                streamingResponseIndices.remove(responseIndex)
             }
         }
     }
 
+    private func cancelResponse(at responseIndex: Int) {
+        modelQueuedResponseIndices.remove(responseIndex)
+        pendingResponseIndices.remove(responseIndex)
+        streamingResponseIndices.remove(responseIndex)
+        responseThinkingIntroByIndex.removeValue(forKey: responseIndex)
+        responseThinkingSummaryByIndex.removeValue(forKey: responseIndex)
+
+        guard branchData.activeChatBlocks.indices.contains(responseIndex) else {
+            onResponseCancelled()
+            return
+        }
+
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.84)) {
+            if responseIndex == branchData.activeChatBlocks.count - 1 {
+                branchData.activeChatBlocks.removeLast()
+            } else {
+                branchData.activeChatBlocks[responseIndex] = .text("Response stopped.")
+            }
+        }
+        onResponseCancelled()
+    }
+
+    private func modelTranscriptForResponse() -> [ChatBlock] {
+        var transcript: [ChatBlock] = []
+        if branchData.compactedContext == nil {
+            let topQuestion = branchData.topQuestionText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if branchData.topQuestionSubmitted, !topQuestion.isEmpty {
+                transcript.append(.user(topQuestion, branchData.branchContextConcept, branchData.topQuestionUploads))
+            }
+        }
+        let compactedBlockCount = min(
+            branchData.compactedThroughBlockCount ?? 0,
+            branchData.activeChatBlocks.count
+        )
+        transcript.append(contentsOf: branchData.activeChatBlocks.dropFirst(compactedBlockCount))
+        return transcript
+    }
+
     private func responseShowsThinkingIntro(at index: Int) -> Bool {
         responseThinkingIntroByIndex[index] ?? true
+    }
+
+    private func responseThinkingSummary(at index: Int) -> [String] {
+        responseThinkingSummaryByIndex[index] ?? []
     }
 
     private func finalizePendingGeneratedTitleIfNeeded() {
@@ -265,19 +387,19 @@ struct ChatThreadColumn: View {
         }
     }
 
+    /// Matches the Open Conversations search bar's chrome (canvas fill, 12pt radius, the same
+    /// hairline border) — but hugs the text field's own height instead of the search bar's fixed
+    /// 52pt, since the question field grows with wrapped/multi-line text.
     private func inputContainer<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         content()
-            .padding(inputTextAlignment.inputContainerPadding)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
             .background(AquinasTheme.Colors.canvas)
-            .clipShape(RoundedRectangle(cornerRadius: inputTextAlignment.inputContainerRadius, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: inputTextAlignment.inputContainerRadius, style: .continuous)
-                    .stroke(
-                        AquinasTheme.Colors.darkBrown.opacity(inputTextAlignment.inputContainerBorderOpacity),
-                        lineWidth: 1
-                    )
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(AquinasTheme.Colors.sideMenuSearchBorder, lineWidth: 1)
             )
-            .animation(.spring(response: 0.34, dampingFraction: 0.84), value: inputTextAlignment)
     }
 
     // Locks the first branch question, uploads, and context chip.
@@ -287,6 +409,14 @@ struct ChatThreadColumn: View {
         // way to read text that was typed but not yet blurred.
         branchData.topQuestionText = topFieldRelay.currentText()
         let submittedQuestion = branchData.topQuestionText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let command = SlashCommand.invocation(for: submittedQuestion) {
+            topFieldRelay.replaceAll("")
+            branchData.topQuestionText = ""
+            topFieldIsEmpty = true
+            onActiveInputTextChange("")
+            onExecuteSlashCommand(command)
+            return
+        }
         guard !submittedQuestion.isEmpty, !branchData.topQuestionSubmitted else {
             branchData.topQuestionText = submittedQuestion
             return
@@ -299,6 +429,7 @@ struct ChatThreadColumn: View {
             uploadedFiles.removeAll()
         }
         pendingGeneratedTitleQuestion = submittedQuestion
+        topFieldSubmittedWidth = QuestionInputField.measuredWidth(for: submittedQuestion)
         withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
             branchData.topQuestionSubmitted = true
         }
@@ -310,6 +441,14 @@ struct ChatThreadColumn: View {
         // Flush live UITextView text to binding before reading (relay avoids per-keystroke writes).
         branchData.bottomQuestionText = bottomFieldRelay.currentText()
         let submittedQuestion = branchData.bottomQuestionText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let command = SlashCommand.invocation(for: submittedQuestion) {
+            bottomFieldRelay.replaceAll("")
+            branchData.bottomQuestionText = ""
+            bottomFieldIsEmpty = true
+            onActiveInputTextChange("")
+            onExecuteSlashCommand(command)
+            return
+        }
         guard !submittedQuestion.isEmpty else {
             branchData.bottomQuestionText = submittedQuestion
             return
@@ -333,106 +472,110 @@ struct ChatThreadColumn: View {
     private var newConversationPromptHeader: some View {
         VStack(alignment: .center, spacing: 48) {
             VStack(alignment: .center, spacing: 8) {
-                Text(trimmedEmptyStateEyebrow.isEmpty ? "NEW CONVERSATION" : trimmedEmptyStateEyebrow.uppercased())
-                    .font(AquinasTheme.Typography.uiLabel)
+                Button(action: onTapEyebrow) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "square.stack")
+                            .font(AquinasTheme.Typography.uiLabel)
+                        Text(displayedEyebrowText)
+                            .font(AquinasTheme.Typography.uiLabel)
+                            .opacity(isEyebrowTextHidden ? 0 : 1)
+                            .blur(radius: isEyebrowTextHidden ? 4 : 0)
+                    }
                     .foregroundColor(AquinasTheme.Colors.lightGreen)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity, alignment: .center)
+                }
+                .buttonStyle(.plain)
+                .onAppear { displayedEyebrowText = eyebrowDisplayText }
+                .onChange(of: eyebrowDisplayText) { _, newValue in
+                    withAnimation(.easeIn(duration: 0.2)) {
+                        isEyebrowTextHidden = true
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                        // Animate the text swap together with the reveal, so the icon
+                        // (repositioned by the HStack re-centering on the new width)
+                        // glides into place instead of snapping.
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+                            displayedEyebrowText = newValue
+                            isEyebrowTextHidden = false
+                        }
+                    }
+                }
 
-                Text(newConversationHeaderTitle)
-                    .font(.custom("LibreBaskerville-Regular", size: 28))
-                    .foregroundColor(AquinasTheme.Colors.headingText)
-                    .lineSpacing(14)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .id(newConversationHeaderTitle)
-                    .transition(.blurredTitleReplacement)
+                if isEditingBigTitle {
+                    TextField("Conversation title", text: $bigTitleDraft)
+                        .font(.custom("LibreBaskerville-Regular", size: 28))
+                        .foregroundColor(AquinasTheme.Colors.headingText)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .focused($isBigTitleFocused)
+                        .submitLabel(.done)
+                        .onSubmit {
+                            isEditingBigTitle = false
+                            onConversationTitleChange(bigTitleDraft)
+                        }
+                } else {
+                    Text(newConversationHeaderTitle)
+                        .font(.custom("LibreBaskerville-Regular", size: 28))
+                        .foregroundColor(AquinasTheme.Colors.headingText)
+                        .lineSpacing(14)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .id(newConversationHeaderTitle)
+                        .transition(.blurredTitleReplacement)
+                        .onTapGesture {
+                            bigTitleDraft = newConversationHeaderTitle
+                            isEditingBigTitle = true
+                            isBigTitleFocused = true
+                        }
+                }
             }
-            .allowsHitTesting(false)
 
-            ConversationSeparator(verticalPadding: 0)
         }
         .frame(maxWidth: .infinity, alignment: .top)
     }
 
-    private var newConversationPrompt: some View {
-        VStack(spacing: 48) {
-            Color.clear
-                .frame(height: 1)
-                .id(branchAnchor)
-
-            newConversationPromptHeader
-                .padding(.top, 84)
-
-            newConversationQuestionField
-        }
-        .frame(maxWidth: .infinity)
-    }
-
     private var newConversationQuestionField: some View {
         VStack(spacing: 12) {
-            ZStack(alignment: .leading) {
-                AnimatedQuestionPlaceholder(
-                    text: "Type / for commands",
-                    font: .custom("LibreBaskerville-Regular", size: 14),
-                    color: AquinasTheme.Colors.placeholderText,
-                    isEmpty: topFieldIsEmpty && !branchData.topQuestionSubmitted,
-                    isFocused: isTopQuestionFocused && !branchData.topQuestionSubmitted,
-                    emptyAlignment: .leading,
-                    filledAlignment: .leading,
-                    animation: inputAlignmentAnimation
-                )
-
-                ListAwareTextField(
-                    text: $branchData.topQuestionText,
-                    font: UIFont(name: "LibreBaskerville-Regular", size: 14) ?? .systemFont(ofSize: 14),
-                    isLocked: branchData.topQuestionSubmitted,
-                    textColor: .aquinasPrimaryReadable,
-                    textAlignment: .natural,
-                    onFocusChange: { focused in
-                        isTopQuestionFocused = focused
-                        if focused {
-                            bottomFieldIsActive = false
-                            isBottomQuestionFocused = false
-                            onTopInputFocused()
-                        }
-                    },
-                    relay: topFieldRelay,
-                    onTextChange: { text in
-                        topFieldIsEmpty = text.isEmpty
-                        onActiveInputTextChange(text)
+            QuestionInputField(
+                placeholder: "Ask a question...",
+                text: $branchData.topQuestionText,
+                isLocked: branchData.topQuestionSubmitted,
+                isSubmitted: branchData.topQuestionSubmitted,
+                submittedWidth: topFieldSubmittedWidth,
+                isEmpty: topFieldIsEmpty && !branchData.topQuestionSubmitted,
+                isFocused: isTopQuestionFocused && !branchData.topQuestionSubmitted,
+                lineHeight: modelResponseLineHeight,
+                showsChrome: false,
+                relay: topFieldRelay,
+                onFocusChange: { focused in
+                    isTopQuestionFocused = focused
+                    if focused {
+                        bottomFieldIsActive = false
+                        isBottomQuestionFocused = false
+                        onTopInputFocused()
                     }
-                )
-                .frame(
-                    maxWidth: inputFieldMaxWidth(isFocused: isTopQuestionFocused, isEmpty: topFieldIsEmpty),
-                    minHeight: 22,
-                    alignment: .leading
-                )
-                .animation(inputAlignmentAnimation, value: topFieldIsEmpty)
-                .animation(inputAlignmentAnimation, value: isTopQuestionFocused)
-            }
-            .frame(
-                maxWidth: inputFieldMaxWidth(isFocused: isTopQuestionFocused, isEmpty: topFieldIsEmpty),
-                alignment: .leading
+                },
+                onTextChange: { text in
+                    topFieldIsEmpty = text.isEmpty
+                    onActiveInputTextChange(text)
+                },
+                onSubmit: {
+                    submitTopQuestionIfNeeded()
+                },
+                onTapToFocus: {
+                    guard !branchData.topQuestionSubmitted else { return }
+                    bottomFieldIsActive = false
+                    isTopQuestionFocused = true
+                    isBottomQuestionFocused = false
+                    topFieldRelay.focus()
+                }
             )
-            .frame(
-                maxWidth: .infinity,
-                alignment: inputFieldPlacementAlignment(isFocused: isTopQuestionFocused, isEmpty: topFieldIsEmpty)
-            )
-            .animation(inputPlacementAnimation, value: isTopQuestionFocused)
-            .animation(inputPlacementAnimation, value: topFieldIsEmpty)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                guard !branchData.topQuestionSubmitted else { return }
-                bottomFieldIsActive = false
-                isTopQuestionFocused = true
-                isBottomQuestionFocused = false
-                topFieldRelay.focus()
-            }
             .overlay(alignment: .top) {
                 slashCommandMenuOverlay(forBottomField: false, yOffset: 34)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .center)
         .zIndex(showsSlashCommandMenu && !bottomFieldIsActive ? 50 : 0)
     }
 
@@ -512,62 +655,46 @@ struct ChatThreadColumn: View {
                     if usesNewConversationPromptHeader {
                         newConversationQuestionField
                     } else {
-                    VStack(spacing: 12) {
-                        inputContainer {
-                            ZStack(alignment: .leading) {
-                                AnimatedQuestionPlaceholder(
-                                    text: "Ask a question...",
-                                    font: inputFont.textFont(size: conversationFontSize),
-                                    color: placeholderColor,
-                                    isEmpty: topFieldIsEmpty && !branchData.topQuestionSubmitted,
-                                    isFocused: isTopQuestionFocused && !branchData.topQuestionSubmitted,
-                                    emptyAlignment: .leading,
-                                    filledAlignment: activeInputFrameAlignment,
-                                    animation: inputAlignmentAnimation
-                                )
-
-                                ListAwareTextField(
-                                    text: $branchData.topQuestionText,
-                                    font: inputFont.uiFont(size: conversationFontSize),
-                                    isLocked: branchData.topQuestionSubmitted,
-                                    textColor: .aquinasPrimaryReadable,
-                                    textAlignment: .natural,
-                                    onFocusChange: { focused in
-                                        isTopQuestionFocused = focused
-                                        if focused {
-                                            bottomFieldIsActive = false
-                                            isBottomQuestionFocused = false
-                                            onTopInputFocused()
-                                        }
-                                    },
-                                    relay: topFieldRelay,
-                                    onTextChange: { text in
-                                        topFieldIsEmpty = text.isEmpty
-                                        onActiveInputTextChange(text)
+                        VStack(spacing: 12) {
+                            QuestionInputField(
+                                placeholder: "Ask a question...",
+                                text: $branchData.topQuestionText,
+                                isLocked: branchData.topQuestionSubmitted,
+                                isSubmitted: branchData.topQuestionSubmitted,
+                                submittedWidth: topFieldSubmittedWidth,
+                                isEmpty: topFieldIsEmpty && !branchData.topQuestionSubmitted,
+                                isFocused: isTopQuestionFocused && !branchData.topQuestionSubmitted,
+                                lineHeight: modelResponseLineHeight,
+                                placeholderColor: placeholderColor,
+                                relay: topFieldRelay,
+                                onFocusChange: { focused in
+                                    isTopQuestionFocused = focused
+                                    if focused {
+                                        bottomFieldIsActive = false
+                                        isBottomQuestionFocused = false
+                                        onTopInputFocused()
                                     }
-                                )
-                                .frame(
-                                    maxWidth: inputFieldMaxWidth(isFocused: isTopQuestionFocused, isEmpty: topFieldIsEmpty),
-                                    alignment: .leading
-                                )
-                                .animation(inputAlignmentAnimation, value: topFieldIsEmpty)
+                                },
+                                onTextChange: { text in
+                                    topFieldIsEmpty = text.isEmpty
+                                    onActiveInputTextChange(text)
+                                },
+                                onSubmit: {
+                                    submitTopQuestionIfNeeded()
+                                },
+                                onTapToFocus: {
+                                    guard !branchData.topQuestionSubmitted else { return }
+                                    bottomFieldIsActive = false
+                                    isTopQuestionFocused = true
+                                    isBottomQuestionFocused = false
+                                    topFieldRelay.focus()
+                                }
+                            )
+                            .overlay(alignment: .top) {
+                                slashCommandMenuOverlay(forBottomField: false, yOffset: 72)
                             }
                         }
-                        .frame(
-                            maxWidth: inputFieldMaxWidth(isFocused: isTopQuestionFocused, isEmpty: topFieldIsEmpty),
-                            alignment: .leading
-                        )
-                        .frame(
-                            maxWidth: .infinity,
-                            alignment: inputFieldPlacementAlignment(isFocused: isTopQuestionFocused, isEmpty: topFieldIsEmpty)
-                        )
-                        .animation(inputPlacementAnimation, value: isTopQuestionFocused)
-                        .animation(inputPlacementAnimation, value: topFieldIsEmpty)
-                        .overlay(alignment: .top) {
-                            slashCommandMenuOverlay(forBottomField: false, yOffset: 72)
-                        }
                     }
-                }
                 }
                 .id("top-input-anchor-\(branchData.id)")
 
@@ -597,27 +724,34 @@ struct ChatThreadColumn: View {
                 ForEach(Array(branchData.activeChatBlocks.enumerated()), id: \.offset) { index, block in
                     switch block {
                     case .text(let textContent):
-
                         TrackedResponseCard(
                             textContent: textContent,
                             responseIndex: index,
                             shouldAnimateOnAppear: animatedResponseIndices.contains(index),
                             showsThinkingIntro: responseShowsThinkingIntro(at: index),
+                            isAwaitingResponse: pendingResponseIndices.contains(index),
+                            isReceivingStream: streamingResponseIndices.contains(index),
+                            isQueuedForModel: modelQueuedResponseIndices.contains(index),
+                            usesNetworkStream: false,
+                            thinkingSummary: responseThinkingSummary(at: index),
                             targetSpawnY: $targetSpawnY,
                             targetSpawnResponseIndex: $targetSpawnResponseIndex,
                             columnSpaceName: "ColumnContent-\(branchData.id)",
                             responseTextAlignment: responseTextAlignment,
                             responseFont: responseFont,
                             conversationFontSize: conversationFontSize,
+                            loadingInsightKey: loadingInsightKey,
+                            queuedInsightKeys: queuedInsightKeys,
                             onCenterChange: onSpawnYChange,
                             onDuplicateBranch: {
                                 onDuplicateResponse(textContent, index)
                             },
+                            onInsightTap: onInsightTap,
                             onFinish: {
                                 animatedResponseIndices.remove(index)
                                 finalizePendingGeneratedTitleIfNeeded()
                                 withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) { branchData.showBottomInput = true }
-                                onResponseCompleted()
+                                onResponseCompleted(index)
                             }
                         )
                         .id("\(branchData.id)-response-\(index)")
@@ -644,16 +778,23 @@ struct ChatThreadColumn: View {
                                     )
                                     .matchedGeometryEffect(id: concept.id, in: quotedContextChipNamespace)
                                 }
-                                inputContainer {
-                                    ListAwareTextField(
-                                        text: .constant(questionText),
-                                        font: inputFont.uiFont(size: conversationFontSize),
-                                        isLocked: true,
-                                        textColor: .aquinasPrimaryReadable,
-                                        textAlignment: .natural
-                                    )
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                }
+                                // Same component the top field uses post-submit (locked,
+                                // isSubmitted), not a plain Text — so a follow-up question
+                                // renders and behaves identically to the branch's first question.
+                                QuestionInputField(
+                                    placeholder: "",
+                                    text: .constant(questionText),
+                                    isLocked: true,
+                                    isSubmitted: true,
+                                    submittedWidth: QuestionInputField.measuredWidth(for: questionText),
+                                    isEmpty: false,
+                                    isFocused: false,
+                                    lineHeight: modelResponseLineHeight,
+                                    showsChrome: false,
+                                    relay: TextInputRelay(),
+                                    onFocusChange: { _ in },
+                                    onTextChange: { _ in }
+                                )
                             }
                             .frame(maxWidth: .infinity)
                         }
@@ -703,55 +844,32 @@ struct ChatThreadColumn: View {
                         }
 
                         VStack(spacing: 12) {
-                            inputContainer {
-                                ZStack(alignment: .leading) {
-                                    AnimatedQuestionPlaceholder(
-                                        text: "Ask a follow-up question...",
-                                        font: inputFont.textFont(size: conversationFontSize),
-                                        color: placeholderColor,
-                                        isEmpty: bottomFieldIsEmpty,
-                                        isFocused: isBottomQuestionFocused,
-                                        emptyAlignment: .leading,
-                                        filledAlignment: activeInputFrameAlignment,
-                                        animation: inputAlignmentAnimation
-                                    )
-
-                                    ListAwareTextField(
-                                        text: $branchData.bottomQuestionText,
-                                        font: inputFont.uiFont(size: conversationFontSize),
-                                        textColor: .aquinasPrimaryReadable,
-                                        textAlignment: .natural,
-                                        onFocusChange: { focused in
-                                            isBottomQuestionFocused = focused
-                                            if focused {
-                                                bottomFieldIsActive = true
-                                                isTopQuestionFocused = false
-                                                onBottomInputFocused()
-                                            }
-                                        },
-                                        relay: bottomFieldRelay,
-                                        onTextChange: { text in
-                                            bottomFieldIsEmpty = text.isEmpty
-                                            onActiveInputTextChange(text)
-                                        }
-                                    )
-                                    .frame(
-                                        maxWidth: inputFieldMaxWidth(isFocused: isBottomQuestionFocused, isEmpty: bottomFieldIsEmpty),
-                                        alignment: .leading
-                                    )
-                                    .animation(inputAlignmentAnimation, value: bottomFieldIsEmpty)
-                                }
-                            }
-                            .frame(
-                                maxWidth: inputFieldMaxWidth(isFocused: isBottomQuestionFocused, isEmpty: bottomFieldIsEmpty),
-                                alignment: .leading
+                            QuestionInputField(
+                                placeholder: "Ask a question...",
+                                text: $branchData.bottomQuestionText,
+                                isEmpty: bottomFieldIsEmpty,
+                                isFocused: isBottomQuestionFocused,
+                                lineHeight: modelResponseLineHeight,
+                                placeholderColor: placeholderColor,
+                                showsChrome: false,
+                                relay: bottomFieldRelay,
+                                onFocusChange: { focused in
+                                    isBottomQuestionFocused = focused
+                                    if focused {
+                                        bottomFieldIsActive = true
+                                        isTopQuestionFocused = false
+                                        onBottomInputFocused()
+                                    }
+                                },
+                                onTextChange: { text in
+                                    bottomFieldIsEmpty = text.isEmpty
+                                    onActiveInputTextChange(text)
+                                },
+                                onSubmit: {
+                                    submitBottomQuestionIfNeeded()
+                                },
+                                onTapToFocus: { bottomFieldRelay.focus() }
                             )
-                            .frame(
-                                maxWidth: .infinity,
-                                alignment: inputFieldPlacementAlignment(isFocused: isBottomQuestionFocused, isEmpty: bottomFieldIsEmpty)
-                            )
-                            .animation(inputPlacementAnimation, value: isBottomQuestionFocused)
-                            .animation(inputPlacementAnimation, value: bottomFieldIsEmpty)
                             .overlay(alignment: .top) {
                                 slashCommandMenuOverlay(forBottomField: true, yOffset: 72)
                             }
@@ -851,7 +969,21 @@ private struct ConversationSeparator: View {
     }
 }
 
+/// Reports a question field's true ambient available width, measured via an unconstrained
+/// sibling probe (see `QuestionInputField`) so the field can be given a concrete number instead
+/// of `nil`/`.infinity` — required for the fill→hug width change to actually animate on submit.
+private struct QuestionInputWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+/// Placeholder text for a question field, fading out once the field has focus or text. Tapping
+/// into the field also briefly swaps the placeholder for a "Type / for a list of commands" hint,
+/// which lingers a couple seconds before fading back to the normal placeholder.
 private struct AnimatedQuestionPlaceholder: View {
+    private static let commandHintText = "Type / for a list of commands"
+    private static let hintLinger: Duration = .seconds(2.5)
+
     let text: String
     let font: Font
     let color: Color
@@ -860,25 +992,223 @@ private struct AnimatedQuestionPlaceholder: View {
     let emptyAlignment: Alignment
     let filledAlignment: Alignment
     let animation: Animation
+    var textAlignment: TextAlignment = .leading
 
-    private var focusedEmptyOffset: CGFloat {
-        0
+    @State private var isShowingCommandHint = false
+    @State private var hintDismissTask: Task<Void, Never>?
+
+    var body: some View {
+        ZStack {
+            Text(text)
+                .opacity(isShowingCommandHint ? 0 : 1)
+            Text(Self.commandHintText)
+                .opacity(isShowingCommandHint ? 1 : 0)
+        }
+        .font(font)
+        .foregroundColor(color)
+        .frame(
+            maxWidth: .infinity,
+            alignment: isEmpty ? emptyAlignment : filledAlignment
+        )
+        .multilineTextAlignment(textAlignment)
+        .opacity(isEmpty ? 1 : 0)
+        .allowsHitTesting(false)
+        .animation(animation, value: isEmpty)
+        .animation(.easeInOut(duration: 0.3), value: isShowingCommandHint)
+        .onChange(of: isFocused) { _, focused in
+            guard focused else { return }
+            hintDismissTask?.cancel()
+            isShowingCommandHint = true
+            hintDismissTask = Task {
+                do { try await Task.sleep(for: Self.hintLinger) } catch { return }
+                await MainActor.run { isShowingCommandHint = false }
+            }
+        }
+        .onDisappear {
+            hintDismissTask?.cancel()
+        }
+    }
+}
+
+/// Draws a magnifying glass on when it appears and off when it's removed, matching the SF Symbol
+/// "Draw On"/"Draw Off" pair on iOS 26+ (with an opacity/scale fallback on earlier versions).
+private struct QuestionInputIcon: View {
+    var body: some View {
+        let icon = Image(systemName: "magnifyingglass")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundColor(AquinasTheme.Colors.lightGreen)
+            .frame(width: 12, height: 12)
+
+        if #available(iOS 26.0, *) {
+            // A single .drawOn transition plays forward on insertion and reverses (draws off)
+            // on removal — no separate .drawOff needed.
+            icon.transition(.symbolEffect(.drawOn))
+        } else {
+            icon.transition(.opacity.combined(with: .scale(scale: 0.7)))
+        }
+    }
+}
+
+/// The single "Ask a question" input box shared by every question field in the thread (the
+/// brand-new-conversation prompt, a forked/continuing branch's top question, and the follow-up
+/// field) — one place to change icon, chrome, sizing, or width behavior instead of three.
+///
+/// Sized to fill its ambient available width while editable. Once `isSubmitted` (for fields that
+/// stay visible, locked, after submitting — the follow-up field never sets this since it's
+/// removed from view on submit instead), it hugs the submitted question if that rendered on a
+/// single line, or holds at `maxWidth` if it wrapped to more than one line.
+private struct QuestionInputField: View {
+    static let maxWidth: CGFloat = 250
+    static let plainMaxWidth: CGFloat = 321
+    static let fontSize: CGFloat = 14
+
+    /// Exact pixel width UIKit renders `text` at in the field's font — measure once, at submit
+    /// time, to decide whether the submitted question fits on one line.
+    static func measuredWidth(for text: String) -> CGFloat {
+        guard !text.isEmpty else { return 0 }
+        let font = UIFont(name: "Figtree-Regular", size: fontSize) ?? .systemFont(ofSize: fontSize)
+        let measuredSize = (text as NSString).size(withAttributes: [.font: font])
+        return ceil(measuredSize.width)
     }
 
-    private var currentAlignment: Alignment {
-        isEmpty && !isFocused ? emptyAlignment : filledAlignment
+    let placeholder: String
+    @Binding var text: String
+    var isLocked: Bool = false
+    var isSubmitted: Bool = false
+    var submittedWidth: CGFloat = 0
+    let isEmpty: Bool
+    let isFocused: Bool
+    let lineHeight: CGFloat
+    var placeholderColor: Color = AquinasTheme.Colors.placeholderText
+    var showsChrome: Bool = true
+    /// Which edge the boxed field hugs to within its available width.
+    var boxAlignment: Alignment = .leading
+    let relay: TextInputRelay
+    var onFocusChange: (Bool) -> Void
+    var onTextChange: (String) -> Void
+    var onSubmit: (() -> Void)? = nil
+    var onTapToFocus: (() -> Void)? = nil
+
+    @State private var availableWidth: CGFloat = 0
+
+    private var inputFont: UIFont {
+        UIFont(name: "Figtree-Regular", size: Self.fontSize) ?? .systemFont(ofSize: Self.fontSize)
+    }
+
+    private var placeholderFont: Font {
+        .custom("Figtree-Regular", size: Self.fontSize)
+    }
+
+    /// Always a concrete number (never nil/`.infinity`), so the fill→hug transition on submit is
+    /// a genuine numeric interpolation SwiftUI can animate.
+    private var boxWidth: CGFloat {
+        guard isSubmitted else { return availableWidth > 0 ? availableWidth : Self.maxWidth }
+        let singleLineWidth = submittedWidth + 40   // + this box's own 20×2 horizontal padding
+        guard singleLineWidth <= Self.maxWidth else { return Self.maxWidth }
+        return max(singleLineWidth, 60)
+    }
+
+    private var plainQuestionEditor: some View {
+        ZStack(alignment: .center) {
+            AnimatedQuestionPlaceholder(
+                text: placeholder,
+                font: placeholderFont,
+                color: placeholderColor,
+                isEmpty: isEmpty,
+                isFocused: isFocused,
+                emptyAlignment: .center,
+                filledAlignment: .center,
+                animation: .spring(response: 0.36, dampingFraction: 0.86),
+                textAlignment: .center
+            )
+
+            ListAwareTextField(
+                text: $text,
+                font: inputFont,
+                lineHeight: lineHeight,
+                isLocked: isLocked,
+                textColor: .aquinasPrimaryReadable,
+                textAlignment: .center,
+                onFocusChange: onFocusChange,
+                relay: relay,
+                onTextChange: onTextChange,
+                onSubmit: onSubmit
+            )
+            .frame(maxWidth: .infinity, minHeight: 22, alignment: .center)
+            .animation(.spring(response: 0.36, dampingFraction: 0.86), value: isEmpty)
+            .animation(.spring(response: 0.36, dampingFraction: 0.86), value: isFocused)
+        }
+        .frame(maxWidth: .infinity, minHeight: 22, alignment: .center)
+        .frame(maxWidth: Self.plainMaxWidth, alignment: .center)
     }
 
     var body: some View {
-        Text(text)
-            .font(font)
-            .foregroundColor(color)
-            .frame(alignment: currentAlignment)
-            .offset(x: focusedEmptyOffset)
-            .opacity(isEmpty ? 1 : 0)
-            .allowsHitTesting(false)
-            .animation(animation, value: isEmpty)
-            .animation(animation, value: isFocused)
+        ZStack(alignment: showsChrome ? boxAlignment : .center) {
+            // Invisible probe: `.frame(maxWidth: .infinity)` makes it want the full width its
+            // ambient parent can offer, which — since it's the ZStack's widest child — forces
+            // the ZStack itself to that true available width, independent of how narrow the
+            // actual box below gets once hugged. Its GeometryReader reports that true width.
+            Color.clear
+                .frame(maxWidth: .infinity, maxHeight: 0)
+                .background(
+                    GeometryReader { geo in
+                        Color.clear.preference(key: QuestionInputWidthKey.self, value: geo.size.width)
+                    }
+                )
+
+            if showsChrome {
+                HStack(spacing: 16) {
+                    if isEmpty {
+                        QuestionInputIcon()
+                    }
+
+                    ZStack(alignment: .leading) {
+                        AnimatedQuestionPlaceholder(
+                            text: placeholder,
+                            font: placeholderFont,
+                            color: placeholderColor,
+                            isEmpty: isEmpty,
+                            isFocused: isFocused,
+                            emptyAlignment: .leading,
+                            filledAlignment: .leading,
+                            animation: .spring(response: 0.36, dampingFraction: 0.86)
+                        )
+
+                        ListAwareTextField(
+                            text: $text,
+                            font: inputFont,
+                            lineHeight: lineHeight,
+                            isLocked: isLocked,
+                            textColor: .aquinasPrimaryReadable,
+                            textAlignment: .natural,
+                            onFocusChange: onFocusChange,
+                            relay: relay,
+                            onTextChange: onTextChange,
+                            onSubmit: onSubmit
+                        )
+                        .frame(maxWidth: .infinity, minHeight: 22, alignment: .leading)
+                        .animation(.spring(response: 0.36, dampingFraction: 0.86), value: isEmpty)
+                        .animation(.spring(response: 0.36, dampingFraction: 0.86), value: isFocused)
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 16)
+                .background(AquinasTheme.Colors.canvas)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(AquinasTheme.Colors.sideMenuSearchBorder, lineWidth: 1)
+                )
+                .frame(width: boxWidth, alignment: .leading)
+            } else {
+                plainQuestionEditor
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .onPreferenceChange(QuestionInputWidthKey.self) { availableWidth = $0 }
+        .animation(.spring(response: 0.32, dampingFraction: 0.82), value: boxWidth)
+        .contentShape(Rectangle())
+        .onTapGesture { onTapToFocus?() }
     }
 }
 
@@ -890,14 +1220,22 @@ struct TrackedResponseCard: View {
     let responseIndex: Int
     let shouldAnimateOnAppear: Bool
     let showsThinkingIntro: Bool
+    let isAwaitingResponse: Bool
+    let isReceivingStream: Bool
+    let isQueuedForModel: Bool
+    let usesNetworkStream: Bool
+    let thinkingSummary: [String]
     @Binding var targetSpawnY: CGFloat
     @Binding var targetSpawnResponseIndex: Int?
     let columnSpaceName: String
     let responseTextAlignment: ResponseTextAlignmentOption
     let responseFont: ConversationFontOption
     let conversationFontSize: ConversationFontSizeOption
+    let loadingInsightKey: String?
+    let queuedInsightKeys: Set<String>
     var onCenterChange: (Int, CGFloat) -> Void = { _, _ in }
     var onDuplicateBranch: () -> Void = {}
+    var onInsightTap: (String, String) -> Void = { _, _ in }
     var onFinish: () -> Void
 
     @State private var myYCenter: CGFloat = 0
@@ -917,14 +1255,22 @@ struct TrackedResponseCard: View {
 
     var body: some View {
         ModelResponseCard(
-            title: "Are Some Lies Acceptable?",
+            title: "",
             fullText: textContent,
             shouldAnimateOnAppear: shouldAnimateOnAppear,
             showsThinkingIntro: showsThinkingIntro,
+            isAwaitingResponse: isAwaitingResponse,
+            isReceivingStream: isReceivingStream,
+            isQueuedForModel: isQueuedForModel,
+            usesNetworkStream: usesNetworkStream,
+            thinkingSummary: thinkingSummary,
             responseTextAlignment: responseTextAlignment,
             responseFont: responseFont,
             conversationFontSize: conversationFontSize,
+            loadingInsightKey: loadingInsightKey,
+            queuedInsightKeys: queuedInsightKeys,
             onDuplicateBranch: onDuplicateBranch,
+            onInsightTap: onInsightTap,
             onFinish: {
                 hasFinishedStreaming = true
                 onCenterChange(responseIndex, myYCenter)

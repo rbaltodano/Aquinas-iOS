@@ -16,51 +16,86 @@ struct ModelResponseCard: View {
     let fullText: String
     let shouldAnimateOnAppear: Bool
     let showsThinkingIntro: Bool
+    let isAwaitingResponse: Bool
+    let isReceivingStream: Bool
+    let isQueuedForModel: Bool
+    let usesNetworkStream: Bool
+    let thinkingSummary: [String]
     let responseTextAlignment: ResponseTextAlignmentOption
     let responseFont: ConversationFontOption
     let conversationFontSize: ConversationFontSizeOption
+    let loadingInsightKey: String?
+    let queuedInsightKeys: Set<String>
     var onDuplicateBranch: (() -> Void)? = nil
+    var onInsightTap: ((String, String) -> Void)? = nil
     var onFinish: (() -> Void)? = nil
 
     @State private var isThinking: Bool
     @State private var isThinkingDocked: Bool
+    @State private var isShowingWritingStatus: Bool
     @State private var showTitle: Bool
+    @State private var showResponseContent: Bool
     @State private var isThinkingExpanded: Bool = false
     @State private var visibleThinkingLineCount: Int = 0
     @State private var isThinkingRuleVisible: Bool = false
     @State private var isThinkingCollapsing: Bool = false
+    @State private var hasStartedFinishThinking: Bool = false
+    @State private var thinkingStartedAt: Date
 
     let brandBrown = AquinasTheme.Colors.primaryReadable
-    private let thinkingSummaryLines = [
-        "I identified the central ideas in the question,",
-        "considered the relevant historical and theological context,",
-        "and organized the response around the clearest supporting details."
-    ]
+    private var thinkingSummaryLines: [String] {
+        thinkingSummary.isEmpty
+            ? ["No reasoning summary was returned for this response."]
+            : thinkingSummary
+    }
+    private var canShowThinkingSummaryButton: Bool {
+        showsThinkingIntro && !isThinking && !isAwaitingResponse
+    }
 
     init(
         title: String,
         fullText: String,
         shouldAnimateOnAppear: Bool = true,
         showsThinkingIntro: Bool = true,
+        isAwaitingResponse: Bool = false,
+        isReceivingStream: Bool = false,
+        isQueuedForModel: Bool = false,
+        usesNetworkStream: Bool = false,
+        thinkingSummary: [String] = [],
         responseTextAlignment: ResponseTextAlignmentOption = .center,
         responseFont: ConversationFontOption = .sans,
         conversationFontSize: ConversationFontSizeOption = .large,
+        loadingInsightKey: String? = nil,
+        queuedInsightKeys: Set<String> = [],
         onDuplicateBranch: (() -> Void)? = nil,
+        onInsightTap: ((String, String) -> Void)? = nil,
         onFinish: (() -> Void)? = nil
     ) {
         self.title = title
         self.fullText = fullText
         self.shouldAnimateOnAppear = shouldAnimateOnAppear
         self.showsThinkingIntro = showsThinkingIntro
+        self.isAwaitingResponse = isAwaitingResponse
+        self.isReceivingStream = isReceivingStream
+        self.isQueuedForModel = isQueuedForModel
+        self.usesNetworkStream = usesNetworkStream
+        self.thinkingSummary = thinkingSummary
         self.responseTextAlignment = responseTextAlignment
         self.responseFont = responseFont
         self.conversationFontSize = conversationFontSize
+        self.loadingInsightKey = loadingInsightKey
+        self.queuedInsightKeys = queuedInsightKeys
         self.onDuplicateBranch = onDuplicateBranch
+        self.onInsightTap = onInsightTap
         self.onFinish = onFinish
-        let shouldShowThinking = shouldAnimateOnAppear && showsThinkingIntro
+        let shouldShowThinking = showsThinkingIntro
+            && (isAwaitingResponse || shouldAnimateOnAppear)
         _isThinking = State(initialValue: shouldShowThinking)
         _isThinkingDocked = State(initialValue: !shouldShowThinking)
+        _isShowingWritingStatus = State(initialValue: isReceivingStream)
         _showTitle = State(initialValue: !shouldAnimateOnAppear)
+        _showResponseContent = State(initialValue: !shouldAnimateOnAppear)
+        _thinkingStartedAt = State(initialValue: Date())
     }
 
     var body: some View {
@@ -73,42 +108,51 @@ struct ModelResponseCard: View {
 
                 if showsThinkingIntro {
                     // ── "Thinking…" / expandable thinking summary ─────────────
-                    Button(action: {
-                        if isThinkingExpanded {
-                            collapseThinking()
-                        } else {
-                            isThinkingCollapsing = false
-                            visibleThinkingLineCount = 0
-                            isThinkingRuleVisible = false
-                            withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
-                                isThinkingExpanded = true
+                    if isThinking {
+                        LiveThinkingProgressView(
+                            summaryLines: thinkingSummary,
+                            isWritingResponse: isShowingWritingStatus,
+                            isQueuedForModel: isQueuedForModel,
+                            font: responseFont.textFont(size: conversationFontSize),
+                            color: brandBrown
+                        )
+                            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                    } else {
+                        Button(action: {
+                            guard canShowThinkingSummaryButton else { return }
+                            if isThinkingExpanded {
+                                collapseThinking()
+                            } else {
+                                isThinkingCollapsing = false
+                                visibleThinkingLineCount = 0
+                                isThinkingRuleVisible = false
+                                withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
+                                    isThinkingExpanded = true
+                                }
                             }
-                        }
-                    }) {
-                        HStack(spacing: 6) {
-                            Text(isThinking ? "Thinking..." : "Show Thinking")
-                                .font(.figtreeParagraphLarge)
-                                .fontWeight(.bold)
-                                .modifier(ThinkingShimmer(isActive: isThinking, color: brandBrown))
-                                .contentTransition(.opacity)
-                                .animation(.easeInOut(duration: 0.2), value: isThinking)
+                        }) {
+                            HStack(spacing: 6) {
+                                Text("Show Thinking")
+                                    .font(
+                                        .custom(
+                                            "Figtree-Bold",
+                                            size: conversationFontSize.pointSize
+                                        )
+                                    )
 
-                            if !isThinking {
                                 Image(systemName: isThinkingExpanded ? "chevron.down" : "chevron.right")
                                     .font(.system(size: 10, weight: .bold))
-                                    .foregroundColor(AquinasTheme.Colors.placeholderText)
                                     .transition(.opacity.combined(with: .scale(scale: 0.8)))
                             }
+                            .foregroundColor(AquinasTheme.Colors.headingText)
+                            .contentShape(Rectangle())
                         }
-                        .contentShape(Rectangle())
+                        .buttonStyle(.plain)
+                        .disabled(!canShowThinkingSummaryButton)
+                        .accessibilityLabel(isThinkingExpanded ? "Hide Thinking" : "Show Thinking")
+                        .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
                     }
-                    .buttonStyle(.plain)
-                    .disabled(isThinking)
-                    .accessibilityLabel(isThinkingExpanded ? "Hide Thinking" : "Show Thinking")
-                    .frame(
-                        maxWidth: isThinkingDocked ? .infinity : nil,
-                        alignment: isThinkingDocked ? responseTextAlignment.frameAlignment : .center
-                    )
                 }
 
                 if showsThinkingIntro && !isThinking && isThinkingExpanded {
@@ -116,7 +160,8 @@ struct ModelResponseCard: View {
                         VStack(alignment: .leading, spacing: 8) {
                             ForEach(Array(thinkingSummaryLines.enumerated()), id: \.offset) { index, line in
                                 Text(line)
-                                    .font(.figtreeParagraphLarge)
+                                    .font(responseFont.textFont(size: conversationFontSize))
+                                    .lineSpacing(8)
                                     .foregroundColor(AquinasTheme.Colors.placeholderText)
                                     .fixedSize(horizontal: false, vertical: true)
                                     .opacity(index < visibleThinkingLineCount ? 1 : 0)
@@ -172,8 +217,8 @@ struct ModelResponseCard: View {
                 }
 
                 // ── Title + response body (card state only) ───────────────────
-                if !isThinking {
-                    if showTitle {
+                if !isThinking && !isAwaitingResponse && showResponseContent {
+                    if showTitle, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Text(title)
                             .font(.baskervilleDisplay)
                             .foregroundColor(brandBrown)
@@ -185,10 +230,15 @@ struct ModelResponseCard: View {
                     StreamingMessageView(
                         fullText: fullText,
                         shouldStream: shouldAnimateOnAppear,
+                        isReceivingStream: isReceivingStream,
+                        usesNetworkStream: usesNetworkStream,
                         responseTextAlignment: responseTextAlignment,
                         responseFont: responseFont,
                         conversationFontSize: conversationFontSize,
+                        loadingInsightKey: loadingInsightKey,
+                        queuedInsightKeys: queuedInsightKeys,
                         onBranch: onDuplicateBranch,
+                        onInsightTap: onInsightTap,
                         onFinish: onFinish
                     )
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
@@ -210,33 +260,108 @@ struct ModelResponseCard: View {
         }
         .frame(maxWidth: .infinity, alignment: .center)
         .task {
+            if shouldBeginThinking {
+                startThinking()
+            }
             guard shouldAnimateOnAppear else { return }
+            guard !isAwaitingResponse else { return }
             guard showsThinkingIntro else {
                 try? await Task.sleep(for: .milliseconds(80))
+                guard !Task.isCancelled else { return }
                 withAnimation(.easeOut(duration: 0.22)) {
                     showTitle = true
+                    showResponseContent = true
                 }
                 return
             }
-            // Prototype delay. Replace this with real model streaming state later.
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
-                isThinkingDocked = true
-            }
-
-            try? await Task.sleep(for: .milliseconds(450))
-            withAnimation(.easeInOut(duration: 0.2)) {
-                isThinking = false
-            }
+            await finishThinking()
         }
-        .onChange(of: isThinking) { _, newValue in
-            if !newValue {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                    withAnimation(.easeOut(duration: 0.4)) {
+        .onChange(of: isAwaitingResponse) { _, isAwaiting in
+            if isAwaiting, shouldBeginThinking {
+                startThinking()
+                return
+            }
+            guard !isAwaiting else { return }
+            Task { @MainActor in
+                if showsThinkingIntro {
+                    await finishThinking()
+                } else {
+                    try? await Task.sleep(for: .milliseconds(80))
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.easeOut(duration: 0.22)) {
                         showTitle = true
+                        showResponseContent = true
                     }
                 }
             }
+        }
+        .onChange(of: isReceivingStream) { _, isReceiving in
+            guard isReceiving else { return }
+            if shouldBeginThinking {
+                startThinking()
+            }
+            withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                isShowingWritingStatus = true
+                isThinkingDocked = true
+            }
+        }
+        .onChange(of: thinkingSummary.count) { _, count in
+            guard count > 0, isThinking else { return }
+            withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                isThinkingDocked = true
+            }
+        }
+    }
+
+    private var shouldBeginThinking: Bool {
+        showsThinkingIntro
+            && shouldAnimateOnAppear
+            && (isAwaitingResponse || isReceivingStream || fullText.isEmpty)
+            && !hasStartedFinishThinking
+    }
+
+    private func startThinking() {
+        thinkingStartedAt = Date()
+        hasStartedFinishThinking = false
+        isThinkingExpanded = false
+        visibleThinkingLineCount = 0
+        isThinkingRuleVisible = false
+        isThinkingCollapsing = false
+        withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
+            isThinking = true
+            isThinkingDocked = false
+            isShowingWritingStatus = isReceivingStream
+            showTitle = false
+            showResponseContent = false
+        }
+    }
+
+    @MainActor
+    private func finishThinking() async {
+        guard isThinking, !hasStartedFinishThinking else { return }
+        hasStartedFinishThinking = true
+        let minimumVisibleDuration: TimeInterval = 1.15
+        let elapsed = Date().timeIntervalSince(thinkingStartedAt)
+        if elapsed < minimumVisibleDuration {
+            try? await Task.sleep(for: .milliseconds(Int((minimumVisibleDuration - elapsed) * 1_000)))
+            guard !Task.isCancelled else { return }
+        }
+        withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
+            isThinkingDocked = true
+        }
+
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
+            isThinking = false
+        }
+
+        // Let the progress stack finish collapsing into "Show Thinking"
+        // before the title and response begin their own entrance.
+        try? await Task.sleep(for: .milliseconds(420))
+        guard !Task.isCancelled else { return }
+        withAnimation(.easeOut(duration: 0.22)) {
+            isShowingWritingStatus = false
+            showTitle = true
+            showResponseContent = true
         }
     }
 
@@ -254,6 +379,73 @@ struct ModelResponseCard: View {
                 isThinkingExpanded = false
             }
         }
+    }
+}
+
+private struct LiveThinkingProgressView: View {
+    let summaryLines: [String]
+    let isWritingResponse: Bool
+    let isQueuedForModel: Bool
+    let font: Font
+    let color: Color
+
+    private var showsDetailedProgress: Bool {
+        !summaryLines.isEmpty || isWritingResponse
+    }
+
+    var body: some View {
+        Group {
+            if showsDetailedProgress {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(summaryLines.enumerated()), id: \.offset) { index, line in
+                        Text(line)
+                            .font(font)
+                            .lineSpacing(8)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .modifier(
+                                ThinkingShimmer(
+                                    isActive: !isWritingResponse && index == summaryLines.count - 1,
+                                    color: color
+                                )
+                            )
+                            .transition(.glideFadeUp)
+                    }
+
+                    if isWritingResponse {
+                        Text("Writing response...")
+                            .font(font)
+                            .fontWeight(.bold)
+                            .lineSpacing(8)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .modifier(ThinkingShimmer(isActive: true, color: color))
+                            .transition(.glideFadeUp)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
+            } else {
+                if isQueuedForModel {
+                    Text("Question queued")
+                        .font(font)
+                        .fontWeight(.bold)
+                        .modifier(QueuedWorkBreatheModifier(isQueued: true))
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                } else {
+                    Text("Thinking...")
+                        .font(font)
+                        .fontWeight(.bold)
+                        .modifier(ThinkingShimmer(isActive: true, color: color))
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                }
+            }
+        }
+        .animation(.easeOut(duration: 0.3), value: summaryLines.count)
+        .animation(.easeOut(duration: 0.3), value: isWritingResponse)
+        .animation(.easeInOut(duration: 0.25), value: isQueuedForModel)
     }
 }
 

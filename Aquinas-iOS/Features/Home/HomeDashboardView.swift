@@ -17,6 +17,7 @@ struct HomeDashboardView: View {
     var onNewConversation: () -> Void
     var onStartQuestion: (String) -> Void
     var onOpenInsightBridge: (UUID, UUID) -> Void
+    var onRefresh: () -> Void = {}
 
     @State private var studyTopics: [StudyTopic] = []
     @State private var usageMonth = MonthlyUsageStore.currentMonth()
@@ -112,12 +113,15 @@ struct HomeDashboardView: View {
 
                         HomeFigmaReadingSection(items: Array(HomeDashboardContent.furtherStudyItems.prefix(3)))
                     }
-                    .frame(maxWidth: 369, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                     Color.clear.frame(height: 40)
                 }
-                .padding(.horizontal, 6)
+                .padding(.horizontal, 36)
                 .frame(maxWidth: .infinity, alignment: .center)
+            }
+            .refreshable {
+                refreshContent()
             }
             .overlay(alignment: .bottom) {
                 LinearGradient(
@@ -146,6 +150,12 @@ struct HomeDashboardView: View {
                 .presentationBackground(AquinasTheme.Colors.canvas)
         }
     }
+
+    private func refreshContent() {
+        usageMonth = MonthlyUsageStore.currentMonth()
+        studyTopics = StudyTopicStore.load()
+        onRefresh()
+    }
 }
 
 // MARK: - Figma Home Sections
@@ -163,40 +173,42 @@ private struct HomeFigmaOpeningSection: View {
     var onStartQuestion: () -> Void
 
     var body: some View {
-        VStack(alignment: .center, spacing: 24) {
-            VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .center, spacing: 84) {
+            VStack(alignment: .center, spacing: 48) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(HomeDashboardContent.todayString())
-                        .font(AquinasTheme.Typography.uiLabel)
-                        .foregroundColor(AquinasTheme.Colors.lightGreen)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(HomeDashboardContent.todayString())
+                            .font(AquinasTheme.Typography.uiLabel)
+                            .foregroundColor(AquinasTheme.Colors.lightGreen)
 
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text("\(greeting),")
-                            .font(AquinasTheme.Typography.titleHome)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text("\(greeting),")
+                                .font(AquinasTheme.Typography.titleHome)
 
-                        Text(userName)
-                            .font(.custom("LibreBaskerville-Italic", size: 36))
+                            Text(userName)
+                                .font(.custom("LibreBaskerville-Italic", size: 36))
+                        }
+                        .foregroundColor(AquinasTheme.Colors.primaryReadable)
                     }
-                    .foregroundColor(AquinasTheme.Colors.primaryReadable)
+
+                    Text(subtitle)
+                        .font(AquinasTheme.Typography.body)
+                        .foregroundColor(AquinasTheme.Colors.placeholderText)
+                        .lineSpacing(14)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                Text(subtitle)
-                    .font(AquinasTheme.Typography.body)
-                    .foregroundColor(AquinasTheme.Colors.placeholderText)
-                    .lineSpacing(14)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(alignment: .center, spacing: 24) {
+                    HomeFigmaUsageGrid(month: month)
 
-            HStack(alignment: .center, spacing: 24) {
-                HomeFigmaUsageGrid(month: month)
-
-                HomeFigmaStatsGrid(
-                    conversationCount: conversationCount,
-                    insightCount: insightCount,
-                    studyTopicCount: studyTopicCount,
-                    unfinishedCount: unfinishedCount
-                )
-                .frame(width: 168)
+                    HomeFigmaStatsGrid(
+                        conversationCount: conversationCount,
+                        insightCount: insightCount,
+                        studyTopicCount: studyTopicCount,
+                        unfinishedCount: unfinishedCount
+                    )
+                    .frame(maxWidth: .infinity)
+                }
             }
 
             HomeFigmaQuestionCard(question: question, action: onStartQuestion)
@@ -377,30 +389,8 @@ private struct HomeInsightBridgeLabel: View {
     }
 }
 
-private struct HomeFigmaSectionTitle: View {
-    let title: String
-
-    init(_ title: String) {
-        self.title = title
-    }
-
-    var body: some View {
-        Text(title)
-            .font(.custom("LibreBaskerville-Regular", size: 28))
-            .foregroundColor(AquinasTheme.Colors.primaryReadable)
-            .lineSpacing(7)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-private struct HomeFigmaDivider: View {
-    var body: some View {
-        Rectangle()
-            .fill(AquinasTheme.Colors.quietBorder)
-            .frame(width: 253, height: 1)
-            .frame(maxWidth: .infinity, alignment: .center)
-    }
-}
+private typealias HomeFigmaSectionTitle = AquinasSectionTitle
+private typealias HomeFigmaDivider = AquinasSectionDivider
 
 private struct HomeFigmaUsageGrid: View {
     let month: MonthlyUsageMonth
@@ -709,38 +699,36 @@ private enum HomeDashboardContent {
     }
 
     nonisolated static func insights(for conversation: InquiryConversation, savedInsights: [ConceptDefinition]) -> [ConceptDefinition] {
-        let text = searchableText(in: conversation).lowercased()
+        // Only surface insights actually saved *within* this conversation — i.e. concepts
+        // embedded in its branches — not every saved insight whose word happens to appear
+        // somewhere in the conversation text.
+        let conceptWords = Set(embeddedConcepts(in: conversation).map { $0.word.lowercased() })
 
         return savedInsights
-            .filter { text.contains($0.word.lowercased()) }
+            .filter { conceptWords.contains($0.word.lowercased()) }
             .uniquedByWordLocally()
     }
 
-    nonisolated private static func searchableText(in conversation: InquiryConversation) -> String {
-        var text = conversation.title
+    nonisolated private static func embeddedConcepts(in conversation: InquiryConversation) -> [ConceptDefinition] {
+        var concepts: [ConceptDefinition] = []
 
         for branch in conversation.branches {
-            text += " \(branch.topQuestionText) \(branch.bottomQuestionText) \(branch.duplicatedResponse ?? "")"
-
-            for concept in [branch.startingConcept, branch.attachedConcept, branch.branchContextConcept].compactMap({ $0 }) {
-                text += " \(concept.word) \(concept.meaning)"
-            }
+            concepts.append(contentsOf: [
+                branch.startingConcept,
+                branch.attachedConcept,
+                branch.branchContextConcept
+            ].compactMap { $0 })
 
             for block in branch.activeChatBlocks {
-                switch block {
-                case .text(let answer):
-                    text += " \(answer)"
-                case .user(let question, let concept, _):
-                    text += " \(question)"
-                    if let concept {
-                        text += " \(concept.word) \(concept.meaning)"
-                    }
+                if case .user(_, let concept?, _) = block {
+                    concepts.append(concept)
                 }
             }
         }
 
-        return text
+        return concepts
     }
+
 }
 
 nonisolated private extension Array where Element == ConceptDefinition {

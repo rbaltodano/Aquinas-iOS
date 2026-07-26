@@ -159,7 +159,7 @@ final class InsightTreeScene: SKScene {
         icon.name = group.name
         group.addChild(icon)
 
-        let label = SKLabelNode(fontNamed: "LibreBaskerville-Regular")
+        let label = SKLabelNode(fontNamed: "Figtree-Bold")
         label.text = node.conceptLabel
         label.fontSize = node.isSuggested ? 20 : 24
         label.fontColor = UIColor(AquinasTheme.Colors.primaryReadable)

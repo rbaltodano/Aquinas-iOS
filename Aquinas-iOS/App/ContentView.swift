@@ -56,6 +56,14 @@ struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable {
         self.meaning = meaning
         self.example = example
     }
+
+    /// A stable id derived from the term's canonical text, so re-defining/re-saving the same term
+    /// (tapping it again in a different message, or after removing and re-saving it) always
+    /// resolves to the same Insight instead of a duplicate with a fresh random id. Use this rather
+    /// than the default random `id` whenever a concept originates from a highlighted term.
+    static func stableID(forTerm term: String) -> UUID {
+        stableUUID(from: "term:\(term.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())")
+    }
 }
 
 enum AppPage: Equatable {
@@ -70,6 +78,9 @@ enum AppPage: Equatable {
 // MARK: - App Shell
 
 struct ContentView: View {
+    @Environment(\.aquinasModel) private var aquinasModel
+    @Environment(\.embeddingProvider) private var embeddingProvider
+
     @State private var questionText: String = ""
     @State private var isAtBottom: Bool = false
     @FocusState private var isKeyboardVisible: Bool
@@ -85,7 +96,11 @@ struct ContentView: View {
     @State private var pageContentOffsetY: CGFloat = 0
     @State private var pendingPageTransitionWorkItem: DispatchWorkItem? = nil
     @State private var isGlobalSideMenuOpen: Bool = false
+    // Set while a Study Topic's detail view is open, so the global edge-swipe
+    // gesture below yields to that screen's own swipe-to-go-back gesture.
+    @State private var isStudyTopicDetailVisible: Bool = false
     @State private var isConversationCanvasMode: Bool = false
+    @State private var globalInsightsContextCardState = ContextCardState()
     // Live drag state for the pull-from-left-edge gesture.
     @State private var sideMenuDragOffset: CGFloat = 0
     @State private var isDraggingToOpenMenu: Bool = false
@@ -120,7 +135,6 @@ struct ContentView: View {
     @State private var globalInsightQuoteTarget: ConceptDefinition? = nil
     @State private var globalInsightIsMidpointMode: Bool = false
     @State private var globalInsightIsGenerating: Bool = false
-    @State private var globalInsightIsThinkingEnabled: Bool = false
     @State private var globalInsightSelectedPersonality: String = "Scholarly"
     @State private var globalInsightIsPersonalityMenuOpen: Bool = false
     @State private var globalInsightHighlightedBridge: (UUID, UUID)? = nil
@@ -210,14 +224,15 @@ struct ContentView: View {
             onMidpointGeneratingChange: { globalInsightIsGenerating = $0 },
             inputFont: inputFont,
             conversationFontSize: conversationFontSize,
-            showQuestionBar: false
+            showQuestionBar: false,
+            model: aquinasModel,
+            embeddingProvider: embeddingProvider
         )
         .safeAreaInset(edge: .bottom) {
             GlobalInsightsModelControls(
                 showFilePicker: $showFilePicker,
                 showPhotoPicker: $showPhotoPicker,
                 showCamera: $showCamera,
-                isThinkingEnabled: $globalInsightIsThinkingEnabled,
                 selectedPersonality: $globalInsightSelectedPersonality,
                 isPersonalityMenuOpen: $globalInsightIsPersonalityMenuOpen,
                 hasCanvasHover: globalInsightHasCanvasHover,
@@ -241,9 +256,14 @@ struct ContentView: View {
                 onMidpointCenter: { globalInsightMidpointCenterRequest += 1 },
                 onMidpointPlace: { globalInsightMidpointPlaceRequest += 1 },
                 onClearCanvasSelection: { globalInsightClearSelectionRequest += 1 },
-                onContextWillOpen: { globalInsightDismissHoverRequest += 1 }
+                onContextWillOpen: { globalInsightDismissHoverRequest += 1 },
+                contextCard: globalInsightsContextCardState
             )
         }
+        .contextCardOverlay(
+            globalInsightsContextCardState,
+            wordCount: globalInsightContextWordCount
+        )
         .background(canvasColor)
         .ignoresSafeArea(.container)  // edges/notch only — keyboard safe area is respected
     }
@@ -322,7 +342,8 @@ struct ContentView: View {
                                         globalInsightHighlightedBridge = (firstID, secondID)
                                         globalInsightHighlightRequest += 1
                                         activePage = .insights
-                                    }
+                                    },
+                                    onRefresh: refreshPersistedContent
                                 )
                             case .conversation:
                                 conversationView
@@ -379,7 +400,8 @@ struct ContentView: View {
                                     },
                                     onDeleteConversation: { conversation in
                                         deleteConversation(conversation)
-                                    }
+                                    },
+                                    onRefresh: refreshPersistedContent
                                 )
                             case .settings:
                                 SettingsView(
@@ -430,7 +452,23 @@ struct ContentView: View {
                                     onRenameConversation: { conversation, title in
                                         renameConversation(conversation, to: title)
                                     },
-                                    requestedTopicID: requestedTopicID
+                                    onPinConversation: { conversation in
+                                        pinConversation(conversation)
+                                    },
+                                    onUnpinConversation: { conversation in
+                                        unpinConversation(conversation)
+                                    },
+                                    onRemoveConversationFromStudyTopic: { conversation in
+                                        detachConversationFromStudyTopic(conversation)
+                                    },
+                                    onDeleteConversation: { conversation in
+                                        deleteConversation(conversation)
+                                    },
+                                    requestedTopicID: requestedTopicID,
+                                    onRefresh: refreshPersistedContent,
+                                    onDetailVisibilityChange: { isVisible in
+                                        isStudyTopicDetailVisible = isVisible
+                                    }
                                 )
                             }
                         }
@@ -438,134 +476,6 @@ struct ContentView: View {
                         .offset(y: pageContentOffsetY)
                     }
                     .background(AquinasTheme.Colors.activeInquiryChrome)
-                }
-                .overlay(alignment: .topLeading) {
-                    if activePage == .insights && !isGlobalSideMenuOpen {
-                        SideMenuTriggerButton {
-                            dismissKeyboard()
-                            withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                isGlobalSideMenuOpen = true
-                            }
-                        }
-                        .padding(.leading, 24)
-                        .padding(.top, 24)
-                        .transition(.scale(scale: 0.92).combined(with: .opacity))
-                        .zIndex(2)
-                    }
-                }
-                .overlay {
-                    // Opacity scales from 0→0.16 as the menu is dragged out, so
-                    // the backdrop feels physical rather than binary snap-in.
-                    let dragProgress = min(345, max(0, sideMenuDragOffset)) / 345
-                    let progress: Double = isGlobalSideMenuOpen ? 1.0 : Double(dragProgress)
-                    Color.black.opacity(0.16 * progress)
-                        .ignoresSafeArea()
-                        .allowsHitTesting(progress > 0.02)
-                        .onTapGesture {
-                            withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                isGlobalSideMenuOpen = false
-                                sideMenuDragOffset = 0
-                            }
-                        }
-                        .animation(.easeInOut(duration: 0.22), value: isGlobalSideMenuOpen)
-                        .zIndex(3)
-                }
-                .overlay(alignment: .leading) {
-                    AquinasSideMenu(
-                            currentTitle: sideMenuCurrentTitle,
-                            conversations: sideMenuConversations,
-                            activeConversationID: sideMenuActiveConversationID,
-                            activePage: activePage,
-                            selectedPersonality: "Friendly",
-                            isPresented: isGlobalSideMenuOpen,
-                            onNewChat: {
-                                newConversationRequest += 1
-                                activePage = .conversation
-                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                    isGlobalSideMenuOpen = false
-                                }
-                            },
-                            onSelectConversation: { conversation in
-                                requestedConversationID = conversation.id
-                                activePage = .conversation
-                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                    isGlobalSideMenuOpen = false
-                                }
-                            },
-                            onRenameConversation: { conversation, title in
-                                renameConversation(conversation, to: title)
-                            },
-                            onPinConversation: { conversation in
-                                pinConversation(conversation)
-                            },
-                            onUnpinConversation: { conversation in
-                                unpinConversation(conversation)
-                            },
-                            onAddConversationToStudyTopic: { conversation, topicID in
-                                attachConversation(conversation, toStudyTopic: topicID)
-                            },
-                            onRemoveConversationFromStudyTopic: { conversation in
-                                detachConversationFromStudyTopic(conversation)
-                            },
-                            onDeleteConversation: { conversation in
-                                deleteConversation(conversation)
-                            },
-                            newInsightsCount: newInsightsCount,
-                            onOpenHome: {
-                                activePage = .home
-                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                    isGlobalSideMenuOpen = false
-                                }
-                            },
-                            onOpenConversations: {
-                                activePage = .openConversations
-                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                    isGlobalSideMenuOpen = false
-                                }
-                            },
-                            onOpenInsights: {
-                                activePage = .insights
-                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                    isGlobalSideMenuOpen = false
-                                }
-                            },
-                            onOpenStudyTopics: {
-                                requestedTopicID = nil
-                                activePage = .studyTopics
-                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                    isGlobalSideMenuOpen = false
-                                }
-                            },
-                            onSelectStudyTopic: { topic in
-                                requestedTopicID = topic.id
-                                activePage = .studyTopics
-                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                    isGlobalSideMenuOpen = false
-                                }
-                            },
-                            onOpenSettings: {
-                                activePage = .settings
-                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                    isGlobalSideMenuOpen = false
-                                }
-                            },
-                            onClose: {
-                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                    isGlobalSideMenuOpen = false
-                                }
-                            }
-                        )
-                        .frame(width: 325)
-                        // When closed, add the live drag offset so the panel follows
-                        // the finger.  The implicit spring animation only fires when
-                        // isGlobalSideMenuOpen changes, so drag updates are instant
-                        // (finger-tracked) while snap-open/close use the spring.
-                        .offset(x: isGlobalSideMenuOpen
-                            ? 0
-                            : (-345 + min(345, max(0, sideMenuDragOffset))))
-                        .opacity(isGlobalSideMenuOpen || isDraggingToOpenMenu ? 1 : 0.96)
-                        .zIndex(4)
-                        .animation(.spring(response: 0.42, dampingFraction: 0.84), value: isGlobalSideMenuOpen)
                 }
                 // ── Full-screen pull-to-open gesture ──────────────────────────
                 // Runs simultaneously with canvas/scroll gestures so it doesn't
@@ -576,6 +486,9 @@ struct ContentView: View {
                     DragGesture(minimumDistance: 10, coordinateSpace: .local)
                         .onChanged { value in
                             guard !isGlobalSideMenuOpen else { return }
+                            // A Study Topic's detail view owns the swipe-to-go-back gesture
+                            // while it's open — don't compete with it for the same drag.
+                            guard !(activePage == .studyTopics && isStudyTopicDetailVisible) else { return }
                             guard abs(value.translation.width) > abs(value.translation.height) else { return }
                             if !isDraggingToOpenMenu {
                                 guard value.translation.width > 0 else { return }
@@ -701,6 +614,129 @@ struct ContentView: View {
                     .ignoresSafeArea()
                 }
 
+                // ── Side-menu trigger, backdrop, and panel ────────────────────
+                // These are direct ZStack siblings (not nested `.overlay()` calls)
+                // so their zIndex is compared against the page content directly —
+                // guarantees the panel renders above everything, including page
+                // content that ignores the safe area (e.g. fade gradients).
+                if activePage == .insights && !isGlobalSideMenuOpen {
+                    SideMenuTriggerButton {
+                        dismissKeyboard()
+                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                            isGlobalSideMenuOpen = true
+                        }
+                    }
+                    .padding(.leading, 24)
+                    .padding(.top, 24)
+                    .transition(.scale(scale: 0.92).combined(with: .opacity))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .zIndex(2)
+                }
+
+                // Opacity scales from 0→0.16 as the menu is dragged out, so
+                // the backdrop feels physical rather than binary snap-in.
+                let dragProgress = min(345, max(0, sideMenuDragOffset)) / 345
+                let progress: Double = isGlobalSideMenuOpen ? 1.0 : Double(dragProgress)
+                Color.black.opacity(0.16 * progress)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(progress > 0.02)
+                    .onTapGesture {
+                        dismissGlobalSideMenu()
+                    }
+                    .animation(.easeInOut(duration: 0.22), value: isGlobalSideMenuOpen)
+                    .zIndex(3)
+
+                AquinasSideMenu(
+                        currentTitle: sideMenuCurrentTitle,
+                        conversations: sideMenuConversations,
+                        activeConversationID: sideMenuActiveConversationID,
+                        activePage: activePage,
+                        selectedPersonality: "Friendly",
+                        isPresented: isGlobalSideMenuOpen,
+                        onNewChat: {
+                            dismissGlobalSideMenu {
+                                newConversationRequest += 1
+                                activePage = .conversation
+                            }
+                        },
+                        onSelectConversation: { conversation in
+                            dismissGlobalSideMenu {
+                                requestedConversationID = conversation.id
+                                activePage = .conversation
+                            }
+                        },
+                        onRenameConversation: { conversation, title in
+                            renameConversation(conversation, to: title)
+                        },
+                        onPinConversation: { conversation in
+                            pinConversation(conversation)
+                        },
+                        onUnpinConversation: { conversation in
+                            unpinConversation(conversation)
+                        },
+                        onAddConversationToStudyTopic: { conversation, topicID in
+                            attachConversation(conversation, toStudyTopic: topicID)
+                        },
+                        onRemoveConversationFromStudyTopic: { conversation in
+                            detachConversationFromStudyTopic(conversation)
+                        },
+                        onDeleteConversation: { conversation in
+                            deleteConversation(conversation)
+                        },
+                        newInsightsCount: newInsightsCount,
+                        onOpenHome: {
+                            dismissGlobalSideMenu {
+                                activePage = .home
+                            }
+                        },
+                        onOpenConversations: {
+                            dismissGlobalSideMenu {
+                                activePage = .openConversations
+                            }
+                        },
+                        onOpenInsights: {
+                            dismissGlobalSideMenu {
+                                activePage = .insights
+                            }
+                        },
+                        onOpenStudyTopics: {
+                            dismissGlobalSideMenu {
+                                requestedTopicID = nil
+                                activePage = .studyTopics
+                            }
+                        },
+                        onSelectStudyTopic: { topic in
+                            dismissGlobalSideMenu {
+                                requestedTopicID = topic.id
+                                activePage = .studyTopics
+                            }
+                        },
+                        onOpenSettings: {
+                            dismissGlobalSideMenu {
+                                activePage = .settings
+                            }
+                        },
+                        onClose: {
+                            dismissGlobalSideMenu()
+                        }
+                    )
+                    .frame(width: 325)
+                    // When closed, add the live drag offset so the panel follows
+                    // the finger.  The implicit spring animation only fires when
+                    // isGlobalSideMenuOpen changes, so drag updates are instant
+                    // (finger-tracked) while snap-open/close use the spring.
+                    .offset(x: isGlobalSideMenuOpen
+                        ? 0
+                        : (-345 + min(345, max(0, sideMenuDragOffset))))
+                    .opacity(isGlobalSideMenuOpen || isDraggingToOpenMenu ? 1 : 0.96)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    // Guaranteed topmost: a direct ZStack sibling (not a nested
+                    // .overlay()) so this zIndex is actually compared against the
+                    // page content's zIndex, rather than being the sole child of
+                    // its own separate overlay layer.
+                    .zIndex(1000)
+                    .animation(.spring(response: 0.42, dampingFraction: 0.84), value: isGlobalSideMenuOpen)
+
             }
             .ignoresSafeArea(.container, edges: .bottom)
         }
@@ -720,6 +756,25 @@ struct ContentView: View {
         }
         .onChange(of: collectedDefinitions) { oldValue, newValue in
             InsightLibraryStore.save(newValue)
+        }
+    }
+
+    /// Closes the panel before changing the view behind it, so its contents
+    /// remain visually stable for the full slide-out animation.
+    private func dismissGlobalSideMenu(then action: @escaping () -> Void = {}) {
+        guard isGlobalSideMenuOpen else {
+            action()
+            return
+        }
+
+        withAnimation(
+            .spring(response: 0.42, dampingFraction: 0.84),
+            completionCriteria: .logicallyComplete
+        ) {
+            isGlobalSideMenuOpen = false
+            sideMenuDragOffset = 0
+        } completion: {
+            action()
         }
     }
 
@@ -775,6 +830,19 @@ struct ContentView: View {
         } ?? snapshot.conversations.first?.title ?? "New Conversation"
     }
 
+    private func refreshPersistedContent() {
+        if let snapshot = CurrentConversationsStore.load() {
+            sideMenuConversations = snapshot.conversations
+            let activeID = snapshot.activeConversationID ?? snapshot.conversations.first?.id
+            sideMenuActiveConversationID = activeID
+            sideMenuCurrentTitle = activeID.flatMap { id in
+                snapshot.conversations.first { $0.id == id }?.title
+            } ?? snapshot.conversations.first?.title ?? "New Conversation"
+        }
+
+        collectedDefinitions = InsightLibraryStore.load()
+    }
+
     private func deleteConversation(_ conversation: InquiryConversation) {
         // Remove from the side menu list immediately for snappy feedback.
         sideMenuConversations.removeAll { $0.id == conversation.id }
@@ -793,10 +861,8 @@ struct ContentView: View {
             )
         )
 
-        // If we were on the open-conversations page and nothing's left, go back.
-        if activePage == .openConversations && sideMenuConversations.isEmpty {
-            activePage = .conversation
-        }
+        // Stay on Open Conversations and let it show its own empty state — don't bounce
+        // back to the canvas, since that auto-seeds a fresh blank conversation on appear.
     }
 
     private func renameConversation(_ conversation: InquiryConversation, to title: String) {
@@ -875,7 +941,6 @@ private struct GlobalInsightsModelControls: View {
     @Binding var showFilePicker: Bool
     @Binding var showPhotoPicker: Bool
     @Binding var showCamera: Bool
-    @Binding var isThinkingEnabled: Bool
     @Binding var selectedPersonality: String
     @Binding var isPersonalityMenuOpen: Bool
     let hasCanvasHover: Bool
@@ -894,6 +959,7 @@ private struct GlobalInsightsModelControls: View {
     var onMidpointPlace: () -> Void
     var onClearCanvasSelection: () -> Void
     var onContextWillOpen: () -> Void
+    let contextCard: ContextCardState
 
     var body: some View {
         InquiryControlDock(
@@ -901,7 +967,6 @@ private struct GlobalInsightsModelControls: View {
             showFilePicker: $showFilePicker,
             showPhotoPicker: $showPhotoPicker,
             showCamera: $showCamera,
-            isThinkingEnabled: $isThinkingEnabled,
             selectedPersonality: $selectedPersonality,
             isPersonalityMenuOpen: $isPersonalityMenuOpen,
             isAtBottom: true,
@@ -924,7 +989,8 @@ private struct GlobalInsightsModelControls: View {
             onClearCanvasSelection: onClearCanvasSelection,
             contextWordCount: contextWordCount,
             onClearConversation: {},
-            onContextWillOpen: onContextWillOpen
+            onContextWillOpen: onContextWillOpen,
+            contextCard: contextCard
         )
     }
 }
@@ -975,7 +1041,6 @@ struct CameraCaptureView: UIViewControllerRepresentable {
 /// Older standalone toolbar kept for reference. The active dock now lives in ActiveInquiry.swift.
 struct ModelControlsToolbar: View {
     @Binding var showFilePicker: Bool
-    @Binding var isThinking: Bool
     @Binding var personality: String
 
     // Controls the visibility of the jump-to-bottom button.
@@ -993,18 +1058,6 @@ struct ModelControlsToolbar: View {
                     .font(.system(size: 16, weight: .medium))
                     .sfSymbolDrawOn()
                     .aquinasIconControl()
-            }
-
-            // Thinking toggle.
-            Button(action: { isThinking.toggle() }) {
-                HStack(spacing: 8) {
-                    Image(systemName: "globe")
-                        .sfSymbolDrawOn()
-                    Text("Thinking")
-                        .font(.system(size: 15, weight: .medium))
-                }
-                .padding(.horizontal, 16)
-                .aquinasCapsuleControl(isSelected: isThinking)
             }
 
             // Personality toggle.

@@ -17,7 +17,8 @@ struct SuggestedInsightSheet: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(node.conceptLabel)
-                            .font(.baskervilleHeading1)
+                            .font(.figtreeDisplay)
+                            .lineSpacing(8)
                             .foregroundColor(AquinasTheme.Colors.primaryReadable)
 
                         Text("Suggested connection")
@@ -48,4 +49,3 @@ struct SuggestedInsightSheet: View {
         .background(AquinasTheme.Colors.canvas)
     }
 }
-

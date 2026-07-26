@@ -15,6 +15,15 @@ struct InsightModel: Identifiable, Codable, Equatable, Hashable {
     let conversationID: UUID
     let savedAt: Date
     var embedding: [Double]?
+    /// Which `EmbeddingProvider` produced `embedding` (e.g. `NLEmbeddingProvider.version`). A
+    /// mismatch against the currently-configured provider means the cached vector is from a
+    /// different, incompatible vector space and must be recomputed rather than compared —
+    /// see `EmbeddingProvider`'s doc comment.
+    var embeddingVersion: String?
+    /// Backend-computed relationship to the owning Node. Present for persisted conversation
+    /// trees; nil for the legacy in-memory/global-library canvas.
+    var relatednessToNode: Double?
+    var distanceToNode: Double?
 
     init(
         id: UUID = UUID(),
@@ -22,7 +31,10 @@ struct InsightModel: Identifiable, Codable, Equatable, Hashable {
         definition: String,
         conversationID: UUID = UUID(),
         savedAt: Date = Date(),
-        embedding: [Double]? = nil
+        embedding: [Double]? = nil,
+        embeddingVersion: String? = nil,
+        relatednessToNode: Double? = nil,
+        distanceToNode: Double? = nil
     ) {
         self.id = id
         self.title = title
@@ -30,6 +42,9 @@ struct InsightModel: Identifiable, Codable, Equatable, Hashable {
         self.conversationID = conversationID
         self.savedAt = savedAt
         self.embedding = embedding
+        self.embeddingVersion = embeddingVersion
+        self.relatednessToNode = relatednessToNode
+        self.distanceToNode = distanceToNode
     }
 
     init(concept: ConceptDefinition, conversationID: UUID = UUID()) {
@@ -39,12 +54,19 @@ struct InsightModel: Identifiable, Codable, Equatable, Hashable {
         self.conversationID = conversationID
         savedAt = Date()
         embedding = nil
+        embeddingVersion = nil
+        relatednessToNode = nil
+        distanceToNode = nil
     }
 }
 
 struct NodeModel: Identifiable, Equatable {
     let id: UUID
-    var conceptLabel: String
+    private var titleCasedConceptLabel: String
+    var conceptLabel: String {
+        get { titleCasedConceptLabel }
+        set { titleCasedConceptLabel = newValue.capitalized }
+    }
     /// The concept's own definition, shown in its docked card just like an insight's. Set when an
     /// insight is promoted to a node (carries the source insight's definition); empty for auto
     /// clustered nodes, whose card falls back to a summary of their member insights.
@@ -54,6 +76,26 @@ struct NodeModel: Identifiable, Equatable {
     var position: CGPoint
     var isSuggested: Bool
     var suggestedInsights: [InsightModel]?
+
+    init(
+        id: UUID,
+        conceptLabel: String,
+        definition: String = "",
+        insights: [InsightModel],
+        embedding: [Double],
+        position: CGPoint,
+        isSuggested: Bool,
+        suggestedInsights: [InsightModel]? = nil
+    ) {
+        self.id = id
+        self.titleCasedConceptLabel = conceptLabel.capitalized
+        self.definition = definition
+        self.insights = insights
+        self.embedding = embedding
+        self.position = position
+        self.isSuggested = isSuggested
+        self.suggestedInsights = suggestedInsights
+    }
 }
 
 struct EdgeModel: Identifiable, Equatable {
@@ -76,7 +118,7 @@ struct MidpointSource: Equatable {
 
 /// Radius of the ring an insight chip orbits around its node. Grows with the chip count and
 /// the longest title so adjacent chips don't overlap. Shared by the layout engine
-/// (`InsightTreeViewModel.insightOrbitPosition`) and the renderer
+/// (`InsightTreeViewModel.nodeFootprintRadius`) and the renderer
 /// (`InsightTreeCanvasView.insightWorldPosition`) — both MUST use this so they never desync.
 func insightOrbitRadius(longestTitleChars: Int, count: Int, isSuggested: Bool) -> CGFloat {
     let base: CGFloat = isSuggested ? 118 : 190
@@ -88,4 +130,3 @@ func insightOrbitRadius(longestTitleChars: Int, count: Int, isSuggested: Bool) -
     let required = (chipWidth + 16) / (2 * sin(.pi / CGFloat(n)))
     return max(base, required)
 }
-

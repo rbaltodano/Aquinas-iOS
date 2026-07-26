@@ -2,8 +2,17 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>AquinasBackendURL</key>
+	<string>http://127.0.0.1:8000</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>NSCameraUsageDescription</key>
 	<string>Aquinas uses the camera so you can attach photos to your questions.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Aquinas connects to your private local model server to answer questions and generate insights.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Aquinas uses your photo library so you can attach images to your questions.</string>
 	<key>UIAppFonts</key>
