@@ -18,6 +18,7 @@ struct BranchContextChip: View {
     var appearDelay: TimeInterval = 0
     var animatesAppearance: Bool = true
     var showRemove: Bool = false
+    var onTap: (() -> Void)? = nil
     var onRemove: (() -> Void)? = nil
     /// When true: no padding, no background, no border — just icon + text.
     var isMinimal: Bool = false
@@ -28,7 +29,7 @@ struct BranchContextChip: View {
         icon == "text.bubble" || icon == "text.bubble.fill"
     }
 
-    var body: some View {
+    private var labelContents: some View {
         HStack(spacing: 6) {
             Image(systemName: icon)
                 .font(.system(size: isInsightChip ? 14 : 12, weight: .bold))
@@ -40,6 +41,34 @@ struct BranchContextChip: View {
                 .font(isInsightChip ? .figtreeHeading2 : .figtreeChipLabel)
                 .foregroundColor(AquinasTheme.Colors.darkGreen)
                 .lineLimit(1)
+        }
+    }
+
+    @ViewBuilder
+    private var mainRegion: some View {
+        if let onTap {
+            Button(action: onTap) {
+                paddedLabelContents
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Open \(title) Insight")
+        } else {
+            paddedLabelContents
+        }
+    }
+
+    private var paddedLabelContents: some View {
+        labelContents
+            .padding(.leading, isMinimal ? 0 : 20)
+            .padding(.trailing, showRemove ? 10 : (isMinimal ? 0 : 20))
+            .padding(.vertical, isMinimal ? 0 : 16)
+            .contentShape(Rectangle())
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            mainRegion
+
             if showRemove, let onRemove {
                 Button(action: onRemove) {
                     Image(systemName: "xmark")
@@ -47,11 +76,12 @@ struct BranchContextChip: View {
                         .foregroundColor(AquinasTheme.Colors.darkGreen)
                         .sfSymbolDrawOn()
                 }
-                .padding(.leading, 4)
+                .buttonStyle(.plain)
+                .padding(.trailing, isMinimal ? 0 : 20)
+                .padding(.vertical, isMinimal ? 0 : 16)
+                .accessibilityLabel("Remove \(title)")
             }
         }
-        .padding(.horizontal, isMinimal ? 0 : 20)
-        .padding(.vertical, isMinimal ? 0 : 16)
         .background(isFilled && !isMinimal ? fillColor : Color.clear)
         .cornerRadius(12)
         .overlay(
@@ -93,30 +123,24 @@ struct BranchContextChip: View {
     }
 }
 
-// MARK: - Connection Context Chip (two-concept inquire connection)
+// MARK: - Connection Context Chip
 
 struct ConnectionContextChip: View {
-    let conceptA: ConceptDefinition
-    let conceptB: ConceptDefinition
+    let concepts: [ConceptDefinition]
     var onRemove: (() -> Void)? = nil
     @State private var borderDrawProgress: CGFloat = 0
     @State private var isVisible: Bool = false
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(conceptA.word.capitalized)
-                .font(.figtreeHeading2)
-                .foregroundColor(AquinasTheme.Colors.darkGreen)
-                .lineLimit(1)
-
-            Image(systemName: "arrow.left.and.right")
+            Image(systemName: "point.3.connected.trianglepath.dotted")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundColor(AquinasTheme.Colors.darkGreen)
 
-            Text(conceptB.word.capitalized)
+            Text(concepts.map { $0.word.capitalized }.formatted())
                 .font(.figtreeHeading2)
                 .foregroundColor(AquinasTheme.Colors.darkGreen)
-                .lineLimit(1)
+                .lineLimit(2)
 
             if let onRemove {
                 Button(action: onRemove) {

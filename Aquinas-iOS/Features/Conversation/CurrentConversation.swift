@@ -21,6 +21,9 @@ private final class MiniScrollButtonVisibilityRelay {
 struct CurrentConversationView: View {
     var onOpenMenu: () -> Void = {}
     var onCanvasModeChange: (Bool) -> Void = { _ in }
+    var onRequestConversationPage: () -> Void = {}
+    var onReturnToStudyTopicTree: (StudyTopicTreeSelectionRequest) -> Void = { _ in }
+    var onQuestionOfTheDayAnswered: () -> Void = {}
     @Binding var collectedDefinitions:         [ConceptDefinition]
     @Binding var sideMenuConversations:        [InquiryConversation]
     @Binding var sideMenuCurrentTitle:         String
@@ -29,6 +32,7 @@ struct CurrentConversationView: View {
     @Binding var newConversationRequest:       Int
     @Binding var pendingNewConversationQuestion: String
     @Binding var pendingNewConversationEyebrow: String
+    @Binding var pendingNewConversationPromptContext: String
     /// Set by ContentView before incrementing `newConversationRequest` when the
     /// user taps "New Conversation" inside a study topic. The new conversation
     /// is tagged with this ID, then the binding is cleared.
@@ -39,16 +43,24 @@ struct CurrentConversationView: View {
     @Binding var newConversationIsStudyTopic:  Bool
     @Binding var deletedConversationID:        UUID?
     @Binding var requestedForkConcept:         ConceptDefinition?
+    @Binding var studyTopicInsightQuoteRequest: StudyTopicInsightQuoteRequest?
     let conversationFontSize: ConversationFontSizeOption
     let inputTextAlignment: InputTextAlignmentOption
     let inputFont: ConversationFontOption
     let responseTextAlignment: ResponseTextAlignmentOption
     let responseFont: ConversationFontOption
+    @Binding var conversationPersonality: ConversationPersonality
     let userName: String
+    let isPageVisible: Bool
+    /// App-shell-owned task state. Keeping these references above page navigation lets model
+    /// work continue and keeps one shared popup/status surface throughout the app.
+    let modelTasks: ModelTaskQueue
+    let modelTasksPopupState: ModelTasksPopupState
 
     @Environment(\.aquinasModel) private var aquinasModel
     @Environment(\.embeddingProvider) private var embeddingProvider
     @Environment(\.insightTreeService) private var insightTreeService
+    @Environment(\.modelCompletionNotifications) private var modelCompletionNotifications
     @Environment(\.scenePhase) private var scenePhase
 
     // MARK: Conversation list (source of truth for side menu)
@@ -63,6 +75,7 @@ struct CurrentConversationView: View {
 
     // MARK: Quoted insight chip
     @State private var attachedConcept: ConceptDefinition? = nil
+    @State private var pendingStudyTopicQuoteReturn: StudyTopicInsightQuoteRequest? = nil
 
     // MARK: Scroll / upload helpers
     @State private var externalSubmitTrigger: Int = 0
@@ -75,8 +88,6 @@ struct CurrentConversationView: View {
     @State private var isBranchScrolledToTop: Bool = true
     @State private var isKeyboardOpen: Bool = false
     @State private var contextCardState = ContextCardState()
-    @State private var modelTasksPopupState = ModelTasksPopupState()
-    @State private var modelTasks = ModelTaskQueue()
     @State private var studyTopics: [StudyTopic] = []
     @State private var conversationForTopicPicker: InquiryConversation? = nil
     @State private var hasTextToSubmit: Bool = false
@@ -96,6 +107,7 @@ struct CurrentConversationView: View {
     @State private var insightTreeUpdateSignal: Int = 0
     @State private var isProcessingInsightTreeQueue = false
     @State private var insightTreeQueueRetryTask: Task<Void, Never>? = nil
+    @State private var insightTreeIdleDebounceTask: Task<Void, Never>? = nil
     @State private var manuallySavedConversationInsightIDs: Set<UUID> = []
     /// Number of branch responses currently generating; drives the context wheel spinner.
     @State private var pendingResponseCount: Int = 0
@@ -114,7 +126,6 @@ struct CurrentConversationView: View {
     @State private var titleEditDraft: String = ""
 
     // MARK: Model controls
-    @State private var selectedPersonality: String = "Scholarly"
     @State private var isPersonalityMenuOpen: Bool = false
     @Binding var showFilePicker: Bool
     @State private var showPhotoPicker: Bool = false
@@ -147,6 +158,7 @@ struct CurrentConversationView: View {
     @State private var generatedDefinitionsByKey: [String: ConceptDefinition] = [:]
     @State private var definitionLookupKeys: Set<String> = []
     @State private var insightSheetContentHeight: CGFloat = 178
+    @State private var failedDefinitionWord: InsightWord? = nil
 
     private var queuedInsightKeys: Set<String> {
         Set(modelTasks.upcomingTasks.compactMap(\.kind.definitionKey))
@@ -214,7 +226,11 @@ struct CurrentConversationView: View {
                     if seen.insert(chipKey).inserted { result.append(concept) }
                 case .user:
                     break
-                case .text: break
+                case .text(let text):
+                    for concept in InlineInsightMarkup.insights(in: text) {
+                        let key = concept.word.lowercased()
+                        if seen.insert(key).inserted { result.append(concept) }
+                    }
                 }
             }
         }
@@ -234,6 +250,16 @@ struct CurrentConversationView: View {
         let currentInsightIDs = conversationInsights.map(\.id)
         _ = InsightDiscoveryStore.markNewInsightsUndiscovered(currentInsightIDs)
         undiscoveredInsightCount = InsightDiscoveryStore.visibleUndiscoveredCount(for: currentInsightIDs)
+    }
+
+    /// A completed backend mutation refreshes a mounted Canvas before announcing "Updated".
+    /// When Canvas is not mounted, backend completion is already the final update boundary.
+    private func finishInsightTreeMutation(for conversationID: UUID) {
+        guard activeConversationID == conversationID else { return }
+        persistedTreeRefreshRequest += 1
+        if !canvasMode.isTopicCanvasVisible {
+            insightTreeUpdateSignal += 1
+        }
     }
 
     private func enqueueInsightTreeAnalysis(branchID: UUID, responseIndex: Int) {
@@ -260,7 +286,21 @@ struct CurrentConversationView: View {
                 attemptCount: 0
             )
         )
-        enqueueInsightTreeUpdateTask()
+        scheduleInsightTreeUpdateAfterIdle()
+    }
+
+    private func scheduleInsightTreeUpdateAfterIdle() {
+        guard !InsightTreeAnalysisQueue.load().isEmpty else { return }
+        insightTreeIdleDebounceTask?.cancel()
+        insightTreeIdleDebounceTask = Task {
+            do {
+                try await Task.sleep(for: .seconds(5))
+            } catch {
+                return
+            }
+            guard scenePhase == .active else { return }
+            enqueueInsightTreeUpdateTask()
+        }
     }
 
     private func enqueueInsightTreeUpdateTask() {
@@ -273,6 +313,8 @@ struct CurrentConversationView: View {
 
         modelTasks.enqueue(
             kind: .updateInsightTree,
+            originPage: .conversation,
+            priority: .background,
             onCancel: {
                 for pending in InsightTreeAnalysisQueue.load() {
                     InsightTreeAnalysisQueue.remove(responseID: pending.responseID)
@@ -322,8 +364,13 @@ struct CurrentConversationView: View {
                     InsightTreeAnalysisQueue.remove(responseID: pendingJob.responseID)
                     if result.didMutate {
                         InsightDiscoveryStore.markUndiscovered(result.addedInsightIDs)
-                        persistedTreeRefreshRequest += 1
-                        insightTreeUpdateSignal += 1
+                        InsightDiscoveryStore.markNodesUndiscovered(result.addedNodeIDs)
+                        InsightDiscoveryStore.markPendingTreePresentation(
+                            insightIDs: result.addedInsightIDs,
+                            nodeIDs: result.addedNodeIDs
+                        )
+                        finishInsightTreeMutation(for: pendingJob.conversationID)
+                        await Task.yield()
                     }
                     break
                 } catch {
@@ -352,7 +399,7 @@ struct CurrentConversationView: View {
                 return
             }
             guard scenePhase == .active else { return }
-            enqueueInsightTreeUpdateTask()
+            scheduleInsightTreeUpdateAfterIdle()
         }
     }
 
@@ -372,25 +419,55 @@ struct CurrentConversationView: View {
               let question = precedingQuestion(in: branch, before: job.responseIndex) else {
             return nil
         }
-        return (question, response)
+        return (question, InlineInsightMarkup.plainText(from: response))
     }
 
-    private func contextWordCount(in branches: [ChatBranch]) -> Int {
+    private func contextWordCount(in branch: ChatBranch?) -> Int {
+        guard let branch else { return 0 }
         var textParts: [String] = []
-        for branch in branches {
-            if branch.topQuestionSubmitted { textParts.append(branch.topQuestionText) }
-            if let duplicatedResponse = branch.duplicatedResponse { textParts.append(duplicatedResponse) }
-            for block in branch.activeChatBlocks {
-                switch block {
-                case .text(let text), .user(let text, _, _):
-                    textParts.append(text)
-                }
+
+        if let compactedContext = branch.compactedContext?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !compactedContext.isEmpty {
+            textParts.append(compactedContext)
+        } else if branch.topQuestionSubmitted {
+            let topQuestion = branch.topQuestionText
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !topQuestion.isEmpty {
+                textParts.append(topQuestion)
             }
         }
-        return textParts
-            .joined(separator: " ")
-            .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
-            .count
+
+        let compactedBlockCount = min(
+            branch.compactedThroughBlockCount ?? 0,
+            branch.activeChatBlocks.count
+        )
+        for block in branch.activeChatBlocks.dropFirst(compactedBlockCount) {
+            switch block {
+            case .text(let text):
+                textParts.append(InlineInsightMarkup.plainText(from: text))
+            case .user(let text, _, _):
+                textParts.append(text)
+            }
+        }
+
+        return textParts.reduce(into: 0) { count, text in
+            count += text.split(whereSeparator: \.isWhitespace).count
+        }
+    }
+
+    private func refreshDisplayedContextWordCount(animated: Bool = true) {
+        let branch = activeBranches.first(where: { $0.id == effectiveFocusedID })
+            ?? activeBranches.first
+        let count = contextWordCount(in: branch)
+
+        if animated {
+            withAnimation(.easeInOut(duration: 0.65)) {
+                displayedContextWordCount = count
+            }
+        } else {
+            displayedContextWordCount = count
+        }
     }
 
     // MARK: Helpers
@@ -438,6 +515,8 @@ struct CurrentConversationView: View {
     }
 
     private func closeTopicCanvas() {
+        canvasMode.isCanvasSearchActive = false
+        canvasMode.canvasSearchQuery = ""
         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
             canvasMode.isTopicCanvasVisible = false
         }
@@ -486,8 +565,8 @@ struct CurrentConversationView: View {
                 toggleSavedConcept(concept)
             },
             inquireConnectionRequest: canvasMode.canvasInquireConnectionRequest,
-            onInquireConnectionConcepts: { c1, c2 in
-                canvasMode.canvasConnectionConcepts = (c1, c2)
+            onInquireConnectionConcepts: { concepts in
+                canvasMode.canvasConnectionConcepts = concepts
                 closeTopicCanvas()
                 Task {
                     try? await Task.sleep(for: .milliseconds(180))
@@ -497,12 +576,24 @@ struct CurrentConversationView: View {
             midpointEnterRequest: canvasMode.canvasMidpointEnterRequest,
             midpointCenterRequest: canvasMode.canvasMidpointCenterRequest,
             midpointPlaceRequest: canvasMode.canvasMidpointPlaceRequest,
+            searchQuery: canvasMode.canvasSearchQuery,
+            searchPreviousRequest: canvasMode.canvasSearchPreviousRequest,
+            searchNextRequest: canvasMode.canvasSearchNextRequest,
+            onSearchResultsChange: { current, total in
+                canvasMode.canvasSearchResultIndex = current
+                canvasMode.canvasSearchResultCount = total
+            },
             onMidpointModeChange: { canvasMode.isCanvasMidpointMode = $0 },
             onMidpointGeneratingChange: { canvasMode.isCanvasInsightGenerating = $0 },
             onUndiscoveredInsightCountChange: { undiscoveredInsightCount = $0 },
+            onPersistedTreeRefreshCompleted: {
+                insightTreeUpdateSignal += 1
+            },
             inputFont: inputFont,
             conversationFontSize: conversationFontSize,
             showQuestionBar: false,
+            modelTasks: modelTasks,
+            modelTaskOriginPage: .conversation,
             model: aquinasModel,
             embeddingProvider: embeddingProvider,
             insightTreeService: insightTreeService
@@ -530,6 +621,36 @@ struct CurrentConversationView: View {
         }
     }
 
+    private func openStudyTopicInsightQuote(_ request: StudyTopicInsightQuoteRequest) {
+        guard let conversation = conversations.first(where: {
+            $0.id == request.conversationID && $0.studyTopicID == request.topicID
+        }) else {
+            studyTopicInsightQuoteRequest = nil
+            return
+        }
+
+        switchToConversation(conversation)
+        pendingStudyTopicQuoteReturn = request
+        studyTopicInsightQuoteRequest = nil
+        quoteConceptIntoCurrentConversation(request.insight)
+        Task {
+            try? await Task.sleep(for: .milliseconds(180))
+            scrollToBottomRequest += 1
+        }
+    }
+
+    private func returnToStudyTopicTreeAfterQuoteCancellation() {
+        guard let request = pendingStudyTopicQuoteReturn else { return }
+        pendingStudyTopicQuoteReturn = nil
+        attachedConcept = nil
+        onReturnToStudyTopicTree(
+            StudyTopicTreeSelectionRequest(
+                topicID: request.topicID,
+                insightID: request.insight.id
+            )
+        )
+    }
+
     @ViewBuilder
     /// The slash-command card shows while the keyboard is up and the composer holds a
     /// bare "/token", in Branch mode (not the topic canvas).
@@ -554,7 +675,15 @@ struct CurrentConversationView: View {
             showFilePicker: $showFilePicker,
             showPhotoPicker: $showPhotoPicker,
             showCamera: $showCamera,
-            selectedPersonality: $selectedPersonality,
+            selectedPersonality: Binding(
+                get: { conversationPersonality.displayName },
+                set: { newValue in
+                    guard let personality = ConversationPersonality.allCases.first(where: {
+                        $0.displayName == newValue
+                    }) else { return }
+                    conversationPersonality = personality
+                }
+            ),
             isPersonalityMenuOpen: $isPersonalityMenuOpen,
             isAtBottom: true,
             isKeyboardOpen: isKeyboardOpen,
@@ -588,6 +717,24 @@ struct CurrentConversationView: View {
             isMidpointMode: canvasMode.isCanvasMidpointMode,
             isCanvasInsightLoading: canvasMode.isCanvasInsightGenerating,
             modelTasks: modelTasks,
+            modelTasksPopupState: modelTasksPopupState,
+            canvasSearchText: Binding(
+                get: { canvasMode.canvasSearchQuery },
+                set: { canvasMode.canvasSearchQuery = $0 }
+            ),
+            isCanvasSearchActive: Binding(
+                get: { canvasMode.isCanvasSearchActive },
+                set: { canvasMode.isCanvasSearchActive = $0 }
+            ),
+            canvasSearchResultIndex: canvasMode.canvasSearchResultIndex,
+            canvasSearchResultCount: canvasMode.canvasSearchResultCount,
+            onCanvasSearchPrevious: { canvasMode.canvasSearchPreviousRequest += 1 },
+            onCanvasSearchNext: { canvasMode.canvasSearchNextRequest += 1 },
+            onCanvasSearchActivated: {
+                contextCardState.reset()
+                modelTasksPopupState.reset()
+                canvasMode.canvasDismissHoverRequest += 1
+            },
             onModelStatusTap: {
                 contextCardState.reset()
                 if !modelTasksPopupState.isOpen {
@@ -658,7 +805,7 @@ struct CurrentConversationView: View {
                 }
 
                 // Left-swipe trigger (UIKit-backed, passthrough)
-                if !canvasMode.isTopicCanvasVisible {
+                if isPageVisible && !canvasMode.isTopicCanvasVisible {
                     RightEdgeCanvasSwipeTrigger {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         enterCanvasMode()
@@ -709,15 +856,6 @@ struct CurrentConversationView: View {
         .safeAreaInset(edge: .bottom) {
             bottomInquiryControlDock
         }
-        .contextCardOverlay(
-            contextCardState,
-            wordCount: displayedContextWordCount,
-            onClearConversation: clearCurrentConversation
-        )
-        .modelTasksOverlay(
-            modelTasksPopupState,
-            modelTasks: modelTasks
-        )
         .alert("Context compacted", isPresented: $isCompactionConfirmationPresented) {
             Button("OK", role: .cancel) { }
         } message: {
@@ -728,10 +866,29 @@ struct CurrentConversationView: View {
         } message: {
             Text("The conversation was left unchanged. Check that the Aquinas backend is running and try again.")
         }
+        .alert("Couldn’t generate definition", isPresented: Binding(
+            get: { failedDefinitionWord != nil },
+            set: { if !$0 { failedDefinitionWord = nil } }
+        )) {
+            Button("Cancel", role: .cancel) {
+                failedDefinitionWord = nil
+            }
+            Button("Try Again") {
+                guard let word = failedDefinitionWord else { return }
+                failedDefinitionWord = nil
+                enqueueDynamicDefinition(word)
+            }
+        } message: {
+            Text("No placeholder Insight was created. Check that the Aquinas backend is available and try again.")
+        }
         .onChange(of: canvasMode.isTopicCanvasVisible) { _, isVisible in
             onCanvasModeChange(isVisible)
             modelTasksPopupState.reset()
             if !isVisible {
+                canvasMode.isCanvasSearchActive = false
+                canvasMode.canvasSearchQuery = ""
+                canvasMode.canvasSearchResultIndex = 0
+                canvasMode.canvasSearchResultCount = 0
                 canvasMode.hasCanvasHover = false
                 canvasMode.hasHoveredCanvasInsight = false
                 canvasMode.canvasQuoteTarget = nil
@@ -740,6 +897,18 @@ struct CurrentConversationView: View {
         }
         .onChange(of: canvasMode.hasHoveredCanvasInsight) { _, isHoveringInsight in
             guard isHoveringInsight else { return }
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                modelTasksPopupState.reset()
+            }
+        }
+        .onChange(of: canvasMode.canvasSelectedItemCount) { _, selectedCount in
+            guard selectedCount > 0 else { return }
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                modelTasksPopupState.reset()
+            }
+        }
+        .onChange(of: canvasMode.isCanvasMidpointMode) { _, isMakingMidpoint in
+            guard isMakingMidpoint else { return }
             withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
                 modelTasksPopupState.reset()
             }
@@ -832,6 +1001,9 @@ struct CurrentConversationView: View {
             }
             .ignoresSafeArea()
         }
+        .onChange(of: focusedBranchID) { _, _ in
+            refreshDisplayedContextWordCount()
+        }
         .onChange(of: activeBranches.count) { oldCount, newCount in
             guard newCount > oldCount else { return }
             let target = pendingFocusBranchTarget()
@@ -866,12 +1038,12 @@ struct CurrentConversationView: View {
                 activeBranches = [ChatBranch(startingConcept: nil)]
                 canvasMode.promotedCanvasInsightIDs = []
             }
-            displayedContextWordCount = contextWordCount(in: activeBranches)
+            focusedBranchID = activeBranches.first?.id
+            refreshDisplayedContextWordCount(animated: false)
             if let activeConversationID {
                 manuallySavedConversationInsightIDs =
                     ConversationInsightMembershipStore.insightIDs(for: activeConversationID)
             }
-            focusedBranchID = activeBranches.first?.id
             studyTopics = StudyTopicStore.load()
             publishShellMenuState()
             scrollToBottomAfterLayout()
@@ -884,7 +1056,10 @@ struct CurrentConversationView: View {
                 handledNewConversationRequest = newConversationRequest
                 startNewConversation()
             }
-            enqueueInsightTreeUpdateTask()
+            scheduleInsightTreeUpdateAfterIdle()
+            if let request = studyTopicInsightQuoteRequest {
+                openStudyTopicInsightQuote(request)
+            }
         }
         // Save branches back into the active conversation on every change, then persist.
         // saveCurrentConversation + publishShellMenuState are cheap (memory only).
@@ -907,6 +1082,10 @@ struct CurrentConversationView: View {
             guard let id, let convo = conversations.first(where: { $0.id == id }) else { return }
             requestedConversationID = nil
             switchToConversation(convo)
+        }
+        .onChange(of: studyTopicInsightQuoteRequest) { _, request in
+            guard let request else { return }
+            openStudyTopicInsightQuote(request)
         }
         // "New Conversation" button in side menu.
         .onChange(of: newConversationRequest) { _, new in
@@ -949,14 +1128,16 @@ struct CurrentConversationView: View {
         .onDisappear {
             persistenceTask?.cancel()
             insightTreeQueueRetryTask?.cancel()
+            insightTreeIdleDebounceTask?.cancel()
             saveCurrentConversation()
             persistConversations()
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
-                enqueueInsightTreeUpdateTask()
+                scheduleInsightTreeUpdateAfterIdle()
             } else {
                 insightTreeQueueRetryTask?.cancel()
+                insightTreeIdleDebounceTask?.cancel()
             }
         }
         // aq:// insight links
@@ -1036,7 +1217,10 @@ struct CurrentConversationView: View {
             if let dup = branch.duplicatedResponse { parts.append(dup) }
             for block in branch.activeChatBlocks {
                 switch block {
-                case .text(let t), .user(let t, _, _): parts.append(t)
+                case .text(let text):
+                    parts.append(InlineInsightMarkup.plainText(from: text))
+                case .user(let text, _, _):
+                    parts.append(text)
                 }
             }
         }
@@ -1083,12 +1267,16 @@ struct CurrentConversationView: View {
                     inputFont: inputFont,
                     responseTextAlignment: responseTextAlignment,
                     responseFont: responseFont,
+                    personality: conversationPersonality,
                     loadingInsightKey: loadingSheetWord?.id,
                     queuedInsightKeys: queuedInsightKeys,
+                    savedInsightIDs: Set(collectedDefinitions.map(\.id)),
                     modelTasks: modelTasks,
                     isModelBusy: modelTasks.isBusy,
+                    isPageVisible: isPageVisible,
                     emptyStateUserName: displayUserName,
                     emptyStateEyebrow: activeEmptyPromptEyebrow,
+                    newConversationViewportHeight: stableViewportHeight,
                     studyTopicTitle: activeStudyTopicTitle,
                     onTapEyebrow: {
                         conversationForTopicPicker = conversations.first { $0.id == activeConversationID }
@@ -1102,7 +1290,7 @@ struct CurrentConversationView: View {
                             startingConcept: nil,
                             parentBranchID: b.id,
                             parentResponseIndex: index,
-                            duplicatedResponse: text,
+                            duplicatedResponse: InlineInsightMarkup.plainText(from: text),
                             yOffset: targetSpawnY
                         )
                         withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
@@ -1118,6 +1306,13 @@ struct CurrentConversationView: View {
                     },
                     onTopInputFocused: {
                         lastFocusedAnchor = "top-input-anchor-\(b.id)"
+                    },
+                    onTopQuestionSubmitted: {
+                        guard b.parentBranchID == nil,
+                              activeEmptyPromptEyebrow == "QUESTION OF THE DAY" else {
+                            return
+                        }
+                        onQuestionOfTheDayAnswered()
                     },
                     onBottomInputFocused: {
                         lastFocusedAnchor = "bottom-input-anchor-\(b.id)"
@@ -1144,10 +1339,29 @@ struct CurrentConversationView: View {
                         executeSlashCommand(command, in: b.id)
                     },
                     onQuoteHandled: { attachedConcept = nil },
+                    onQuotedConceptRemoved: {
+                        returnToStudyTopicTreeAfterQuoteCancellation()
+                    },
+                    onQuotedConceptSubmitted: {
+                        pendingStudyTopicQuoteReturn = nil
+                    },
+                    onQuotedConceptTap: { concept in
+                        presentQuotedConcept(concept)
+                    },
                     connectionConcepts: b.id == effectiveFocusedID ? canvasMode.canvasConnectionConcepts : nil,
                     onConnectionHandled: { canvasMode.canvasConnectionConcepts = nil },
+                    onResponseGenerated: { _ in
+                        guard !isPageVisible else { return }
+                        modelCompletionNotifications?.post(
+                            title: "Answer ready: \(activeTitle)"
+                        ) {
+                            onRequestConversationPage()
+                            focusedBranchID = b.id
+                            scrollToBottomAfterLayout()
+                        }
+                    },
                     onResponseCompleted: { responseIndex in
-                        displayedContextWordCount = contextWordCount(in: activeBranches)
+                        refreshDisplayedContextWordCount()
                         pendingResponseCount = max(0, pendingResponseCount - 1)
                         enqueueInsightTreeAnalysis(branchID: b.id, responseIndex: responseIndex)
                     },
@@ -1159,6 +1373,30 @@ struct CurrentConversationView: View {
                     },
                     onInsightTap: { word, sourceResponseBlock in
                         openDynamicDefinition(word: word, sourceResponseBlock: sourceResponseBlock)
+                    },
+                    onInlineInsightQuote: { concept in
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
+                            attachedConcept = concept
+                            focusedBranchID = b.id
+                        }
+                        Task {
+                            try? await Task.sleep(for: .milliseconds(180))
+                            scrollToBottomRequest += 1
+                        }
+                    },
+                    onInlineInsightFork: { concept, responseIndex in
+                        let newBranch = ChatBranch(
+                            startingConcept: concept,
+                            parentBranchID: b.id,
+                            parentResponseIndex: responseIndex,
+                            yOffset: targetSpawnY
+                        )
+                        withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
+                            insertBranch(newBranch, after: b.id)
+                        }
+                    },
+                    onInlineInsightToggleSaved: { concept in
+                        toggleSavedConcept(concept)
                     }
                 )
                 .padding(.horizontal, 36)
@@ -1238,13 +1476,19 @@ struct CurrentConversationView: View {
     private func insightSheet(for sheetData: InsightWord) -> some View {
         let definition = generatedDefinitionsByKey[sheetData.id]
         let isSaved = definition.map { c in
-            collectedDefinitions.contains(where: { $0.word == c.word })
+            collectedDefinitions.contains {
+                $0.word.caseInsensitiveCompare(c.word) == .orderedSame
+                    && $0.containsDefinitions(from: c)
+            }
         } ?? false
 
         return DynamicInsightSheetCard(
             word: sheetData.text,
             concept: definition,
             isSaved: isSaved,
+            funStatusText: modelTasks.allTasks.first {
+                $0.kind.definitionKey == sheetData.id && $0.phase != .completed
+            }?.funStatusText,
             onQuote: {
                 guard let concept = definition else { return }
                 activeSheetWord = nil
@@ -1400,6 +1644,7 @@ struct CurrentConversationView: View {
                     min(compactedThroughBlockCount, activeBranches[currentIndex].activeChatBlocks.count)
                 saveCurrentConversation()
                 persistConversations()
+                refreshDisplayedContextWordCount()
                 isCompactionConfirmationPresented = true
             }
         }
@@ -1429,17 +1674,17 @@ struct CurrentConversationView: View {
             ? [ChatBranch(startingConcept: nil)]
             : conversation.branches
         activeBranches = nextBranches
+        focusedBranchID = activeBranches.first?.id
         manuallySavedConversationInsightIDs =
             ConversationInsightMembershipStore.insightIDs(for: conversation.id)
-        displayedContextWordCount = contextWordCount(in: nextBranches)
+        refreshDisplayedContextWordCount(animated: false)
         canvasMode.promotedCanvasInsightIDs = conversation.promotedInsightIDs
         activeEmptyPromptEyebrow = ""
         activeEmptyPromptQuestion = ""
-        focusedBranchID = activeBranches.first?.id
         publishShellMenuState()
         persistConversations()
         scrollToBottomAfterLayout()
-        enqueueInsightTreeUpdateTask()
+        scheduleInsightTreeUpdateAfterIdle()
     }
 
     /// Reset the active conversation in place so study-topic membership and the
@@ -1488,9 +1733,16 @@ struct CurrentConversationView: View {
         newConversationIsStudyTopic = false
         let pendingQuestion = pendingNewConversationQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
         let pendingEyebrow = pendingNewConversationEyebrow.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pendingPromptContext = pendingNewConversationPromptContext.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
         pendingNewConversationQuestion = ""
         pendingNewConversationEyebrow = ""
-        let freshBranch = ChatBranch(startingConcept: nil)
+        pendingNewConversationPromptContext = ""
+        let freshBranch = ChatBranch(
+            startingConcept: nil,
+            hiddenPromptContext: pendingPromptContext.isEmpty ? nil : pendingPromptContext
+        )
         let fresh = InquiryConversation(isStudyTopic: isStudyTopic, studyTopicID: topicID)
         conversations.insert(fresh, at: 0)
         activeConversationID = fresh.id
@@ -1568,9 +1820,15 @@ struct CurrentConversationView: View {
         }
     }
 
+    private func presentQuotedConcept(_ concept: ConceptDefinition) {
+        let insightWord = InsightWord(text: concept.word, sourceResponseBlock: nil)
+        generatedDefinitionsByKey[insightWord.id] = concept
+        presentDefinition(insightWord)
+    }
+
     private func resetModelTaskPipeline() {
         modelTasks.cancelTasks {
-            $0.kind != .updateInsightTree
+            !$0.kind.isInsightTreeTask
         }
         modelTasks.clearCompletedTasks()
         modelTasksPopupState.reset()
@@ -1591,6 +1849,7 @@ struct CurrentConversationView: View {
 
         modelTasks.enqueue(
             kind: .defineInsight(key: word.id, name: word.text),
+            originPage: .conversation,
             onStart: {
                 insightSheetContentHeight = 178
                 loadingSheetWord = word
@@ -1611,14 +1870,24 @@ struct CurrentConversationView: View {
     // Routes through BackendAquinasModel's live contextual-definition call.
     private func requestDynamicDefinition(for word: String, sourceResponseBlock: String?) async {
         let conversationID = activeConversationID
-
-        let defined = await aquinasModel.defineTerm(
-            word,
-            in: definitionContext(sourceResponseBlock: sourceResponseBlock),
-            conversationID: conversationID
-        )
-        guard !Task.isCancelled else { return }
         let completedWord = InsightWord(text: word, sourceResponseBlock: sourceResponseBlock)
+
+        let defined: ConceptDefinition
+        do {
+            defined = try await aquinasModel.defineTerm(
+                word,
+                in: definitionContext(sourceResponseBlock: sourceResponseBlock),
+                conversationID: conversationID
+            )
+        } catch {
+            guard !Task.isCancelled else { return }
+            if loadingSheetWord == completedWord {
+                loadingSheetWord = nil
+            }
+            failedDefinitionWord = completedWord
+            return
+        }
+        guard !Task.isCancelled else { return }
         guard loadingSheetWord == completedWord else { return }
 
         // Re-stamp with a stable, term-derived id — the model assigns content, never identity
@@ -1629,7 +1898,7 @@ struct CurrentConversationView: View {
         )
         loadingSheetWord = nil
 
-        presentDefinition(completedWord)
+        postDefinitionCompletedNotification(completedWord)
     }
 
     private func definitionContext(sourceResponseBlock: String?) -> ConversationContext {
@@ -1651,7 +1920,8 @@ struct CurrentConversationView: View {
             partOfSpeech: definition.partOfSpeech,
             pronunciation: definition.pronunciation,
             meaning: definition.meaning,
-            example: definition.example
+            example: definition.example,
+            definitions: definition.contextualDefinitions
         )
     }
 
@@ -1661,6 +1931,18 @@ struct CurrentConversationView: View {
         } else if activeSheetWord != word,
                   !completedDefinitionWords.contains(where: { $0.id == word.id }) {
             completedDefinitionWords.append(word)
+        }
+    }
+
+    private func postDefinitionCompletedNotification(_ word: InsightWord) {
+        let title = generatedDefinitionsByKey[word.id]?.word ?? word.text.capitalized
+        modelCompletionNotifications?.post(title: title) {
+            onRequestConversationPage()
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(250))
+                guard generatedDefinitionsByKey[word.id] != nil else { return }
+                presentDefinition(word)
+            }
         }
     }
 
@@ -1675,17 +1957,28 @@ struct CurrentConversationView: View {
     }
 
     private func toggleSavedConcept(_ concept: ConceptDefinition) {
-        let shouldSave = !collectedDefinitions.contains { $0.id == concept.id }
+        let shouldSave = !collectedDefinitions.contains {
+            $0.id == concept.id && $0.containsDefinitions(from: concept)
+        }
         setSavedConcept(concept, isSaved: shouldSave)
     }
 
     private func setSavedConcept(_ concept: ConceptDefinition, isSaved: Bool) {
         let wasSavedToConversation = manuallySavedConversationInsightIDs.contains(concept.id)
+        let existingConcept = collectedDefinitions.first { $0.id == concept.id }
+        let conceptToSave = existingConcept?.mergingDefinitions(from: concept) ?? concept
 
         withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-            collectedDefinitions.removeAll { $0.id == concept.id }
             if isSaved {
-                collectedDefinitions.append(concept)
+                if let existingIndex = collectedDefinitions.firstIndex(
+                    where: { $0.id == concept.id }
+                ) {
+                    collectedDefinitions[existingIndex] = conceptToSave
+                } else {
+                    collectedDefinitions.append(conceptToSave)
+                }
+            } else {
+                collectedDefinitions.removeAll { $0.id == concept.id }
             }
         }
 
@@ -1702,7 +1995,6 @@ struct CurrentConversationView: View {
                 undiscoveredInsightCount = InsightDiscoveryStore.visibleUndiscoveredCount(
                     for: conversationInsights.map(\.id)
                 )
-                insightTreeUpdateSignal += 1
             }
         } else {
             ConversationInsightMembershipStore.remove(
@@ -1713,17 +2005,35 @@ struct CurrentConversationView: View {
         }
 
         guard isSaved else { return }
-        Task {
+        modelTasks.enqueue(
+            kind: .refreshInsightTree,
+            originPage: .conversation,
+            priority: .background
+        ) {
             do {
-                let suggestedNodeLabel = await aquinasModel.labelSubject(
-                    forTitles: ["\(concept.word): \(concept.meaning)"]
+                // Keep the global library's merged definitions separate from this conversation's
+                // tree membership. The tree must persist only the contextual definition the user
+                // just saved here, even when the same stable Insight ID exists in another thread.
+                let suggestedNodeLabel = try await aquinasModel.labelSubject(
+                    forTitles: ["\(concept.word): \(concept.semanticDefinition)"]
                 )
-                try await insightTreeService.save(
+                let assignment = try await insightTreeService.save(
                     concept,
                     to: conversationID,
                     suggestedNodeLabel: suggestedNodeLabel
                 )
-                persistedTreeRefreshRequest += 1
+                guard !Task.isCancelled,
+                      activeConversationID == conversationID else { return }
+                let addedNodeIDs = assignment.didCreateNode ? [assignment.nodeID] : []
+                InsightDiscoveryStore.markNodesUndiscovered(addedNodeIDs)
+                InsightDiscoveryStore.markPendingTreePresentation(
+                    insightIDs: [concept.id],
+                    nodeIDs: addedNodeIDs
+                )
+                finishInsightTreeMutation(for: conversationID)
+                // Give the mounted tree a turn to enqueue its persisted-snapshot refresh
+                // before this mutation leaves the shared model queue.
+                await Task.yield()
             } catch {
                 // The durable conversation-membership record lets Canvas reconcile this
                 // save from the global library when the backend is reachable again.
@@ -1738,13 +2048,20 @@ struct CurrentConversationView: View {
             from: conversationID
         )
         manuallySavedConversationInsightIDs.remove(concept.id)
-        Task {
+        modelTasks.enqueue(
+            kind: .refreshInsightTree,
+            originPage: .conversation,
+            priority: .background
+        ) {
             do {
                 try await insightTreeService.remove(
                     insightID: concept.id,
                     from: conversationID
                 )
-                persistedTreeRefreshRequest += 1
+                guard !Task.isCancelled,
+                      activeConversationID == conversationID else { return }
+                finishInsightTreeMutation(for: conversationID)
+                await Task.yield()
             } catch {
                 // Keep the current snapshot if the backend is unavailable.
             }
@@ -1753,17 +2070,31 @@ struct CurrentConversationView: View {
 
     private func restoreConversationInsight(_ concept: ConceptDefinition) {
         guard let conversationID = activeConversationID else { return }
-        Task {
+        modelTasks.enqueue(
+            kind: .refreshInsightTree,
+            originPage: .conversation,
+            priority: .background
+        ) {
             do {
-                let suggestedNodeLabel = await aquinasModel.labelSubject(
-                    forTitles: ["\(concept.word): \(concept.meaning)"]
+                let suggestedNodeLabel = try await aquinasModel.labelSubject(
+                    forTitles: ["\(concept.word): \(concept.semanticDefinition)"]
                 )
-                try await insightTreeService.save(
+                let assignment = try await insightTreeService.save(
                     concept,
                     to: conversationID,
                     suggestedNodeLabel: suggestedNodeLabel
                 )
-                persistedTreeRefreshRequest += 1
+                guard !Task.isCancelled,
+                      activeConversationID == conversationID else { return }
+                let addedNodeIDs = assignment.didCreateNode ? [assignment.nodeID] : []
+                InsightDiscoveryStore.markUndiscovered([concept.id])
+                InsightDiscoveryStore.markNodesUndiscovered(addedNodeIDs)
+                InsightDiscoveryStore.markPendingTreePresentation(
+                    insightIDs: [concept.id],
+                    nodeIDs: addedNodeIDs
+                )
+                finishInsightTreeMutation(for: conversationID)
+                await Task.yield()
             } catch {
                 // Undo can be retried by saving the Insight again.
             }
@@ -1888,12 +2219,13 @@ private extension String {
             return self
         }
         let range = NSRange(startIndex..., in: self)
-        return regex.stringByReplacingMatches(
+        let visibleText = regex.stringByReplacingMatches(
             in: self,
             options: [],
             range: range,
             withTemplate: "$1"
         )
+        return InlineInsightMarkup.plainText(from: visibleText)
     }
 }
 

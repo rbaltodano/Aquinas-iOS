@@ -18,6 +18,8 @@ xcuserdata/
 *.dSYM
 DerivedData/
 .build/
+LocalModels/
+Aquinas-iOS/LocalModels/
 
 # Swift Package Manager
 .swiftpm/

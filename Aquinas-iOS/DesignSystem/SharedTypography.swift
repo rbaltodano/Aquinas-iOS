@@ -139,9 +139,9 @@ enum AquinasTheme {
 }
 
 extension Animation {
-    /// Short, bouncy spring shared by the Insight card's height changes (bars → definition) and
-    /// swiping between saved insights, so both movements feel the same.
-    static let insightCardBounce = Animation.spring(response: 0.17, dampingFraction: 0.6)
+    /// Gentle spring shared by the Insight card's height changes (bars → definition) and
+    /// swiping between saved insights, keeping the motion soft with only a subtle bounce.
+    static let insightCardBounce = Animation.spring(response: 0.28, dampingFraction: 0.86)
 }
 
 extension AnyTransition {

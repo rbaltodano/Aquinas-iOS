@@ -32,8 +32,8 @@ final class CanvasModeModel {
     var canvasCreateConceptRequest: Int = 0
     var canvasInquireConnectionRequest: Int = 0
 
-    /// The two concepts selected for a connection inquiry.
-    var canvasConnectionConcepts: (ConceptDefinition, ConceptDefinition)? = nil
+    /// The concepts selected for a connection inquiry.
+    var canvasConnectionConcepts: [ConceptDefinition]? = nil
 
     // Midpoint placement flow.
     var canvasMidpointEnterRequest: Int = 0
@@ -42,6 +42,14 @@ final class CanvasModeModel {
     var isCanvasMidpointMode: Bool = false
     /// True while a just-placed midpoint insight is "generating" (loading on the canvas).
     var isCanvasInsightGenerating: Bool = false
+
+    // Search flow.
+    var isCanvasSearchActive: Bool = false
+    var canvasSearchQuery: String = ""
+    var canvasSearchResultIndex: Int = 0
+    var canvasSearchResultCount: Int = 0
+    var canvasSearchPreviousRequest: Int = 0
+    var canvasSearchNextRequest: Int = 0
 
     /// Insight IDs the user promoted from the canvas into the conversation.
     var promotedCanvasInsightIDs: [UUID] = []

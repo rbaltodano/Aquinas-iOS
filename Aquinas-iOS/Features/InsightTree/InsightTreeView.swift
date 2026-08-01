@@ -19,6 +19,7 @@ struct InsightTreeView: View {
     var clearSelectionRequest: Int = 0
     var dismissHoverRequest: Int = 0
     var createConceptRequest: Int = 0
+    var restoreSelectedInsightID: UUID? = nil
     var promotedInsightIDs: [UUID] = []
     var onClose: (() -> Void)?
     var onRemoveInsight:  ((ConceptDefinition) -> Void)? = nil
@@ -32,10 +33,14 @@ struct InsightTreeView: View {
     var savedConceptIDs: Set<UUID> = []
     var onToggleSavedConcept: ((ConceptDefinition) -> Void)? = nil
     var inquireConnectionRequest: Int = 0
-    var onInquireConnectionConcepts: ((ConceptDefinition, ConceptDefinition) -> Void)? = nil
+    var onInquireConnectionConcepts: (([ConceptDefinition]) -> Void)? = nil
     var midpointEnterRequest: Int = 0
     var midpointCenterRequest: Int = 0
     var midpointPlaceRequest: Int = 0
+    var searchQuery: String = ""
+    var searchPreviousRequest: Int = 0
+    var searchNextRequest: Int = 0
+    var onSearchResultsChange: ((_ current: Int, _ total: Int) -> Void)? = nil
     var highlightedInsightPair: (UUID, UUID)? = nil
     var highlightPairRequest: Int = 0
     var startsMidpointForHighlightedPair: Bool = false
@@ -43,10 +48,15 @@ struct InsightTreeView: View {
     /// Reports whether a just-placed midpoint insight is currently "generating".
     var onMidpointGeneratingChange: ((Bool) -> Void)? = nil
     var onUndiscoveredInsightCountChange: ((Int) -> Void)? = nil
+    /// Fires after a mutation-triggered persisted snapshot is fully reconciled and applied.
+    var onPersistedTreeRefreshCompleted: (() -> Void)? = nil
     var inputFont: ConversationFontOption = .serif
     var conversationFontSize: ConversationFontSizeOption = .small
     var showQuestionBar: Bool = true
+    let modelTasks: ModelTaskQueue?
+    let modelTaskOriginPage: ModelTaskOriginPage
     let model: AquinasModel
+    let embeddingProvider: EmbeddingProvider
     let insightTreeService: InsightTreeService
 
     @Environment(\.colorScheme) private var colorScheme
@@ -57,6 +67,10 @@ struct InsightTreeView: View {
     @State private var hoveredConcept: ConceptDefinition?
     /// Insight id of a just-placed midpoint while it "loads" on the canvas.
     @State private var midpointPlacedInsightID: UUID?
+    /// Matches the placed id only after its generated content has replaced the loading
+    /// placeholder. The canvas waits for this signal before revealing the title and card.
+    @State private var midpointGeneratedInsightID: UUID?
+    @State private var midpointGenerationTask: Task<Void, Never>?
     /// True only for the card that pops after a midpoint placement, so its body text
     /// animates in like a streamed model response.
     @State private var animateMidpointCardText: Bool = false
@@ -71,6 +85,7 @@ struct InsightTreeView: View {
     @State private var makeNodeGenerating: Bool = false
     @State private var restoreFocusedCameraRequest: Int = 0
     @State private var focusedInsightID: UUID?
+    @State private var focusedNodeID: UUID?
     @State private var undoInsight: ConceptDefinition? = nil
     @State private var undoTask: Task<Void, Never>? = nil
     @State private var pendingRemoveInsight: InsightModel? = nil
@@ -86,6 +101,18 @@ struct InsightTreeView: View {
     @State private var midpointTargetIndex: Int = 0
     @State private var midpointTargetWeight: Double = 0.5
     @State private var midpointPercentRequest: Int = 0
+    @State private var searchResults: [CanvasSelectionTarget] = []
+    @State private var searchResultIndex: Int = 0
+    /// Advances only after a backend snapshot has been fully reconciled and applied.
+    /// The canvas uses this—not its own appearance—to decide when a persisted update may animate.
+    @State private var persistedTreePresentationRevision: Int = 0
+    /// Equals `persistedTreePresentationRevision` only for refreshes caused by a completed
+    /// mutation. Initial loads establish a baseline without touring the camera.
+    @State private var animatedPersistedTreePresentationRevision: Int = 0
+    /// Prevents a slower initial fetch from overwriting a newer mutation-triggered refresh.
+    @State private var persistedTreeLoadGeneration: Int = 0
+    @State private var isModelActionErrorPresented: Bool = false
+    @State private var pendingModelActionRetry: (() -> Void)? = nil
 
     init(
         insights: [ConceptDefinition],
@@ -95,6 +122,7 @@ struct InsightTreeView: View {
         clearSelectionRequest: Int = 0,
         dismissHoverRequest: Int = 0,
         createConceptRequest: Int = 0,
+        restoreSelectedInsightID: UUID? = nil,
         promotedInsightIDs: [UUID] = [],
         onClose: (() -> Void)? = nil,
         onRemoveInsight:  ((ConceptDefinition) -> Void)? = nil,
@@ -108,19 +136,26 @@ struct InsightTreeView: View {
         savedConceptIDs: Set<UUID> = [],
         onToggleSavedConcept: ((ConceptDefinition) -> Void)? = nil,
         inquireConnectionRequest: Int = 0,
-        onInquireConnectionConcepts: ((ConceptDefinition, ConceptDefinition) -> Void)? = nil,
+        onInquireConnectionConcepts: (([ConceptDefinition]) -> Void)? = nil,
         midpointEnterRequest: Int = 0,
         midpointCenterRequest: Int = 0,
         midpointPlaceRequest: Int = 0,
+        searchQuery: String = "",
+        searchPreviousRequest: Int = 0,
+        searchNextRequest: Int = 0,
+        onSearchResultsChange: ((_ current: Int, _ total: Int) -> Void)? = nil,
         highlightedInsightPair: (UUID, UUID)? = nil,
         highlightPairRequest: Int = 0,
         startsMidpointForHighlightedPair: Bool = false,
         onMidpointModeChange: ((Bool) -> Void)? = nil,
         onMidpointGeneratingChange: ((Bool) -> Void)? = nil,
         onUndiscoveredInsightCountChange: ((Int) -> Void)? = nil,
+        onPersistedTreeRefreshCompleted: (() -> Void)? = nil,
         inputFont: ConversationFontOption = .serif,
         conversationFontSize: ConversationFontSizeOption = .small,
         showQuestionBar: Bool = true,
+        modelTasks: ModelTaskQueue? = nil,
+        modelTaskOriginPage: ModelTaskOriginPage = .insights,
         model: AquinasModel = MockAquinasModel(),
         embeddingProvider: EmbeddingProvider = NLEmbeddingProvider(),
         insightTreeService: InsightTreeService = BackendInsightTreeService()
@@ -128,12 +163,14 @@ struct InsightTreeView: View {
         self.insights              = insights
         self.conversationID        = conversationID
         self.model                 = model
+        self.embeddingProvider     = embeddingProvider
         self.insightTreeService    = insightTreeService
         self.selectionRequest      = selectionRequest
         self.persistedTreeRefreshRequest = persistedTreeRefreshRequest
         self.clearSelectionRequest = clearSelectionRequest
         self.dismissHoverRequest   = dismissHoverRequest
         self.createConceptRequest  = createConceptRequest
+        self.restoreSelectedInsightID = restoreSelectedInsightID
         self.promotedInsightIDs    = promotedInsightIDs
         self.onClose               = onClose
         self.onRemoveInsight       = onRemoveInsight
@@ -151,18 +188,26 @@ struct InsightTreeView: View {
         self.midpointEnterRequest          = midpointEnterRequest
         self.midpointCenterRequest         = midpointCenterRequest
         self.midpointPlaceRequest          = midpointPlaceRequest
+        self.searchQuery                   = searchQuery
+        self.searchPreviousRequest         = searchPreviousRequest
+        self.searchNextRequest             = searchNextRequest
+        self.onSearchResultsChange         = onSearchResultsChange
         self.highlightedInsightPair        = highlightedInsightPair
         self.highlightPairRequest          = highlightPairRequest
         self.startsMidpointForHighlightedPair = startsMidpointForHighlightedPair
         self.onMidpointModeChange          = onMidpointModeChange
         self.onMidpointGeneratingChange    = onMidpointGeneratingChange
         self.onUndiscoveredInsightCountChange = onUndiscoveredInsightCountChange
+        self.onPersistedTreeRefreshCompleted = onPersistedTreeRefreshCompleted
         self.inputFont             = inputFont
         self.conversationFontSize  = conversationFontSize
         self.showQuestionBar       = showQuestionBar
+        self.modelTasks            = modelTasks
+        self.modelTaskOriginPage   = modelTaskOriginPage
         _viewModel = StateObject(wrappedValue: InsightTreeViewModel(
             insights: insights,
             promotedInsightIDs: promotedInsightIDs,
+            showsAllClusterInsights: conversationID == nil,
             model: model,
             embeddingProvider: embeddingProvider
         ))
@@ -212,16 +257,23 @@ struct InsightTreeView: View {
                 edges: viewModel.edges,
                 restoreFocusedCameraRequest: restoreFocusedCameraRequest,
                 focusedInsightID: focusedInsightID,
+                focusedSearchNodeID: focusedNodeID,
                 pulsingInsightID: questionBarContextInsight?.id,
                 pulsingNodeID: selectedNode?.id,
                 selectedCanvasTargets: selectedCanvasTargets,
                 selectionPulseRequest: selectionPulseRequest,
                 makeNodeChildIDs: viewModel.makeNodeChildIDs,
+                generatedMakeNodeChildIDs: viewModel.generatedMakeNodeChildIDs,
                 placedMidpointNodeIDs: viewModel.placedMidpointNodeIDs,
                 placedMidpointSources: viewModel.placedMidpointSources,
                 insightBondLengths: viewModel.insightBondLengths,
                 layoutTargets: viewModel.layoutTargets,
                 nodeDepths: viewModel.nodeDepths,
+                showsAllClusterInsights: conversationID == nil,
+                defersEntranceUntilPersistedTree: conversationID != nil,
+                persistedTreePresentationRevision: persistedTreePresentationRevision,
+                animatedPersistedTreePresentationRevision:
+                    animatedPersistedTreePresentationRevision,
                 isHoveringTarget: selectedInsight != nil || selectedNode != nil || hoveredConcept != nil,
                 isMidpointMode: isMidpointMode,
                 midpointCenterRequest: midpointCenterRequest,
@@ -249,6 +301,7 @@ struct InsightTreeView: View {
                     placeMidpointInsight(at: worldPosition, nearestTarget: nearestTarget, weights: weights)
                 },
                 midpointPlacedInsightID: midpointPlacedInsightID,
+                midpointGeneratedInsightID: midpointGeneratedInsightID,
                 onMidpointInsightLoaded: { insightID in
                     revealPlacedMidpointCard(insightID)
                 },
@@ -463,6 +516,7 @@ struct InsightTreeView: View {
         }
         .onChange(of: insights) { oldValue, newValue in
             viewModel.updateInsights(newValue, promotedInsightIDs: promotedInsightIDs)
+            restoreRequestedInsightSelection()
             if let selectedInsight,
                !newValue.contains(where: { $0.id == selectedInsight.id }) {
                 dismissDockedInsight()
@@ -483,11 +537,29 @@ struct InsightTreeView: View {
         .onChange(of: createConceptRequest) { _, _ in
             promoteHoveredInsightToConcept()
         }
+        .onChange(of: restoreSelectedInsightID) { _, _ in
+            restoreRequestedInsightSelection()
+        }
         .onChange(of: inquireConnectionRequest) { _, _ in
             performInquireConnection()
         }
         .onChange(of: midpointEnterRequest) { _, _ in
             enterMidpointMode()
+        }
+        .onChange(of: searchQuery) { _, _ in
+            refreshSearchResults(resetIndex: true)
+        }
+        .onChange(of: searchPreviousRequest) { _, _ in
+            stepSearchResult(by: -1)
+        }
+        .onChange(of: searchNextRequest) { _, _ in
+            stepSearchResult(by: 1)
+        }
+        .onChange(of: persistedTreePresentationRevision) { _, _ in
+            guard !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return
+            }
+            refreshSearchResults(resetIndex: false)
         }
         .onChange(of: highlightPairRequest) { _, _ in
             highlightInsightPair()
@@ -496,12 +568,19 @@ struct InsightTreeView: View {
             if highlightedInsightPair != nil {
                 highlightInsightPair()
             }
+            restoreRequestedInsightSelection()
         }
         .task(id: conversationID) {
-            await loadPersistedTree()
+            enqueuePersistedTreeLoad(animateChanges: false)
         }
         .onChange(of: persistedTreeRefreshRequest) { _, _ in
-            Task { await loadPersistedTree() }
+            enqueuePersistedTreeLoad(animateChanges: true)
+        }
+        .onDisappear {
+            midpointGenerationTask?.cancel()
+            if midpointPlacedInsightID != nil {
+                onMidpointGeneratingChange?(false)
+            }
         }
         .alert("Remove from conversation?", isPresented: Binding(
             get: { pendingRemoveInsight != nil },
@@ -517,6 +596,21 @@ struct InsightTreeView: View {
         } message: {
             Text("This insight will be removed from this conversation’s tree. Its global bookmark is unchanged.")
         }
+        .alert(
+            "Couldn’t complete that model action",
+            isPresented: $isModelActionErrorPresented
+        ) {
+            Button("Cancel", role: .cancel) {
+                pendingModelActionRetry = nil
+            }
+            Button("Try Again") {
+                let retry = pendingModelActionRetry
+                pendingModelActionRetry = nil
+                retry?()
+            }
+        } message: {
+            Text("The Insight Tree was left unchanged. Check that the Aquinas backend is available and try again.")
+        }
         .sheet(item: $viewModel.selectedSuggestedNode) { node in
             SuggestedInsightSheet(node: node) {
                 viewModel.dismissSuggestedNode(node)
@@ -525,6 +619,18 @@ struct InsightTreeView: View {
             .presentationDragIndicator(.visible)
             .presentationBackground(AquinasTheme.Colors.canvas)
         }
+    }
+
+    private func restoreRequestedInsightSelection() {
+        guard let restoreSelectedInsightID,
+              selectedInsight?.id != restoreSelectedInsightID,
+              let insight = viewModel.nodes
+                .lazy
+                .flatMap(\.insights)
+                .first(where: { $0.id == restoreSelectedInsightID }) else {
+            return
+        }
+        showInsightCard(insight)
     }
 
     private func showInsightCard(_ insight: InsightModel, animateText: Bool = false, moveCamera: Bool = true) {
@@ -725,6 +831,159 @@ struct InsightTreeView: View {
         }
     }
 
+    private func refreshSearchResults(resetIndex: Bool) {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            let hadResults = !searchResults.isEmpty
+            searchResults = []
+            searchResultIndex = 0
+            focusedInsightID = nil
+            focusedNodeID = nil
+            onSearchResultsChange?(0, 0)
+            if hadResults {
+                restoreFocusedCameraRequest += 1
+            }
+            return
+        }
+
+        let rankedInsights = viewModel.nodes
+            .flatMap(\.insights)
+            .compactMap { insight -> (target: CanvasSelectionTarget, title: String, score: Double)? in
+                guard let score = searchScore(query: query, title: insight.title) else {
+                    return nil
+                }
+                return (.insight(insight.id), insight.title, score)
+            }
+
+        let rankedNodes = viewModel.nodes.compactMap {
+            node -> (target: CanvasSelectionTarget, title: String, score: Double)? in
+            guard !viewModel.placedMidpointNodeIDs.contains(node.id),
+                  let score = searchScore(
+                    query: query,
+                    title: node.conceptLabel
+                  ) else {
+                return nil
+            }
+            return (.node(node.id), node.conceptLabel, score)
+        }
+
+        let ranked = (rankedInsights + rankedNodes)
+            .sorted {
+                if $0.score != $1.score { return $0.score > $1.score }
+                return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+            }
+
+        let previousResult = searchResults.indices.contains(searchResultIndex)
+            ? searchResults[searchResultIndex]
+            : nil
+        searchResults = ranked.map(\.target)
+        if resetIndex {
+            searchResultIndex = 0
+        } else if let previousResult,
+                  let retainedIndex = searchResults.firstIndex(of: previousResult) {
+            searchResultIndex = retainedIndex
+        } else {
+            searchResultIndex = min(searchResultIndex, max(searchResults.count - 1, 0))
+        }
+        focusCurrentSearchResult()
+    }
+
+    private func stepSearchResult(by offset: Int) {
+        guard !searchResults.isEmpty else { return }
+        searchResultIndex =
+            (searchResultIndex + offset + searchResults.count)
+            % searchResults.count
+        UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.55)
+        focusCurrentSearchResult()
+    }
+
+    private func focusCurrentSearchResult() {
+        guard searchResults.indices.contains(searchResultIndex) else {
+            focusedInsightID = nil
+            focusedNodeID = nil
+            onSearchResultsChange?(0, 0)
+            return
+        }
+        let result = searchResults[searchResultIndex]
+        onSearchResultsChange?(searchResultIndex + 1, searchResults.count)
+
+        switch result {
+        case .insight(let insightID):
+            focusedNodeID = nil
+            if focusedInsightID == insightID {
+                focusedInsightID = nil
+                DispatchQueue.main.async {
+                    focusedInsightID = insightID
+                }
+            } else {
+                focusedInsightID = insightID
+            }
+
+        case .node(let nodeID):
+            focusedInsightID = nil
+            if focusedNodeID == nodeID {
+                focusedNodeID = nil
+                DispatchQueue.main.async {
+                    focusedNodeID = nodeID
+                }
+            } else {
+                focusedNodeID = nodeID
+            }
+        }
+    }
+
+    private func searchScore(query: String, title: String) -> Double? {
+        let needle = query.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: .current
+        )
+        let haystack = title.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: .current
+        )
+        guard !needle.isEmpty else { return nil }
+
+        if haystack == needle { return 10_000 }
+        if haystack.hasPrefix(needle) {
+            return 8_000 - Double(haystack.count - needle.count)
+        }
+        if let range = haystack.range(of: needle) {
+            return 6_000 - Double(haystack.distance(from: haystack.startIndex, to: range.lowerBound))
+        }
+
+        let queryTokens = needle.split(whereSeparator: \.isWhitespace)
+        if !queryTokens.isEmpty, queryTokens.allSatisfy({ haystack.contains($0) }) {
+            return 4_000 + Double(queryTokens.count * 10)
+        }
+
+        let similarity = normalizedEditSimilarity(needle, haystack)
+        guard similarity >= 0.45 else { return nil }
+        return similarity * 1_000
+    }
+
+    private func normalizedEditSimilarity(_ left: String, _ right: String) -> Double {
+        let leftCharacters = Array(left)
+        let rightCharacters = Array(right)
+        guard !leftCharacters.isEmpty || !rightCharacters.isEmpty else { return 1 }
+
+        var previous = Array(0...rightCharacters.count)
+        for (leftIndex, leftCharacter) in leftCharacters.enumerated() {
+            var current = [leftIndex + 1]
+            for (rightIndex, rightCharacter) in rightCharacters.enumerated() {
+                current.append(
+                    min(
+                        current[rightIndex] + 1,
+                        previous[rightIndex + 1] + 1,
+                        previous[rightIndex] + (leftCharacter == rightCharacter ? 0 : 1)
+                    )
+                )
+            }
+            previous = current
+        }
+        let distance = previous[rightCharacters.count]
+        return 1 - (Double(distance) / Double(max(leftCharacters.count, rightCharacters.count)))
+    }
+
     private func playDockedCardHaptic() {
         let generator = UIImpactFeedbackGenerator(style: .light)
         generator.prepare()
@@ -741,6 +1000,8 @@ struct InsightTreeView: View {
     }
 
     private func selectHoveredCanvasTarget() {
+        guard selectedCanvasTargets.count < CanvasSelectionPolicy.maximumCount else { return }
+
         let target: CanvasSelectionTarget?
         if let selectedInsight {
             target = .insight(selectedInsight.id)
@@ -792,13 +1053,70 @@ struct InsightTreeView: View {
     private func promoteHoveredInsightToConcept() {
         guard let selectedInsight else { return }
         guard !promotedInsightIDs.contains(selectedInsight.id) else { return }
-        UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.8)
-        // Keep this insight's card docked while its children generate; it grows an Insight
-        // link per child, each appended in sync with the child's reveal haptic.
-        makeNodeParentInsightID = selectedInsight.id
-        makeNodeLinkInsightIDs = []
-        makeNodeGenerating = true
-        onPromotedInsightIDsChange?(promotedInsightIDs + [selectedInsight.id])
+
+        let insightID = selectedInsight.id
+        let beginGeneration = {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.8)
+            // Keep this insight's card docked while its children generate; it grows an Insight
+            // link per child, each appended in sync with the child's reveal haptic.
+            makeNodeParentInsightID = insightID
+            makeNodeLinkInsightIDs = []
+            makeNodeGenerating = true
+            viewModel.reserveMakeNodeGeneration(for: insightID)
+            onPromotedInsightIDsChange?(promotedInsightIDs + [insightID])
+        }
+        let cancelGeneration = {
+            viewModel.cancelMakeNodeGeneration(for: insightID)
+            onPromotedInsightIDsChange?(
+                promotedInsightIDs.filter { $0 != insightID }
+            )
+            if makeNodeParentInsightID == insightID {
+                clearMakeNodeCardGrowth()
+                onMidpointGeneratingChange?(false)
+            }
+        }
+
+        guard let modelTasks else {
+            beginGeneration()
+            Task {
+                do {
+                    try await viewModel.generateReservedMakeNodeChildren(
+                        for: selectedInsight
+                    )
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    cancelGeneration()
+                    presentModelActionError {
+                        promoteHoveredInsightToConcept()
+                    }
+                }
+            }
+            return
+        }
+
+        modelTasks.enqueue(
+            kind: .makeNode,
+            originPage: modelTaskOriginPage,
+            onStart: beginGeneration,
+            onCancel: cancelGeneration
+        ) {
+            do {
+                try await viewModel.generateReservedMakeNodeChildren(
+                    for: selectedInsight
+                )
+            } catch {
+                guard !Task.isCancelled else { return }
+                cancelGeneration()
+                presentModelActionError {
+                    promoteHoveredInsightToConcept()
+                }
+            }
+        }
+    }
+
+    private func presentModelActionError(retry: @escaping () -> Void) {
+        pendingModelActionRetry = retry
+        isModelActionErrorPresented = true
     }
 
     /// Called by the canvas as each Make Node child is revealed (on its haptic). Appends an
@@ -827,12 +1145,11 @@ struct InsightTreeView: View {
 
     private func performInquireConnection() {
         guard selectedCanvasTargets.count >= 2 else { return }
-        let c1 = concept(for: selectedCanvasTargets[0])
-        let c2 = concept(for: selectedCanvasTargets[1])
-        guard let c1, let c2 else { return }
+        let concepts = selectedCanvasTargets.compactMap { concept(for: $0) }
+        guard concepts.count == selectedCanvasTargets.count else { return }
         clearSelectedCanvasTargets()
         dismissDockedInsight()
-        onInquireConnectionConcepts?(c1, c2)
+        onInquireConnectionConcepts?(concepts)
     }
 
     // MARK: - Midpoint Mode
@@ -851,10 +1168,13 @@ struct InsightTreeView: View {
         onMidpointModeChange?(false)
     }
 
-    /// Commits the placed midpoint: builds a "New Insight" concept, pins it on the
-    /// canvas connected to the nearest selected insight, then exits midpoint mode.
+    /// Commits the placed midpoint immediately so the loading icon can appear at the chosen
+    /// position, then generates and swaps in its real content without changing its identity.
     private func placeMidpointInsight(at worldPosition: CGPoint, nearestTarget: CanvasSelectionTarget, weights: [Double]) {
-        let sourceConcepts = selectedCanvasTargets.compactMap { concept(for: $0) }
+        let sourceTargets = selectedCanvasTargets
+        let sourceConcepts = sourceTargets.compactMap { concept(for: $0) }
+        guard sourceConcepts.count >= 2, sourceConcepts.count == weights.count else { return }
+        let cachedSourceEmbeddings = sourceTargets.map { cachedEmbedding(for: $0) }
         // Connect the placed midpoint to every source it was spawned from — to the insight chip
         // for a selected insight, or the node center for a selected node concept.
         let sources: [MidpointSource] = selectedCanvasTargets.compactMap { target in
@@ -862,26 +1182,76 @@ struct InsightTreeView: View {
             if case .node = target { return MidpointSource(insightID: id, isNode: true) }
             return MidpointSource(insightID: id, isNode: false)
         }
-        let concept = makeMidpointConcept(weights: weights, targets: sourceConcepts)
+        let concept = makeMidpointLoadingConcept()
 
         // The placed node and its single insight both share the concept id.
         midpointPlacedInsightID = concept.id
+        midpointGeneratedInsightID = nil
         onMidpointGeneratingChange?(true)
         viewModel.addPlacedMidpoint(concept: concept, at: worldPosition, sources: sources)
 
         exitMidpointMode()
         selectedCanvasTargets.removeAll()
         onSelectedCanvasItemCountChange?(0)
-        // Keep the canvas hovering the new insight — the canvas runs its loading
-        // sequence and calls back via revealPlacedMidpointCard to pop the card.
+
+        let placedID = concept.id
+        midpointGenerationTask?.cancel()
+        let generateMidpoint = {
+            do {
+                let generated = try await requestMidpointDefinition(
+                    weights: weights,
+                    targets: sourceConcepts,
+                    cachedSourceEmbeddings: cachedSourceEmbeddings
+                )
+                guard !Task.isCancelled, midpointPlacedInsightID == placedID else { return }
+                viewModel.replacePlacedMidpoint(id: placedID, with: generated)
+                midpointGeneratedInsightID = placedID
+            } catch {
+                guard !Task.isCancelled, midpointPlacedInsightID == placedID else { return }
+                viewModel.removePlacedMidpoint(id: placedID)
+                midpointPlacedInsightID = nil
+                midpointGeneratedInsightID = nil
+                onMidpointGeneratingChange?(false)
+                presentModelActionError {
+                    selectedCanvasTargets = sourceTargets
+                    placeMidpointInsight(
+                        at: worldPosition,
+                        nearestTarget: nearestTarget,
+                        weights: weights
+                    )
+                }
+            }
+        }
+
+        guard let modelTasks else {
+            midpointGenerationTask = Task { @MainActor in
+                await generateMidpoint()
+            }
+            return
+        }
+
+        modelTasks.enqueue(
+            kind: .createMidpoint,
+            originPage: modelTaskOriginPage,
+            onCancel: {
+                guard midpointPlacedInsightID == placedID else { return }
+                viewModel.removePlacedMidpoint(id: placedID)
+                midpointPlacedInsightID = nil
+                midpointGeneratedInsightID = nil
+                onMidpointGeneratingChange?(false)
+            }
+        ) {
+            await generateMidpoint()
+        }
     }
 
-    /// Called by the canvas once the placed midpoint insight has finished its simulated
-    /// load (icon flash → title reveal → dot pulse). Pops the insight card with its body
-    /// text animating in like a streamed model response.
+    /// Called by the canvas after generation and the loading-icon reveal sequence. Pops the
+    /// generated Insight card with its body text animating in like a streamed model response.
     private func revealPlacedMidpointCard(_ insightID: UUID) {
         guard midpointPlacedInsightID == insightID else { return }
         midpointPlacedInsightID = nil
+        midpointGeneratedInsightID = nil
+        midpointGenerationTask = nil
         onMidpointGeneratingChange?(false)
         // If the user navigated to another insight/node while it generated, don't hijack their card.
         let viewingOther = (selectedInsight != nil && selectedInsight?.id != insightID) || selectedNode != nil
@@ -890,25 +1260,89 @@ struct InsightTreeView: View {
         showInsightCard(insight, animateText: true, moveCamera: false)
     }
 
-    /// Synchronous stub so the node appears pinned immediately. The placed concept is
-    /// simply named "New Insight" for now; `requestMidpointDefinition` is the seam for
-    /// the real model-generated blend.
-    private func makeMidpointConcept(weights: [Double], targets: [ConceptDefinition]) -> ConceptDefinition {
+    /// Empty, identity-bearing content used only while the loading icon is visible. It is never
+    /// revealed as an Insight title; the generated definition replaces it in place first.
+    private func makeMidpointLoadingConcept() -> ConceptDefinition {
         ConceptDefinition(
-            word: "New Insight",
+            word: "",
             partOfSpeech: "",
             pronunciation: "",
-            meaning: "",            // DockedConceptCard shows placeholder copy when meaning is empty
+            meaning: "",
             example: ""
         )
     }
 
-    /// Real model call, not yet wired into `placeMidpointInsight`'s flow — that still commits
-    /// `makeMidpointConcept`'s synchronous placeholder so the node appears pinned immediately.
-    /// This is the seam for replacing the placed concept's contents in place via the view model
-    /// once a real blend result is ready.
-    private func requestMidpointDefinition(weights: [Double], targets: [ConceptDefinition]) async -> ConceptDefinition {
-        await model.blendConcepts(targets, weights: weights)
+    private func requestMidpointDefinition(
+        weights: [Double],
+        targets: [ConceptDefinition],
+        cachedSourceEmbeddings: [[Double]?]
+    ) async throws -> ConceptDefinition {
+        let candidates = try await model.blendConceptCandidates(
+            targets,
+            weights: weights
+        )
+        guard let fallback = candidates.first else {
+            throw AquinasModelActionError.invalidResponse
+        }
+
+        var sourceEmbeddings: [[Double]] = []
+        for index in targets.indices {
+            if index < cachedSourceEmbeddings.count,
+               let cached = cachedSourceEmbeddings[index],
+               !cached.isEmpty {
+                sourceEmbeddings.append(cached)
+                continue
+            }
+            let target = targets[index]
+            guard let embedded = await embeddingProvider.embed(
+                "\(target.word). \(target.semanticDefinition)"
+            ) else {
+                return fallback
+            }
+            sourceEmbeddings.append(embedded)
+        }
+        guard let targetCentroid = normalizedWeightedCentroid(
+            sourceEmbeddings,
+            weights: weights
+        ) else {
+            return fallback
+        }
+
+        var nearest = fallback
+        var nearestDistance = Double.infinity
+        for candidate in candidates {
+            guard let candidateEmbedding = await embeddingProvider.embed(
+                "\(candidate.word). \(candidate.semanticDefinition)"
+            ) else {
+                continue
+            }
+            let distance = semanticDistance(candidateEmbedding, targetCentroid)
+            if distance < nearestDistance {
+                nearest = candidate
+                nearestDistance = distance
+            }
+        }
+        return nearest
+    }
+
+    private func cachedEmbedding(for target: CanvasSelectionTarget) -> [Double]? {
+        switch target {
+        case .insight(let id):
+            return viewModel.nodes
+                .flatMap(\.insights)
+                .first(where: {
+                    $0.id == id && $0.embeddingVersion == embeddingProvider.version
+                })?
+                .embedding
+        case .node(let id):
+            guard let embedding = viewModel.nodes
+                .first(where: { $0.id == id })?
+                .embedding,
+                !embedding.isEmpty else {
+                return nil
+            }
+            return embedding
+        }
     }
 
     private func insightID(for target: CanvasSelectionTarget) -> UUID? {
@@ -936,7 +1370,25 @@ struct InsightTreeView: View {
     }
 
     private func concept(for insight: InsightModel) -> ConceptDefinition {
-        insights.first(where: { $0.id == insight.id })
+        if let placedMidpoint = viewModel.placedMidpointConcept(for: insight.id) {
+            return placedMidpoint
+        }
+
+        // A persisted tree Insight already carries the definition scoped to this conversation.
+        // Resolving it through the global library can return the same term with definitions merged
+        // from other conversations, which makes the tree card show unrelated meanings.
+        if conversationID != nil {
+            return ConceptDefinition(
+                id: insight.id,
+                word: insight.title,
+                partOfSpeech: "",
+                pronunciation: "",
+                meaning: insight.definition,
+                example: ""
+            )
+        }
+
+        return insights.first(where: { $0.id == insight.id })
             ?? ConceptDefinition(
                 id: insight.id,
                 word: insight.title,
@@ -947,20 +1399,32 @@ struct InsightTreeView: View {
             )
     }
 
-    private func loadPersistedTree() async {
+    private func loadPersistedTree(animateChanges: Bool) async {
         guard let conversationID else { return }
+        persistedTreeLoadGeneration += 1
+        let loadGeneration = persistedTreeLoadGeneration
         do {
             var tree = try await insightTreeService.tree(for: conversationID)
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  loadGeneration == persistedTreeLoadGeneration else { return }
 
             var didRepairNodeLabel = false
             for node in tree.nodes where node.needsGeneratedLabel {
                 let descriptions = node.insights.map {
                     "\($0.title): \($0.definition)"
                 }
-                let label = await model.labelSubject(forTitles: descriptions)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !label.isEmpty else { continue }
+                let label: String
+                do {
+                    label = try await model.labelSubject(forTitles: descriptions)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                } catch {
+                    continue
+                }
+                let labelKey = canonicalTreeTitle(label)
+                let duplicatesInsightTitle = node.insights.contains {
+                    canonicalTreeTitle($0.title) == labelKey
+                }
+                guard !label.isEmpty, !duplicatesInsightTitle else { continue }
                 do {
                     try await insightTreeService.labelNode(
                         nodeID: node.id,
@@ -974,9 +1438,9 @@ struct InsightTreeView: View {
             }
             if didRepairNodeLabel {
                 tree = try await insightTreeService.tree(for: conversationID)
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled,
+                      loadGeneration == persistedTreeLoadGeneration else { return }
             }
-            viewModel.applyPersistedTree(tree)
 
             // One-time/back-online reconciliation for saved concepts already associated with
             // this conversation before persistent tree consumption was introduced.
@@ -987,13 +1451,20 @@ struct InsightTreeView: View {
             var didSaveMissingInsight = false
             for concept in missingSavedInsights {
                 do {
-                    let suggestedNodeLabel = await model.labelSubject(
-                        forTitles: ["\(concept.word): \(concept.meaning)"]
+                    let suggestedNodeLabel = try await model.labelSubject(
+                        forTitles: ["\(concept.word): \(concept.semanticDefinition)"]
                     )
-                    try await insightTreeService.save(
+                    let assignment = try await insightTreeService.save(
                         concept,
                         to: conversationID,
                         suggestedNodeLabel: suggestedNodeLabel
+                    )
+                    let addedNodeIDs = assignment.didCreateNode ? [assignment.nodeID] : []
+                    InsightDiscoveryStore.markUndiscovered([concept.id])
+                    InsightDiscoveryStore.markNodesUndiscovered(addedNodeIDs)
+                    InsightDiscoveryStore.markPendingTreePresentation(
+                        insightIDs: [concept.id],
+                        nodeIDs: addedNodeIDs
                     )
                     didSaveMissingInsight = true
                 } catch {
@@ -1002,13 +1473,50 @@ struct InsightTreeView: View {
             }
             if didSaveMissingInsight {
                 tree = try await insightTreeService.tree(for: conversationID)
-                guard !Task.isCancelled else { return }
-                viewModel.applyPersistedTree(tree)
+                guard !Task.isCancelled,
+                      loadGeneration == persistedTreeLoadGeneration else { return }
+            }
+
+            // Apply exactly one fully reconciled snapshot. Publishing an intermediate tree here
+            // used to let the canvas consume its entrance animation before the real update landed.
+            guard loadGeneration == persistedTreeLoadGeneration else { return }
+            viewModel.applyPersistedTree(tree)
+            persistedTreePresentationRevision += 1
+            if animateChanges {
+                animatedPersistedTreePresentationRevision =
+                    persistedTreePresentationRevision
+                onPersistedTreeRefreshCompleted?()
             }
         } catch {
             // The local backend is optional during previews/offline use. Keep the existing
             // in-memory canvas instead of blanking a usable tree.
         }
+    }
+
+    /// Persisted-tree fetches may also repair labels or reconcile saved Insights, so they are
+    /// model work rather than an untracked view refresh. Keeping them in the shared queue prevents
+    /// the status control from returning to Idle before the fully reconciled snapshot is applied.
+    private func enqueuePersistedTreeLoad(animateChanges: Bool) {
+        guard conversationID != nil else { return }
+        guard let modelTasks else {
+            Task { await loadPersistedTree(animateChanges: animateChanges) }
+            return
+        }
+        modelTasks.enqueue(
+            kind: .refreshInsightTree,
+            originPage: modelTaskOriginPage,
+            priority: .background
+        ) {
+            await loadPersistedTree(animateChanges: animateChanges)
+        }
+    }
+
+    private func canonicalTreeTitle(_ title: String) -> String {
+        title
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+            .lowercased()
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
     }
 
     private func quoteTarget(for node: NodeModel) -> ConceptDefinition? {
@@ -1038,9 +1546,47 @@ struct InsightTreeView: View {
     }
 }
 
+/// A literal weighted centroid in the active cosine-embedding space. Source vectors are first
+/// normalized so their magnitudes cannot distort the percentages, then the centroid is normalized
+/// for direct cosine-distance comparison with generated candidates.
+func normalizedWeightedCentroid(
+    _ vectors: [[Double]],
+    weights: [Double]
+) -> [Double]? {
+    guard let first = vectors.first,
+          !first.isEmpty,
+          vectors.count == weights.count,
+          vectors.allSatisfy({ $0.count == first.count }),
+          weights.allSatisfy(\.isFinite) else {
+        return nil
+    }
+
+    let clippedWeights = weights.map { max($0, 0) }
+    let totalWeight = clippedWeights.reduce(0, +)
+    guard totalWeight > 0 else { return nil }
+
+    var center = Array(repeating: 0.0, count: first.count)
+    for (vector, weight) in zip(vectors, clippedWeights) where weight > 0 {
+        let magnitude = sqrt(vector.map { $0 * $0 }.reduce(0, +))
+        guard magnitude > 0 else { return nil }
+        let normalizedWeight = weight / totalWeight
+        for index in vector.indices {
+            center[index] += vector[index] / magnitude * normalizedWeight
+        }
+    }
+
+    let centerMagnitude = sqrt(center.map { $0 * $0 }.reduce(0, +))
+    guard centerMagnitude > 0 else { return nil }
+    return center.map { $0 / centerMagnitude }
+}
+
 enum CanvasSelectionTarget: Equatable {
     case node(UUID)
     case insight(UUID)
+}
+
+enum CanvasSelectionPolicy {
+    static let maximumCount = 8
 }
 
 struct DockedInsightTreeCard: View {
@@ -1266,24 +1812,23 @@ private struct DockedConceptCard: View {
                     isSaved: isSaved,
                     canCopy: true,
                     canFork: true,
-                    copyText: concept.meaning,
+                    copyText: concept.semanticDefinition,
                     tintColor: AquinasTheme.Colors.placeholderText,
                     saveTintColor: AquinasTheme.Colors.accentRed,
                     onSave: onToggleSaved,
                     onFork: onFork
                 )
             }
-            let meaningText = concept.meaning.isEmpty || concept.meaning.lowercased() == concept.word.lowercased()
-                ? "This is an example of what an Insight Card will look like, the definition as relates to subject will be here"
-                : concept.meaning
-            TruncatableParagraph(text: meaningText, color: AquinasTheme.Colors.paragraphText.opacity(0.75))
+            InsightDefinitionsContent(
+                definitions: concept.contextualDefinitions
+            )
         }
-        .padding(32)
+        .padding(24)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(insightTreeInsightColor)
-        .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 36, style: .continuous)
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
         )
     }

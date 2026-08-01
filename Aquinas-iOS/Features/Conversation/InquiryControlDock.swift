@@ -4,22 +4,92 @@
 //
 
 import SwiftUI
+import UIKit
+
+/// Full context capacity of the deployed Gemma 4 E2B checkpoint.
+let aquinasContextWindowLimit = 131_072
+
+private struct OpenModelTaskPageActionKey: EnvironmentKey {
+    static let defaultValue: (ModelTaskSnapshot) -> Void = { _ in }
+}
+
+extension EnvironmentValues {
+    var openModelTaskPage: (ModelTaskSnapshot) -> Void {
+        get { self[OpenModelTaskPageActionKey.self] }
+        set { self[OpenModelTaskPageActionKey.self] = newValue }
+    }
+}
+
+struct ModelCompletionNotification: Identifiable {
+    let id = UUID()
+    let title: String
+    let openAction: @MainActor () -> Void
+}
+
+@MainActor
+@Observable
+final class ModelCompletionNotificationCenter {
+    private(set) var notifications: [ModelCompletionNotification] = []
+
+    func post(
+        title: String,
+        openAction: @escaping @MainActor () -> Void
+    ) {
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+            notifications.insert(
+                ModelCompletionNotification(
+                    title: title,
+                    openAction: openAction
+                ),
+                at: 0
+            )
+        }
+        if UIApplication.shared.applicationState != .active {
+            AquinasSystemNotifications.postCompletedResponse(title: title)
+        }
+        playCompletionHaptics()
+    }
+
+    func dismiss(id: UUID) {
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+            notifications.removeAll { $0.id == id }
+        }
+    }
+
+    func open(id: UUID) {
+        guard let notification = notifications.first(where: { $0.id == id }) else {
+            return
+        }
+        dismiss(id: id)
+        notification.openAction()
+    }
+
+    private func playCompletionHaptics() {
+        guard SettingsHaptics.isEnabled else { return }
+        let generator = UIImpactFeedbackGenerator(style: .light)
+        generator.prepare()
+        generator.impactOccurred(intensity: 0.7)
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            generator.prepare()
+            generator.impactOccurred(intensity: 0.7)
+        }
+    }
+}
+
+extension EnvironmentValues {
+    @Entry var modelCompletionNotifications: ModelCompletionNotificationCenter? = nil
+}
 
 extension Notification.Name {
     static let aquinasMiniScrollButtonVisibilityChanged = Notification.Name("aquinasMiniScrollButtonVisibilityChanged")
 }
 
-/// Shared open/animation state for the Context popup, owned by whichever screen hosts
-/// `InquiryControlDock` (not the dock itself) so the popup can be rendered as a plain
-/// ZStack sibling instead of nested inside the dock's `.safeAreaInset` content — content
-/// there gets visually clipped/occluded the moment it tries to bleed above its own strip,
-/// which is why the popup silently failed to appear at all.
+/// Shared open/animation state for the Context row in the model-controls stack.
 @Observable
 final class ContextCardState {
     var isOpen = false
-    /// The outside-tap dismiss catcher is armed a beat after the card opens, so the very tap that
-    /// opened it isn't caught by the catcher and immediately closes it again.
-    var dismissArmed = false
     var isCompacting = false
     var isCompactionComplete = false
     var dragY: CGFloat = 0
@@ -37,86 +107,32 @@ final class ContextCardState {
 @Observable
 final class ModelTasksPopupState {
     var isOpen = false
-    var dismissArmed = false
 
     func reset() {
         isOpen = false
-        dismissArmed = false
     }
 }
 
-/// Reports the world-space top-center point of the dock's pill, measured via an
-/// `anchorPreference` so `ContextCardPopover` can be positioned above the dock correctly
-/// even though it renders as a sibling outside the dock's `.safeAreaInset` content.
-struct DockPillTopAnchorKey: PreferenceKey {
-    static var defaultValue: Anchor<CGPoint>?
-    static func reduce(value: inout Anchor<CGPoint>?, nextValue: () -> Anchor<CGPoint>?) {
-        value = nextValue() ?? value
-    }
-}
-
-/// The Context popup card, hosted as a direct ZStack sibling (via `.overlayPreferenceValue`)
-/// rather than as an `.overlay()` inside the dock — see `ContextCardState` for why.
-struct ContextCardPopover: View {
+/// The Context card as a real row in the bottom model-controls stack.
+private struct ContextControlsStackCard: View {
     let contextCard: ContextCardState
     let wordCount: Int
-    var wordLimit: Int = 10_000
+    var wordLimit: Int = aquinasContextWindowLimit
     var onClearConversation: () -> Void = {}
-    /// Full screen size, measured by the hosting GeometryReader — the tap-catcher is sized to
-    /// exactly this instead of an oversized guess, which was quietly corrupting this view's
-    /// reported layout size and pushing the actual card off-position/off-screen.
-    let screenSize: CGSize
-    /// Distance from the top of the screen down to the dock's own top edge. The card is
-    /// bottom-aligned inside a box exactly this tall, so it always sits flush above the dock
-    /// regardless of the dock's real height — no hand-tuned offset needed.
-    let dockTopY: CGFloat
 
     var body: some View {
-        ZStack(alignment: .top) {
-            if contextCard.isOpen {
-                if !contextCard.isCompacting {
-                    Color.clear
-                        .frame(width: screenSize.width, height: screenSize.height)
-                        .contentShape(Rectangle())
-                        .onTapGesture { if contextCard.dismissArmed { dismissContextCard() } }
-                        .onAppear {
-                            contextCard.dismissArmed = false
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                                contextCard.dismissArmed = true
-                            }
-                        }
-                }
-
-                VStack(spacing: 0) {
-                    Spacer(minLength: 0)
-                    ContextUsageCard(
-                        wordCount: wordCount,
-                        wordLimit: wordLimit,
-                        isCompacting: contextCard.isCompacting,
-                        isCompactionComplete: contextCard.isCompactionComplete,
-                        onCompact: beginContextCompaction,
-                        onClear: clearConversation,
-                        onArrowAppear: contextArrowDidAppear
-                    )
-                    .offset(y: contextCard.dragY)
-                    .gesture(contextCardDismissGesture)
-                    .padding(.bottom, 16)
-                    .transition(.asymmetric(
-                        insertion: .identity,
-                        removal: .scale(scale: 0.35, anchor: .bottom).combined(with: .opacity)
-                    ))
-                }
-                .frame(width: screenSize.width, height: max(dockTopY, 0), alignment: .bottom)
-                .allowsHitTesting(true)
-            }
-        }
-    }
-
-    private func dismissContextCard() {
-        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
-            contextCard.isOpen = false
-            contextCard.dragY = 0
-        }
+        ContextUsageCard(
+            wordCount: wordCount,
+            wordLimit: wordLimit,
+            isCompacting: contextCard.isCompacting,
+            isCompactionComplete: contextCard.isCompactionComplete,
+            onCompact: beginContextCompaction,
+            onClear: clearConversation,
+            onArrowAppear: contextArrowDidAppear
+        )
+        .offset(y: contextCard.dragY)
+        .gesture(contextCardDismissGesture)
+        .transition(.bottomDockCard)
     }
 
     private var contextCardDismissGesture: some Gesture {
@@ -199,86 +215,9 @@ struct ContextCardPopover: View {
     }
 }
 
-/// Convenience wrapper: reads the dock's measured top anchor and positions the popover
-/// correctly above it, regardless of the dock's actual height or bottom padding. Chain this
-/// directly after `.safeAreaInset(edge: .bottom) { dock }` on the same view — NOT inside the
-/// inset's own content closure.
-extension View {
-    func contextCardOverlay(
-        _ contextCard: ContextCardState,
-        wordCount: Int,
-        wordLimit: Int = 10_000,
-        onClearConversation: @escaping () -> Void = {}
-    ) -> some View {
-        overlayPreferenceValue(DockPillTopAnchorKey.self) { anchor in
-            GeometryReader { proxy in
-                if let anchor {
-                    ContextCardPopover(
-                        contextCard: contextCard,
-                        wordCount: wordCount,
-                        wordLimit: wordLimit,
-                        onClearConversation: onClearConversation,
-                        screenSize: proxy.size,
-                        dockTopY: proxy[anchor].y
-                    )
-                }
-            }
-        }
-    }
-}
-
-private struct ModelTasksPopover: View {
-    let popupState: ModelTasksPopupState
-    let modelTasks: ModelTaskQueue
-    let screenSize: CGSize
-    let dockTopY: CGFloat
-
-    var body: some View {
-        ZStack(alignment: .top) {
-            if popupState.isOpen {
-                Color.clear
-                    .frame(width: screenSize.width, height: screenSize.height)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        if popupState.dismissArmed {
-                            dismiss()
-                        }
-                    }
-                    .onAppear {
-                        popupState.dismissArmed = false
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                            popupState.dismissArmed = true
-                        }
-                    }
-            }
-
-            VStack(spacing: 0) {
-                Spacer(minLength: 0)
-                if popupState.isOpen {
-                    ModelTasksCard(modelTasks: modelTasks)
-                        .frame(width: min(345, max(screenSize.width - 32, 0)))
-                        .padding(.bottom, 16)
-                        .transition(.bottomDockCard)
-                }
-            }
-            .frame(
-                width: screenSize.width,
-                height: max(dockTopY, 0),
-                alignment: .bottom
-            )
-        }
-        .allowsHitTesting(popupState.isOpen)
-    }
-
-    private func dismiss() {
-        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
-            popupState.reset()
-        }
-    }
-}
-
 private struct ModelTasksCard: View {
     let modelTasks: ModelTaskQueue
+    @Environment(\.openModelTaskPage) private var openModelTaskPage
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -314,18 +253,24 @@ private struct ModelTasksCard: View {
                     ForEach(modelTasks.allTasks) { task in
                         ModelTaskRow(
                             task: task,
+                            onOpen: {
+                                openModelTaskPage(task)
+                            },
                             onStop: modelTasks.stopCurrent,
                             onRemove: {
                                 modelTasks.removeUpcoming(id: task.id)
                             },
                             onMove: { draggedID, placeAfterTarget in
-                                modelTasks.moveUpcoming(
+                                let didMove = modelTasks.moveUpcoming(
                                     id: draggedID,
                                     relativeTo: task.id,
                                     placeAfterTarget: placeAfterTarget
                                 )
-                                UIImpactFeedbackGenerator(style: .light)
-                                    .impactOccurred(intensity: 0.65)
+                                if didMove {
+                                    UIImpactFeedbackGenerator(style: .light)
+                                        .impactOccurred(intensity: 0.65)
+                                }
+                                return didMove
                             }
                         )
                         .transition(.opacity)
@@ -337,11 +282,12 @@ private struct ModelTasksCard: View {
         .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
         .animation(.easeInOut(duration: 0.24), value: modelTasks.allTasks)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(28)
+        .padding(32)
+        .frame(width: 355)
         .background(AquinasTheme.Colors.canvasSecondary)
-        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
+            RoundedRectangle(cornerRadius: 36, style: .continuous)
                 .stroke(AquinasTheme.Colors.darkBrown.opacity(0.08), lineWidth: 1)
         )
     }
@@ -349,9 +295,10 @@ private struct ModelTasksCard: View {
 
 private struct ModelTaskRow: View {
     let task: ModelTaskSnapshot
+    let onOpen: () -> Void
     let onStop: () -> Void
     let onRemove: () -> Void
-    let onMove: (_ draggedID: UUID, _ placeAfterTarget: Bool) -> Void
+    let onMove: (_ draggedID: UUID, _ placeAfterTarget: Bool) -> Bool
 
     @ViewBuilder
     var body: some View {
@@ -364,8 +311,7 @@ private struct ModelTaskRow: View {
                           draggedID != task.id else {
                         return false
                     }
-                    onMove(draggedID, location.y > 14)
-                    return true
+                    return onMove(draggedID, location.y > 14)
                 }
         } else {
             rowContent
@@ -374,16 +320,21 @@ private struct ModelTaskRow: View {
 
     private var rowContent: some View {
         HStack(spacing: 8) {
-            HStack(spacing: 4) {
-                taskStatusIcon
+            Button(action: onOpen) {
+                HStack(spacing: 4) {
+                    taskStatusIcon
 
-                Text(task.title)
-                    .font(.custom("Figtree-Regular", size: 14))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                    Text(task.title)
+                        .font(.custom("Figtree-Regular", size: 14))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+
+                    Spacer(minLength: 8)
+                }
             }
-
-            Spacer(minLength: 8)
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
 
             taskAction
         }
@@ -426,6 +377,7 @@ private struct ModelTaskRow: View {
             case .current:
                 Button(action: onStop) {
                     Image(systemName: "stop.circle.fill")
+                        .symbolRenderingMode(.hierarchical)
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundColor(AquinasTheme.Colors.paragraphText)
                 }
@@ -449,31 +401,259 @@ private struct ModelTaskRow: View {
     }
 }
 
-extension View {
-    func modelTasksOverlay(
-        _ popupState: ModelTasksPopupState,
-        modelTasks: ModelTaskQueue
-    ) -> some View {
-        overlayPreferenceValue(DockPillTopAnchorKey.self) { anchor in
-            GeometryReader { proxy in
-                if let anchor {
-                    ModelTasksPopover(
-                        popupState: popupState,
-                        modelTasks: modelTasks,
-                        screenSize: proxy.size,
-                        dockTopY: proxy[anchor].y
+/// Bottom-anchored vertical composition shared by every model-control surface.
+/// Its middle position is intentionally reserved for the upcoming notification cards.
+private struct ModelControlsStack<Controls: View>: View {
+    let showsScrollToBottom: Bool
+    let onScrollToBottom: () -> Void
+    let contextCard: ContextCardState?
+    let contextWordCount: Int
+    let contextWordLimit: Int
+    let onClearConversation: () -> Void
+    let modelTasksPopupState: ModelTasksPopupState?
+    let modelTasks: ModelTaskQueue?
+    let confirmationTitle: String?
+    let onConfirm: () -> Void
+    let onDecline: () -> Void
+    let controls: Controls
+    @Environment(\.modelCompletionNotifications) private var completionNotifications
+    @State private var controlsWidth: CGFloat = 315
+
+    init(
+        showsScrollToBottom: Bool = false,
+        onScrollToBottom: @escaping () -> Void = {},
+        contextCard: ContextCardState? = nil,
+        contextWordCount: Int = 0,
+        contextWordLimit: Int = aquinasContextWindowLimit,
+        onClearConversation: @escaping () -> Void = {},
+        modelTasksPopupState: ModelTasksPopupState? = nil,
+        modelTasks: ModelTaskQueue? = nil,
+        confirmationTitle: String? = nil,
+        onConfirm: @escaping () -> Void = {},
+        onDecline: @escaping () -> Void = {},
+        @ViewBuilder controls: () -> Controls
+    ) {
+        self.showsScrollToBottom = showsScrollToBottom
+        self.onScrollToBottom = onScrollToBottom
+        self.contextCard = contextCard
+        self.contextWordCount = contextWordCount
+        self.contextWordLimit = contextWordLimit
+        self.onClearConversation = onClearConversation
+        self.modelTasksPopupState = modelTasksPopupState
+        self.modelTasks = modelTasks
+        self.confirmationTitle = confirmationTitle
+        self.onConfirm = onConfirm
+        self.onDecline = onDecline
+        self.controls = controls()
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            if showsScrollToBottom {
+                ScrollToBottomStackButton(action: onScrollToBottom)
+                    .transition(.bottomDockCard)
+            }
+
+            if let completionNotifications {
+                ForEach(completionNotifications.notifications) { notification in
+                    ModelCompletionNotificationPill(
+                        title: notification.title,
+                        width: controlsWidth,
+                        onOpen: {
+                            completionNotifications.open(id: notification.id)
+                        },
+                        onDismiss: {
+                            completionNotifications.dismiss(id: notification.id)
+                        }
                     )
+                    .transition(.bottomDockCard)
                 }
             }
+
+            if let confirmationTitle {
+                ModelControlsConfirmationPill(
+                    title: confirmationTitle,
+                    width: controlsWidth,
+                    onConfirm: onConfirm,
+                    onDecline: onDecline
+                )
+                .transition(.bottomDockCard)
+            }
+
+            if let contextCard, contextCard.isOpen {
+                ContextControlsStackCard(
+                    contextCard: contextCard,
+                    wordCount: contextWordCount,
+                    wordLimit: contextWordLimit,
+                    onClearConversation: onClearConversation
+                )
+            } else if let modelTasksPopupState,
+                      modelTasksPopupState.isOpen,
+                      let modelTasks {
+                ModelTasksCard(modelTasks: modelTasks)
+                    .transition(.bottomDockCard)
+            }
+
+            controls
+                .background {
+                    GeometryReader { geometry in
+                        Color.clear.preference(
+                            key: ModelControlsWidthPreferenceKey.self,
+                            value: geometry.size.width
+                        )
+                    }
+                }
         }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .onPreferenceChange(ModelControlsWidthPreferenceKey.self) { width in
+            guard width > 0, abs(controlsWidth - width) > 0.5 else { return }
+            controlsWidth = width
+        }
+        .animation(
+            .spring(response: 0.42, dampingFraction: 0.86),
+            value: showsScrollToBottom
+        )
+        .animation(
+            .spring(response: 0.42, dampingFraction: 0.86),
+            value: contextCard?.isOpen == true
+        )
+        .animation(
+            .spring(response: 0.42, dampingFraction: 0.86),
+            value: modelTasksPopupState?.isOpen == true
+        )
+        .animation(
+            .spring(response: 0.42, dampingFraction: 0.86),
+            value: completionNotifications?.notifications.map(\.id) ?? []
+        )
+        .animation(
+            .spring(response: 0.42, dampingFraction: 0.86),
+            value: confirmationTitle
+        )
+    }
+}
+
+private struct ModelControlsConfirmationPill: View {
+    let title: String
+    let width: CGFloat
+    let onConfirm: () -> Void
+    let onDecline: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(AquinasTheme.Colors.lightGreen)
+                    .sfSymbolDrawOn()
+                    .frame(width: 18, height: 18)
+
+                Text(title)
+                    .font(AquinasTheme.Typography.uiLabel)
+                    .foregroundStyle(AquinasTheme.Colors.headingText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 12) {
+                Button("Yes", action: onConfirm)
+                    .accessibilityLabel("Confirm \(title)")
+
+                Button("No", action: onDecline)
+                    .accessibilityLabel("Decline \(title)")
+            }
+            .font(.custom("Figtree-Bold", size: 12))
+            .foregroundStyle(AquinasTheme.Colors.headingText)
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 20)
+        .frame(width: width, height: 50)
+        .background(AquinasTheme.Colors.canvasSecondary)
+        .clipShape(Capsule())
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct ModelControlsWidthPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 315
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct ModelCompletionNotificationPill: View {
+    let title: String
+    let width: CGFloat
+    let onOpen: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button(action: onOpen) {
+                HStack(spacing: 8) {
+                    Image("InsightNotificationIcon")
+                        .renderingMode(.template)
+                        .resizable()
+                        .foregroundStyle(AquinasTheme.Colors.lightGreen)
+                        .frame(width: 12, height: 12)
+
+                    Text(title)
+                        .font(AquinasTheme.Typography.uiLabel)
+                        .foregroundStyle(AquinasTheme.Colors.lightGreen)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity, minHeight: 50, alignment: .leading)
+                .padding(.leading, 20)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(AquinasTheme.Colors.paragraphText)
+                    .frame(width: 32, height: 50)
+                    .contentShape(Rectangle())
+            }
+            .padding(.trailing, 10)
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss notification")
+        }
+        .frame(width: width, height: 50)
+        .background(AquinasTheme.Colors.canvasSecondary)
+        .clipShape(Capsule())
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct ScrollToBottomStackButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "arrow.down")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundColor(Color(hex: 0xFFFAF0))
+                .frame(width: 24, height: 24)
+                .background(AquinasTheme.Colors.lightBrown)
+                .clipShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Scroll to bottom")
     }
 }
 
 // MARK: - Bottom Control Dock
 
-private struct ModelStatusButton: View {
+struct ModelStatusButton: View {
     let modelTasks: ModelTaskQueue
     let action: () -> Void
+    @AppStorage(SettingsStorageKey.modelActivityDisplay)
+    private var activityDisplay: ModelActivityDisplayOption = .detailed
 
     private var isActive: Bool {
         modelTasks.isBusy
@@ -487,17 +667,44 @@ private struct ModelStatusButton: View {
         min(modelTasks.currentPosition, max(totalTaskCount, 1))
     }
 
+    private var activeStatusText: String {
+        if modelTasks.isRuntimeLoading {
+            return modelTasks.currentTask?.funLoadingStatusText
+                ?? String(localized: "Loading...")
+        }
+        return modelTasks.currentTask?.funStatusText
+            ?? modelTasks.currentTask?.kind.standardStatusText
+            ?? String(localized: "Thinking...")
+    }
+
+    private var accessibleActiveStatusText: String {
+        if modelTasks.isRuntimeLoading {
+            return String(localized: "Loading...")
+        }
+        return modelTasks.currentTask?.kind.standardStatusText
+            ?? String(localized: "Thinking...")
+    }
+
     var body: some View {
         Button(action: action) {
             HStack(spacing: 4) {
-                if isActive && totalTaskCount > 1 {
-                    Text("\(currentTaskNumber)/\(totalTaskCount)")
-                        .monospacedDigit()
+                if activityDisplay == .detailed && isActive && totalTaskCount > 1 {
+                    ModelTaskCounter(
+                        currentTaskNumber: currentTaskNumber,
+                        totalTaskCount: totalTaskCount
+                    )
                         .transition(.scale(scale: 0.8).combined(with: .opacity))
                 }
 
                 if isActive {
-                    Text("Thinking")
+                    if activityDisplay == .compact {
+                        HStack(spacing: 3) {
+                            ForEach(0..<3, id: \.self) { _ in
+                                Circle()
+                                    .fill(AquinasTheme.Colors.lightGreen)
+                                    .frame(width: 4, height: 4)
+                            }
+                        }
                         .modifier(
                             ThinkingShimmer(
                                 isActive: true,
@@ -505,10 +712,31 @@ private struct ModelStatusButton: View {
                             )
                         )
                         .transition(.opacity)
+                    } else {
+                        Text(activeStatusText)
+                            .modifier(
+                                ThinkingShimmer(
+                                    isActive: true,
+                                    color: AquinasTheme.Colors.lightGreen
+                                )
+                            )
+                            .transition(.opacity)
+                    }
                 } else {
-                    Text("Idle")
-                        .foregroundColor(AquinasTheme.Colors.headingText)
+                    if activityDisplay == .compact {
+                        HStack(spacing: 3) {
+                            ForEach(0..<3, id: \.self) { _ in
+                                Circle()
+                                    .fill(AquinasTheme.Colors.paragraphText)
+                                    .frame(width: 4, height: 4)
+                            }
+                        }
                         .transition(.opacity)
+                    } else {
+                        Text("Idle")
+                            .foregroundColor(AquinasTheme.Colors.paragraphText)
+                            .transition(.opacity)
+                    }
                 }
             }
             .font(.custom("Figtree-SemiBold", size: 14))
@@ -525,12 +753,180 @@ private struct ModelStatusButton: View {
 
     private var accessibilityStatus: String {
         guard isActive else { return String(localized: "Model status: Idle") }
-        guard totalTaskCount > 1 else { return String(localized: "Model status: Thinking") }
+        guard totalTaskCount > 1 else {
+            return String(localized: "Model status: \(accessibleActiveStatusText)")
+        }
         return String(
-            localized: "Model status: task \(currentTaskNumber) of \(totalTaskCount), Thinking"
+            localized: "Model status: task \(currentTaskNumber) of \(totalTaskCount), \(accessibleActiveStatusText)"
         )
     }
 
+}
+
+private struct ModelTaskCounter: View {
+    let currentTaskNumber: Int
+    let totalTaskCount: Int
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text(currentTaskNumber, format: .number)
+                .contentTransition(.numericText(value: Double(currentTaskNumber)))
+                .animation(
+                    .spring(response: 0.32, dampingFraction: 0.82),
+                    value: currentTaskNumber
+                )
+
+            Text("/")
+
+            Text(totalTaskCount, format: .number)
+                .contentTransition(.numericText(value: Double(totalTaskCount)))
+                .animation(
+                    .spring(response: 0.32, dampingFraction: 0.82),
+                    value: totalTaskCount
+                )
+        }
+        .monospacedDigit()
+    }
+}
+
+/// Compact global controls for non-conversation pages. Idle model status stays out of the way
+/// here; it returns whenever the shared queue becomes active. Page-specific actions remain.
+struct PageModelControls: View {
+    let modelTasks: ModelTaskQueue
+    let popupState: ModelTasksPopupState
+    var actionTitle: String? = nil
+    var secondaryActionTitle: String? = nil
+    var secondaryAction: () -> Void = {}
+    var confirmationTitle: String? = nil
+    var onConfirm: () -> Void = {}
+    var onDecline: () -> Void = {}
+    var action: () -> Void = {}
+
+    @State private var controlScale: CGFloat = 1
+    @AppStorage(SettingsStorageKey.modelActivityDisplay)
+    private var activityDisplay: ModelActivityDisplayOption = .detailed
+
+    private var showsModelStatus: Bool {
+        modelTasks.isBusy && activityDisplay != .hidden
+    }
+
+    private var showsControlPill: Bool {
+        showsModelStatus || actionTitle != nil || secondaryActionTitle != nil
+    }
+
+    private var controlLayoutKey: String {
+        let taskKey = modelTasks.isBusy
+            ? "\(modelTasks.currentPosition)/\(modelTasks.totalCount)"
+            : "idle"
+        return "\(taskKey)|\(actionTitle ?? "")|\(secondaryActionTitle ?? "")"
+    }
+
+    var body: some View {
+        ModelControlsStack(
+            modelTasksPopupState: popupState,
+            modelTasks: modelTasks,
+            confirmationTitle: confirmationTitle,
+            onConfirm: onConfirm,
+            onDecline: onDecline
+        ) {
+            if showsControlPill {
+                HStack(
+                    alignment: .center,
+                    spacing: secondaryActionTitle == nil ? 24 : 16
+                ) {
+                    if showsModelStatus {
+                        ModelStatusButton(
+                            modelTasks: modelTasks,
+                            action: toggleModelTasksPopup
+                        )
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                    }
+
+                    if let actionTitle {
+                        PageModelControlActionButton(
+                            title: actionTitle,
+                            action: action
+                        )
+                    }
+
+                    if let secondaryActionTitle {
+                        PageModelControlActionButton(
+                            title: secondaryActionTitle,
+                            action: secondaryAction
+                        )
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                    }
+                }
+                .padding(.horizontal, secondaryActionTitle == nil ? 32 : 24)
+                .padding(.vertical, 24)
+                .fixedSize(horizontal: true, vertical: true)
+                .background(AquinasTheme.Colors.canvasSecondary)
+                .clipShape(Capsule())
+                .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
+                .scaleEffect(controlScale)
+                .transition(.scale(scale: 0.4).combined(with: .opacity))
+                .animation(.spring(response: 0.38, dampingFraction: 0.78), value: controlLayoutKey)
+            }
+        }
+        .padding(.bottom, 24)
+        .background(alignment: .bottom) {
+            LinearGradient(
+                stops: [
+                    .init(color: AquinasTheme.Colors.canvas.opacity(0.95), location: 0),
+                    .init(color: AquinasTheme.Colors.canvas.opacity(0), location: 1)
+                ],
+                startPoint: UnitPoint(x: 0.5, y: 0.52),
+                endPoint: UnitPoint(x: 0.5, y: 0)
+            )
+            .ignoresSafeArea(edges: .bottom)
+            .allowsHitTesting(false)
+        }
+        .onChange(of: controlLayoutKey) { _, _ in
+            controlScale = 1.05
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
+                controlScale = 1
+            }
+        }
+        .onChange(of: modelTasks.isBusy) { _, isBusy in
+            guard !isBusy else { return }
+            popupState.reset()
+        }
+    }
+
+    private func toggleModelTasksPopup() {
+        if !popupState.isOpen {
+            let generator = UIImpactFeedbackGenerator(style: .light)
+            generator.prepare()
+            generator.impactOccurred(intensity: 0.65)
+        }
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+            popupState.isOpen.toggle()
+        }
+    }
+}
+
+private struct PageModelControlActionButton: View {
+    let title: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: "plus")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 16, height: 16)
+
+                Text(title)
+                    .font(.custom("Figtree-SemiBold", size: 14))
+                    .contentTransition(.opacity)
+            }
+            .foregroundColor(AquinasTheme.Colors.lightGreen)
+            .frame(minHeight: 21)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+    }
 }
 
 /// A single persistent control surface whose contents adapt to Branch and Canvas mode.
@@ -563,27 +959,43 @@ struct InquiryControlDock: View {
     var isCanvasInsightLoading: Bool = false
     /// Shared serialized model work. Drives both the status control and its task popup.
     var modelTasks: ModelTaskQueue? = nil
+    var modelTasksPopupState: ModelTasksPopupState? = nil
+    var canvasSearchText: Binding<String>? = nil
+    var isCanvasSearchActive: Binding<Bool>? = nil
+    var canvasSearchResultIndex: Int = 0
+    var canvasSearchResultCount: Int = 0
+    var onCanvasSearchPrevious: () -> Void = {}
+    var onCanvasSearchNext: () -> Void = {}
+    var onCanvasSearchActivated: () -> Void = {}
     var onModelStatusTap: () -> Void = {}
+    var confirmationTitle: String? = nil
+    var onConfirm: () -> Void = {}
+    var onDecline: () -> Void = {}
     var onMidpointCenter: () -> Void = {}
     var onMidpointPlace: () -> Void = {}
     var onClearCanvasSelection: () -> Void = {}
     var contextWordCount: Int = 0
-    // Prototype word-based capacity while the real token limit is unwired.
-    var contextWordLimit: Int = 10_000
+    var contextWordLimit: Int = aquinasContextWindowLimit
     var onClearConversation: () -> Void = {}
     var onContextWillOpen: () -> Void = {}
-    /// Owned by the hosting screen; the popup itself renders elsewhere via `.contextCardOverlay(_:)`
-    /// so it isn't clipped by this dock's `.safeAreaInset` content. See `ContextCardState`.
+    /// Owned by the hosting screen so Context state survives control-layout changes.
     let contextCard: ContextCardState
 
     @State private var canvasActionDrawID = UUID()
     @State private var isScrollButtonVisible = false
     @State private var controlScale: CGFloat = 1
     @State private var addFlashOpacity: CGFloat = 1
+    @AppStorage(SettingsStorageKey.modelActivityDisplay)
+    private var activityDisplay: ModelActivityDisplayOption = .detailed
+    @FocusState private var isCanvasSearchFieldFocused: Bool
 
     /// Flash the Add button while in Select mode with an insight hovered, hinting it can be added.
     private var shouldFlashAdd: Bool {
-        hasSelectedCanvasItems && hasCanvasHover
+        canAddCanvasSelection && hasCanvasHover
+    }
+
+    private var canAddCanvasSelection: Bool {
+        hasSelectedCanvasItems && selectedCanvasItemCount < CanvasSelectionPolicy.maximumCount
     }
 
     private func startAddFlashIfNeeded() {
@@ -608,7 +1020,27 @@ struct InquiryControlDock: View {
     }
 
     private var showsModelStatusControl: Bool {
-        modelTasks != nil && !(isCanvasMode && hasCanvasInsightHover)
+        activityDisplay != .hidden
+            && modelTasks != nil
+            && !(isCanvasMode && (
+                hasCanvasInsightHover
+                    || hasSelectedCanvasItems
+                    || isMidpointMode
+            ))
+    }
+
+    private var canvasSearchIsActive: Bool {
+        isCanvasSearchActive?.wrappedValue == true
+    }
+
+    private var showsCanvasSearchControl: Bool {
+        isCanvasMode
+            && canvasSearchText != nil
+            && isCanvasSearchActive != nil
+            && !hasCanvasHover
+            && !hasSelectedCanvasItems
+            && !isMidpointMode
+            && !isCanvasInsightLoading
     }
 
     private var controlCount: Int {
@@ -616,18 +1048,21 @@ struct InquiryControlDock: View {
             return (showsModelStatusControl ? 1 : 0) + 1
         }
         if isCanvasMode && isMidpointMode {
-            return (showsModelStatusControl ? 1 : 0) + 2 + 1
+            return (showsModelStatusControl ? 1 : 0) + 2 + 1 + 1
         }
         let attachmentCount = showsAttachmentControl ? 1 : 0
         let modelStatusCount = showsModelStatusControl ? 1 : 0
+        let searchCount = showsCanvasSearchControl ? 1 : 0
         let canvasActionCount: Int
         if !isCanvasMode {
             canvasActionCount = 0
         } else if hasSelectedCanvasItems {
-            if selectedCanvasItemCount == 2 {
-                canvasActionCount = 3 // Select + Quote + Midpoint
+            if hasCanvasHover {
+                canvasActionCount = canAddCanvasSelection ? 1 : 0
+            } else if selectedCanvasItemCount == 2 {
+                canvasActionCount = 2 // Inquire + Midpoint
             } else if selectedCanvasItemCount > 2 {
-                canvasActionCount = 2 // Select + Midpoint
+                canvasActionCount = 2 // Inquire + Midpoint
             } else {
                 canvasActionCount = 1 // Select only
             }
@@ -638,28 +1073,55 @@ struct InquiryControlDock: View {
         } else {
             canvasActionCount = 0
         }
-        return attachmentCount + modelStatusCount + canvasActionCount + 1 + (showsSendButton ? 1 : 0)
+        let selectionCancelCount = isCanvasMode && hasSelectedCanvasItems ? 1 : 0
+        return attachmentCount + searchCount + modelStatusCount + canvasActionCount
+            + selectionCancelCount + 1
+            + (showsSendButton ? 1 : 0)
     }
 
     /// Captures everything that changes the dock's visible controls — including swaps that
     /// keep the same control count but change content width (e.g. the "Add" button ↔ the
     /// "Tap another Insight" hint) — so the capsule resizes with the same spring + scale bump.
     private var controlLayoutKey: String {
-        "\(controlCount)|\(modelTasks?.pendingCount ?? 0)|\(isMidpointMode ? 1 : 0)|\(isCanvasInsightLoading ? 1 : 0)|\(hasCanvasHover ? 1 : 0)|\(hasCanvasInsightHover ? 1 : 0)|\(selectedCanvasItemCount)|\(showsSendButton ? 1 : 0)"
+        "\(controlCount)|\(modelTaskCounterKey)|\(isMidpointMode ? 1 : 0)|\(isCanvasInsightLoading ? 1 : 0)|\(hasCanvasHover ? 1 : 0)|\(hasCanvasInsightHover ? 1 : 0)|\(selectedCanvasItemCount)|\(showsSendButton ? 1 : 0)|\(canvasSearchIsActive ? 1 : 0)"
+    }
+
+    /// Explicitly keys the pill's resize and 5% pulse to the fraction shown by Model Status.
+    private var modelTaskCounterKey: String {
+        guard let modelTasks, modelTasks.isBusy else { return "idle" }
+        return "\(modelTasks.currentPosition)/\(modelTasks.totalCount)"
     }
 
     var body: some View {
-        ZStack(alignment: .top) {
-            HStack(alignment: .center, spacing: 24) {
+        ModelControlsStack(
+            showsScrollToBottom: !isCanvasMode && isScrollButtonVisible,
+            onScrollToBottom: onScrollToBottom,
+            contextCard: contextCard,
+            contextWordCount: contextWordCount,
+            contextWordLimit: contextWordLimit,
+            onClearConversation: onClearConversation,
+            modelTasksPopupState: modelTasksPopupState,
+            modelTasks: modelTasks,
+            confirmationTitle: confirmationTitle,
+            onConfirm: onConfirm,
+            onDecline: onDecline
+        ) {
+            ZStack(alignment: .top) {
+                HStack(alignment: .center, spacing: 24) {
                 if showsAttachmentControl {
                     attachmentButton
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                }
+
+                if showsCanvasSearchControl {
+                    canvasSearchButton
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
 
                 if showsModelStatusControl, let modelTasks {
                     ModelStatusButton(
                         modelTasks: modelTasks,
-                        action: onModelStatusTap
+                        action: handleModelStatusTap
                     )
                     .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
@@ -676,10 +1138,12 @@ struct InquiryControlDock: View {
                     if hasSelectedCanvasItems && hasCanvasHover {
                         // Selection mode + hovering an addable insight/node:
                         // the Add button is the only control present.
-                        selectCanvasActionButton
-                            .opacity(shouldFlashAdd ? addFlashOpacity : 1)
-                            .onAppear { startAddFlashIfNeeded() }
-                            .onChange(of: shouldFlashAdd) { _, _ in startAddFlashIfNeeded() }
+                        if canAddCanvasSelection {
+                            selectCanvasActionButton
+                                .opacity(shouldFlashAdd ? addFlashOpacity : 1)
+                                .onAppear { startAddFlashIfNeeded() }
+                                .onChange(of: shouldFlashAdd) { _, _ in startAddFlashIfNeeded() }
+                        }
                     } else if hasSelectedCanvasItems {
                         // Selection mode, nothing hovered: hint (1 selected) or the
                         // selection actions (Quote + Midpoint for 2, Midpoint for 3+).
@@ -690,11 +1154,13 @@ struct InquiryControlDock: View {
                                 .fixedSize()
                                 .transition(.opacity)
                         } else if selectedCanvasItemCount == 2 {
-                            canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onInquireConnection)
+                            canvasActionButton(title: "Inquire", icon: "point.3.connected.trianglepath.dotted", action: onInquireConnection)
                                 .transition(.scale(scale: 0.4).combined(with: .opacity))
                             canvasActionButton(title: "Midpoint", icon: "graph.2d", action: onMidpointConcepts)
                                 .transition(.scale(scale: 0.4).combined(with: .opacity))
                         } else {
+                            canvasActionButton(title: "Inquire", icon: "point.3.connected.trianglepath.dotted", action: onInquireConnection)
+                                .transition(.scale(scale: 0.4).combined(with: .opacity))
                             canvasActionButton(title: "Midpoint", icon: "graph.2d", action: onMidpointConcepts)
                                 .transition(.scale(scale: 0.4).combined(with: .opacity))
                         }
@@ -713,34 +1179,41 @@ struct InquiryControlDock: View {
                     }
                 }
 
+                if isCanvasMode && hasSelectedCanvasItems {
+                    clearCanvasSelectionButton
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                }
+
                 contextButton
 
                 if showsSendButton {
                     sendButton
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
-            }
-            .padding(.horizontal, 32)
-            .padding(.vertical, 24)
-            .fixedSize(horizontal: true, vertical: true)
-            .background(AquinasTheme.Colors.canvasSecondary)
-            .clipShape(Capsule())
-            .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
-            .scaleEffect(controlScale)
-            .animation(.spring(response: 0.38, dampingFraction: 0.78), value: controlLayoutKey)
-            // Reports this pill's top-center point so the popup — rendered elsewhere via
-            // `.contextCardOverlay(_:)` to escape this dock's `.safeAreaInset` clipping —
-            // can still be positioned correctly above it.
-            .anchorPreference(key: DockPillTopAnchorKey.self, value: .top) { $0 }
+                }
+                .padding(.horizontal, 32)
+                .padding(.vertical, 24)
+                .fixedSize(horizontal: true, vertical: true)
+                .background(AquinasTheme.Colors.canvasSecondary)
+                .clipShape(Capsule())
+                .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
+                .scaleEffect(controlScale)
+                .animation(.spring(response: 0.38, dampingFraction: 0.78), value: controlLayoutKey)
+                .opacity(canvasSearchIsActive ? 0 : 1)
+                .allowsHitTesting(!canvasSearchIsActive)
 
-            if !isCanvasMode {
-                scrollToBottomButton
+                if canvasSearchIsActive, let canvasSearchText {
+                    expandedCanvasSearchBar(text: canvasSearchText)
+                        .padding(.horizontal, 16)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .center)
         .padding(.bottom, isKeyboardOpen ? 8 : 24)
         .animation(.spring(response: 0.42, dampingFraction: 0.86), value: isKeyboardOpen)
         .animation(.spring(response: 0.42, dampingFraction: 0.86), value: showsSendButton)
+        .animation(.easeInOut(duration: 0.24), value: canvasSearchIsActive)
         .background(alignment: .bottom) {
             LinearGradient(
                 stops: [
@@ -772,8 +1245,118 @@ struct InquiryControlDock: View {
         .onChange(of: hasCanvasInsightHover) { _, isHoveringInsight in
             if isHoveringInsight { dismissContextPopup() }
         }
+        .onChange(of: canvasSearchIsActive) { _, isActive in
+            if isActive {
+                DispatchQueue.main.async {
+                    isCanvasSearchFieldFocused = true
+                }
+            } else {
+                isCanvasSearchFieldFocused = false
+            }
+        }
         .onDisappear {
             contextCard.compactTask?.cancel()
+        }
+    }
+
+    private var canvasSearchButton: some View {
+        Button(action: activateCanvasSearch) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 14, weight: .regular))
+
+                Text("Search")
+                    .font(.custom("Figtree-SemiBold", size: 14))
+            }
+            .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+            .frame(minHeight: 21)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Search Insights")
+    }
+
+    private func expandedCanvasSearchBar(text: Binding<String>) -> some View {
+        HStack(spacing: 16) {
+            HStack(spacing: 8) {
+                Button(action: dismissCanvasSearch) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 14, weight: .regular))
+                        .foregroundColor(AquinasTheme.Colors.placeholderText)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close Insight search")
+
+                TextField(
+                    "",
+                    text: text,
+                    prompt: Text("Search")
+                        .foregroundColor(AquinasTheme.Colors.placeholderText)
+                )
+                .font(.custom("Figtree-SemiBold", size: 14))
+                .foregroundColor(AquinasTheme.Colors.paragraphText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.search)
+                .focused($isCanvasSearchFieldFocused)
+                .accessibilityLabel("Search Insights")
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 9) {
+                Button(action: onCanvasSearchPrevious) {
+                    Image(systemName: "arrow.left")
+                        .font(.system(size: 11, weight: .medium))
+                        .frame(width: 14, height: 14)
+                }
+                .disabled(canvasSearchResultCount == 0)
+                .accessibilityLabel("Previous search result")
+
+                Text(searchResultFraction)
+                    .font(.custom("Figtree-SemiBold", size: 14))
+                    .monospacedDigit()
+                    .fixedSize()
+
+                Button(action: onCanvasSearchNext) {
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 11, weight: .medium))
+                        .frame(width: 14, height: 14)
+                }
+                .disabled(canvasSearchResultCount == 0)
+                .accessibilityLabel("Next search result")
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(AquinasTheme.Colors.placeholderText)
+        }
+        .padding(.horizontal, 32)
+        .padding(.vertical, 24)
+        .frame(maxWidth: .infinity)
+        .background(AquinasTheme.Colors.canvasSecondary)
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
+    }
+
+    private var searchResultFraction: String {
+        guard canvasSearchResultCount > 0 else { return "0/0" }
+        return "\(max(canvasSearchResultIndex, 1))/\(canvasSearchResultCount)"
+    }
+
+    private func activateCanvasSearch() {
+        dismissContextPopup()
+        onCanvasSearchActivated()
+        withAnimation(.easeInOut(duration: 0.24)) {
+            isCanvasSearchActive?.wrappedValue = true
+        }
+        DispatchQueue.main.async {
+            isCanvasSearchFieldFocused = true
+        }
+    }
+
+    private func dismissCanvasSearch() {
+        isCanvasSearchFieldFocused = false
+        canvasSearchText?.wrappedValue = ""
+        withAnimation(.easeInOut(duration: 0.24)) {
+            isCanvasSearchActive?.wrappedValue = false
         }
     }
 
@@ -817,7 +1400,10 @@ struct InquiryControlDock: View {
             if !contextCard.isCompacting {
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.7)
                 contextCard.dragY = 0
-                if !contextCard.isOpen { onContextWillOpen() }
+                if !contextCard.isOpen {
+                    modelTasksPopupState?.reset()
+                    onContextWillOpen()
+                }
                 withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
                     contextCard.isOpen.toggle()
                 }
@@ -832,6 +1418,12 @@ struct InquiryControlDock: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Conversation context")
+    }
+
+    private func handleModelStatusTap() {
+        guard !contextCard.isCompacting else { return }
+        contextCard.reset()
+        onModelStatusTap()
     }
 
     private var contextProgress: CGFloat {
@@ -875,6 +1467,17 @@ struct InquiryControlDock: View {
         .buttonStyle(.plain)
     }
 
+    private var clearCanvasSelectionButton: some View {
+        Button(action: onClearCanvasSelection) {
+            Image(systemName: "xmark")
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 16, height: 16)
+                .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Cancel current selection")
+    }
+
     @ViewBuilder
     private var selectionCountIcon: some View {
         if selectedCanvasItemCount > 0 {
@@ -905,24 +1508,9 @@ struct InquiryControlDock: View {
         .buttonStyle(.plain)
     }
 
-    private var scrollToBottomButton: some View {
-        Button(action: onScrollToBottom) {
-            Image(systemName: "arrow.down")
-                .font(.system(size: 8, weight: .semibold))
-                .foregroundColor(Color(hex: 0xFFFAF0))
-                .frame(width: 24, height: 24)
-                .background(AquinasTheme.Colors.lightBrown)
-                .clipShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .offset(y: isScrollButtonVisible ? -36 : -28)
-        .opacity(isScrollButtonVisible ? 1 : 0)
-        .allowsHitTesting(isScrollButtonVisible)
-        .animation(.easeInOut(duration: 0.16), value: isScrollButtonVisible)
-    }
 }
 
-private struct ContextUsageIcon: View {
+struct ContextUsageIcon: View {
     let progress: CGFloat
     let color: Color
     var isSpinning: Bool = false
@@ -951,6 +1539,7 @@ private struct ContextUsageIcon: View {
                     .trim(from: 0, to: trimEnd)
                     .stroke(color, style: StrokeStyle(lineWidth: 3, lineCap: .round))
                     .rotationEffect(.degrees(-90 + angle))
+                    .animation(.easeInOut(duration: 0.65), value: progress)
             }
         }
         .frame(width: 14, height: 14)
@@ -1002,13 +1591,6 @@ private struct ContextUsageCard: View {
     private var progress: CGFloat {
         guard wordLimit > 0 else { return 0 }
         return min(max(CGFloat(wordCount) / CGFloat(wordLimit), 0), 1)
-    }
-
-    private var visualProgress: CGFloat {
-        guard wordCount > 0 else { return 0 }
-        // Prototype-only visual floor: the real word count stays accurate above,
-        // but the 10k placeholder limit makes normal conversations look empty.
-        return max(progress, 0.72)
     }
 
     private var progressTrackColor: Color {
@@ -1073,8 +1655,8 @@ private struct ContextUsageCard: View {
                                     .overlay(Capsule().stroke(progressTrackBorderColor, lineWidth: 1))
                                 Capsule()
                                     .fill(progressFillColor)
-                                    .frame(width: visualProgress > 0 ? max(geometry.size.width * visualProgress, 8) : 0)
-                                    .animation(.easeInOut(duration: 0.65), value: visualProgress)
+                                    .frame(width: progress > 0 ? max(geometry.size.width * progress, 8) : 0)
+                                    .animation(.easeInOut(duration: 0.65), value: progress)
                             }
                         }
                         .frame(height: 2)

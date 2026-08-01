@@ -4,23 +4,21 @@
 //
 
 import Foundation
+import ImageIO
+import UIKit
 
-/// The live model boundary. Implemented backend tasks use the local FastAPI service; tasks whose
-/// backend contracts are not ready yet deliberately retain the mock behavior so the current UI
-/// remains usable while the integration proceeds one seam at a time.
+/// The live model boundary. Generative tasks use the local FastAPI service and fail explicitly
+/// when it is unavailable; deterministic mock content is restricted to previews and tests.
 struct BackendAquinasModel: AquinasModel {
     private let baseURL: URL
     private let session: URLSession
-    private let fallback: MockAquinasModel
 
     init(
         baseURL: URL = AquinasBackendConfiguration.defaultBaseURL,
-        session: URLSession = .shared,
-        fallback: MockAquinasModel = MockAquinasModel()
+        session: URLSession = .shared
     ) {
         self.baseURL = baseURL
         self.session = session
-        self.fallback = fallback
     }
 
     func respond(to context: ConversationContext) async -> ModelResponse {
@@ -54,8 +52,7 @@ struct BackendAquinasModel: AquinasModel {
     ) async -> ModelResponse {
         let messages = context.backendMessages
         guard !messages.isEmpty else {
-            let response = await fallback.respond(to: context)
-            return response.withThinkingEnabled(thinkingEnabled)
+            return ModelResponse(text: "")
         }
 
         do {
@@ -64,7 +61,8 @@ struct BackendAquinasModel: AquinasModel {
                 body: ConversationResponseRequest(
                     recentMessages: messages,
                     compactedContext: context.compactedContext,
-                    thinkingEnabled: thinkingEnabled
+                    thinkingEnabled: thinkingEnabled,
+                    personality: context.personality
                 )
             )
             return ModelResponse(
@@ -76,7 +74,8 @@ struct BackendAquinasModel: AquinasModel {
                         canonicalTerm: $0.canonicalTerm,
                         contextExcerpt: $0.contextExcerpt
                     )
-                }
+                },
+                insight: response.insight?.conceptDefinition
             )
         } catch {
             logFailure(error, operation: "answer conversation")
@@ -92,11 +91,7 @@ struct BackendAquinasModel: AquinasModel {
     ) async -> ModelResponse {
         let messages = context.backendMessages
         guard !messages.isEmpty else {
-            return await fallback.respond(
-                to: context,
-                thinkingEnabled: thinkingEnabled,
-                onUpdate: onUpdate
-            )
+            return ModelResponse(text: "")
         }
 
         do {
@@ -104,9 +99,15 @@ struct BackendAquinasModel: AquinasModel {
                 messages: messages,
                 compactedContext: context.compactedContext,
                 thinkingEnabled: thinkingEnabled,
+                personality: context.personality,
                 onUpdate: onUpdate
             )
         } catch {
+            // Cancellation is an intentional user action. Do not turn it into a second,
+            // non-streaming backend request whose result will immediately be discarded.
+            guard !Task.isCancelled else {
+                return ModelResponse(text: "", thinkingSummary: [], keyTerms: [])
+            }
             logFailure(error, operation: "stream conversation")
             onUpdate(.generationStarted)
             let response = await completeResponse(
@@ -121,7 +122,10 @@ struct BackendAquinasModel: AquinasModel {
         }
     }
 
-    func defineTerm(_ term: String, in context: ConversationContext) async -> ConceptDefinition {
+    func defineTerm(
+        _ term: String,
+        in context: ConversationContext
+    ) async throws -> ConceptDefinition {
         let payload = ContextualDefinitionRequest(
             term: term,
             sourceExcerpt: context.sourceExcerpt(for: term),
@@ -138,11 +142,12 @@ struct BackendAquinasModel: AquinasModel {
                 partOfSpeech: response.partOfSpeech,
                 pronunciation: response.pronunciation,
                 meaning: response.definition.removingContextLeadIn(),
-                example: response.example
+                example: response.example,
+                context: response.context
             )
         } catch {
             logFailure(error, operation: "define term")
-            return await fallback.defineTerm(term, in: context)
+            throw AquinasModelActionError.unavailable
         }
     }
 
@@ -150,9 +155,9 @@ struct BackendAquinasModel: AquinasModel {
         _ term: String,
         in context: ConversationContext,
         conversationID: UUID?
-    ) async -> ConceptDefinition {
+    ) async throws -> ConceptDefinition {
         guard let conversationID else {
-            return await defineTerm(term, in: context)
+            return try await defineTerm(term, in: context)
         }
 
         let payload = ContextualDefinitionRequest(
@@ -171,11 +176,12 @@ struct BackendAquinasModel: AquinasModel {
                 partOfSpeech: response.partOfSpeech,
                 pronunciation: response.pronunciation,
                 meaning: response.definition.removingContextLeadIn(),
-                example: response.example
+                example: response.example,
+                context: response.context
             )
         } catch {
             logFailure(error, operation: "define cached term")
-            return await defineTerm(term, in: context)
+            return try await defineTerm(term, in: context)
         }
     }
 
@@ -203,7 +209,8 @@ struct BackendAquinasModel: AquinasModel {
                 partOfSpeech: response.partOfSpeech,
                 pronunciation: response.pronunciation,
                 meaning: response.definition.removingContextLeadIn(),
-                example: response.example
+                example: response.example,
+                context: response.context
             )
         } catch {
             logFailure(error, operation: "look up cached term")
@@ -211,7 +218,7 @@ struct BackendAquinasModel: AquinasModel {
         }
     }
 
-    func labelSubject(forTitles titles: [String]) async -> String {
+    func labelSubject(forTitles titles: [String]) async throws -> String {
         do {
             let response: BackendNodeSubjectResponse = try await post(
                 path: "insight-tree/label-node",
@@ -219,19 +226,116 @@ struct BackendAquinasModel: AquinasModel {
             )
             return response.label
         } catch {
-            return await fallback.labelSubject(forTitles: titles)
+            logFailure(error, operation: "label Node Concept")
+            throw AquinasModelActionError.unavailable
         }
     }
 
-    func blendConcepts(
+    func blendConceptCandidates(
         _ concepts: [ConceptDefinition],
         weights: [Double]
-    ) async -> ConceptDefinition {
-        await fallback.blendConcepts(concepts, weights: weights)
+    ) async throws -> [ConceptDefinition] {
+        guard concepts.count >= 2, concepts.count == weights.count else {
+            throw AquinasModelActionError.invalidRequest
+        }
+
+        do {
+            let response: MidpointCandidatesResponse = try await post(
+                path: "concept/blend",
+                body: MidpointBlendRequest(
+                    concepts: concepts.map {
+                        MidpointConceptPayload(
+                            title: $0.word,
+                            definition: $0.meaning,
+                            example: $0.example
+                        )
+                    },
+                    weights: weights
+                )
+            )
+            guard !response.candidates.isEmpty else {
+                throw BackendModelError.invalidResponse
+            }
+            return response.candidates.map {
+                ConceptDefinition(
+                    word: $0.title,
+                    partOfSpeech: $0.partOfSpeech,
+                    pronunciation: $0.pronunciation,
+                    meaning: $0.definition.removingContextLeadIn(),
+                    example: $0.example
+                )
+            }
+        } catch {
+            logFailure(error, operation: "blend Midpoint concepts")
+            throw AquinasModelActionError.unavailable
+        }
     }
 
-    func generateChildren(for concept: ConceptDefinition) async -> [ConceptDefinition] {
-        await fallback.generateChildren(for: concept)
+    func generateChildren(
+        for concept: ConceptDefinition
+    ) async throws -> [ConceptDefinition] {
+        do {
+            let response: MakeNodeChildrenResponse = try await post(
+                path: "concept/children",
+                body: MakeNodeChildrenRequest(
+                    concept: MidpointConceptPayload(
+                        title: concept.word,
+                        definition: concept.meaning,
+                        example: concept.example
+                    )
+                )
+            )
+            guard response.children.count == 3 else {
+                throw BackendModelError.invalidResponse
+            }
+            return response.children.map {
+                ConceptDefinition(
+                    word: $0.title,
+                    partOfSpeech: $0.partOfSpeech,
+                    pronunciation: $0.pronunciation,
+                    meaning: $0.definition.removingContextLeadIn(),
+                    example: $0.example
+                )
+            }
+        } catch {
+            logFailure(error, operation: "generate Make Node children")
+            throw AquinasModelActionError.unavailable
+        }
+    }
+
+    func generateQuestionOfTheDay(
+        from context: ConversationContext,
+        conversationTitle: String,
+        insights: [ConceptDefinition]
+    ) async throws -> DailyQuestionDraft {
+        let messages = context.backendMessages
+        guard !messages.isEmpty else {
+            throw AquinasModelActionError.invalidRequest
+        }
+
+        do {
+            let response: DailyQuestionResponse = try await post(
+                path: "home/question-of-the-day",
+                body: DailyQuestionRequest(
+                    conversationTitle: conversationTitle,
+                    recentMessages: messages,
+                    insights: insights.prefix(4).map {
+                        DailyQuestionInsightPayload(
+                            title: $0.word,
+                            definition: $0.semanticDefinition
+                        )
+                    }
+                )
+            )
+            return DailyQuestionDraft(
+                question: response.question,
+                reasonForAsking: response.reasonForAsking,
+                citedInsightTitle: response.citedInsightTitle
+            )
+        } catch {
+            logFailure(error, operation: "generate Question of the Day")
+            throw AquinasModelActionError.unavailable
+        }
     }
 
     private func post<Body: Encodable, Response: Decodable>(
@@ -267,6 +371,7 @@ struct BackendAquinasModel: AquinasModel {
         messages: [BackendConversationMessage],
         compactedContext: String? = nil,
         thinkingEnabled: Bool,
+        personality: ConversationPersonality,
         onUpdate: @escaping (ModelResponseUpdate) -> Void
     ) async throws -> ModelResponse {
         let endpoint = baseURL.appendingPathComponent("conversation/respond/stream")
@@ -279,7 +384,8 @@ struct BackendAquinasModel: AquinasModel {
             ConversationResponseRequest(
                 recentMessages: messages,
                 compactedContext: compactedContext,
-                thinkingEnabled: thinkingEnabled
+                thinkingEnabled: thinkingEnabled,
+                personality: personality
             )
         )
 
@@ -340,7 +446,8 @@ struct BackendAquinasModel: AquinasModel {
                             canonicalTerm: $0.canonicalTerm,
                             contextExcerpt: $0.contextExcerpt
                         )
-                    }
+                    },
+                    insight: event.insight?.conceptDefinition
                 )
                 if thinkingEnabled && !result.thinkingSummary.isEmpty {
                     onUpdate(.thinkingSummary(result.thinkingSummary))
@@ -392,7 +499,10 @@ private struct BackendNodeSubjectRequest: Encodable {
 
 private struct BackendNodeSubjectResponse: Decodable {
     let label: String
-    let summary: String
+}
+
+private struct MidpointCandidatesResponse: Decodable {
+    let candidates: [ContextualDefinitionResponse]
 }
 
 private extension ModelResponse {
@@ -403,7 +513,8 @@ private extension ModelResponse {
         return ModelResponse(
             text: text,
             thinkingSummary: [],
-            keyTerms: keyTerms
+            keyTerms: keyTerms,
+            insight: insight
         )
     }
 }
@@ -424,29 +535,67 @@ enum AquinasBackendConfiguration {
         }
         return URL(string: "http://127.0.0.1:8000")!
     }()
+
+    static var canRecoverFromCurrentDevice: Bool {
+#if targetEnvironment(simulator)
+        true
+#else
+        !isLoopback(defaultBaseURL)
+#endif
+    }
+
+    static func isLoopback(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        return host == "127.0.0.1" || host == "localhost" || host == "::1"
+    }
 }
 
 // MARK: - Conversation Mapping
 
 private extension ConversationContext {
     var backendMessages: [BackendConversationMessage] {
-        transcript.compactMap { block in
+        let messages = transcript.compactMap { block in
             switch block {
             case .text(let text):
-                return BackendConversationMessage(role: "assistant", text: text)
-            case .user(let text, _, _):
-                return BackendConversationMessage(role: "user", text: text)
+                return BackendConversationMessage(
+                    role: "assistant",
+                    text: InlineInsightMarkup.plainText(from: text),
+                    images: []
+                )
+            case .user(let text, _, let uploads):
+                return BackendConversationMessage(
+                    role: "user",
+                    text: text,
+                    images: uploads.compactMap(\.backendImagePayload)
+                )
             }
         }
         .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         .suffix(20)
+
+        // Keep multimodal requests bounded while retaining the most recently attached images,
+        // which are the ones a follow-up question is most likely to reference.
+        var remainingImageCount = 8
+        return messages.reversed().map { message in
+            let images = Array(message.images.prefix(remainingImageCount))
+            remainingImageCount -= images.count
+            return BackendConversationMessage(
+                role: message.role,
+                text: message.text,
+                images: images
+            )
+        }
+        .reversed()
         .map { $0 }
     }
 
     func sourceExcerpt(for term: String) -> String {
         for block in transcript.reversed() {
-            guard case .text(let text) = block,
-                  let termRange = text.range(
+            guard case .text(let storedText) = block else {
+                continue
+            }
+            let text = InlineInsightMarkup.plainText(from: storedText)
+            guard let termRange = text.range(
                     of: term,
                     options: [.caseInsensitive, .diacriticInsensitive]
                   ) else {
@@ -473,17 +622,61 @@ private extension ConversationContext {
 private struct BackendConversationMessage: Codable {
     let role: String
     let text: String
+    let images: [BackendConversationImage]
+}
+
+private struct BackendConversationImage: Codable {
+    let name: String
+    let mediaType: String
+    let dataBase64: String
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case mediaType = "media_type"
+        case dataBase64 = "data_base64"
+    }
+}
+
+private extension UploadedFile {
+    var backendImagePayload: BackendConversationImage? {
+        guard let imageData,
+              let source = CGImageSourceCreateWithData(imageData as CFData, nil),
+              let thumbnail = CGImageSourceCreateThumbnailAtIndex(
+                source,
+                0,
+                [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 1_536
+                ] as CFDictionary
+              ),
+              let jpegData = UIImage(cgImage: thumbnail).jpegData(
+                compressionQuality: 0.82
+              ) else {
+            return nil
+        }
+
+        return BackendConversationImage(
+            name: name,
+            mediaType: "image/jpeg",
+            dataBase64: jpegData.base64EncodedString()
+        )
+    }
 }
 
 private struct ConversationResponseRequest: Encodable {
     let recentMessages: [BackendConversationMessage]
     let compactedContext: String?
     let thinkingEnabled: Bool
+    let personality: ConversationPersonality
+    let generationMode: String = "automatic"
 
     enum CodingKeys: String, CodingKey {
         case recentMessages = "recent_messages"
         case compactedContext = "compacted_context"
         case thinkingEnabled = "thinking_enabled"
+        case personality
+        case generationMode = "generation_mode"
     }
 }
 
@@ -501,15 +694,46 @@ private struct ConversationCompactionResponse: Decodable {
     let summary: String
 }
 
+private struct DailyQuestionRequest: Encodable {
+    let conversationTitle: String
+    let recentMessages: [BackendConversationMessage]
+    let insights: [DailyQuestionInsightPayload]
+
+    enum CodingKeys: String, CodingKey {
+        case conversationTitle = "conversation_title"
+        case recentMessages = "recent_messages"
+        case insights
+    }
+}
+
+private struct DailyQuestionInsightPayload: Encodable {
+    let title: String
+    let definition: String
+}
+
+private struct DailyQuestionResponse: Decodable {
+    let question: String
+    let reasonForAsking: String
+    let citedInsightTitle: String?
+
+    enum CodingKeys: String, CodingKey {
+        case question
+        case reasonForAsking = "reason_for_asking"
+        case citedInsightTitle = "cited_insight_title"
+    }
+}
+
 private struct StructuredConversationResponse: Decodable {
     let response: String
     let thinkingSummary: [String]?
     let keyTerms: [GeneratedKeyTermResponse]
+    let insight: ContextualDefinitionResponse?
 
     enum CodingKeys: String, CodingKey {
         case response
         case thinkingSummary = "thinking_summary"
         case keyTerms = "key_terms"
+        case insight
     }
 }
 
@@ -519,6 +743,7 @@ private struct ConversationStreamEvent: Decodable {
     let response: String?
     let thinkingSummary: [String]?
     let keyTerms: [GeneratedKeyTermResponse]?
+    let insight: ContextualDefinitionResponse?
     let detail: String?
 
     enum CodingKeys: String, CodingKey {
@@ -527,6 +752,7 @@ private struct ConversationStreamEvent: Decodable {
         case response
         case thinkingSummary = "thinking_summary"
         case keyTerms = "key_terms"
+        case insight
         case detail
     }
 
@@ -545,6 +771,10 @@ private struct ConversationStreamEvent: Decodable {
         keyTerms = try? container.decode(
             [GeneratedKeyTermResponse].self,
             forKey: .keyTerms
+        )
+        insight = try? container.decode(
+            ContextualDefinitionResponse.self,
+            forKey: .insight
         )
         detail = try? container.decode(String.self, forKey: .detail)
     }
@@ -574,12 +804,32 @@ private struct ContextualDefinitionRequest: Encodable {
     }
 }
 
+private struct MidpointConceptPayload: Encodable {
+    let title: String
+    let definition: String
+    let example: String
+}
+
+private struct MidpointBlendRequest: Encodable {
+    let concepts: [MidpointConceptPayload]
+    let weights: [Double]
+}
+
+private struct MakeNodeChildrenRequest: Encodable {
+    let concept: MidpointConceptPayload
+}
+
+private struct MakeNodeChildrenResponse: Decodable {
+    let children: [ContextualDefinitionResponse]
+}
+
 private struct ContextualDefinitionResponse: Decodable {
     let title: String
     let partOfSpeech: String
     let pronunciation: String
     let definition: String
     let example: String
+    let context: String
 
     enum CodingKeys: String, CodingKey {
         case title
@@ -587,6 +837,37 @@ private struct ContextualDefinitionResponse: Decodable {
         case pronunciation
         case definition
         case example
+        case context
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        title = try container.decode(String.self, forKey: .title)
+        partOfSpeech = try container.decodeIfPresent(
+            String.self,
+            forKey: .partOfSpeech
+        ) ?? ""
+        pronunciation = try container.decodeIfPresent(
+            String.self,
+            forKey: .pronunciation
+        ) ?? ""
+        definition = try container.decode(String.self, forKey: .definition)
+        example = try container.decodeIfPresent(String.self, forKey: .example) ?? ""
+        context = try container.decodeIfPresent(String.self, forKey: .context) ?? ""
+    }
+}
+
+private extension ContextualDefinitionResponse {
+    var conceptDefinition: ConceptDefinition {
+        ConceptDefinition(
+            id: ConceptDefinition.stableID(forTerm: title),
+            word: title,
+            partOfSpeech: partOfSpeech,
+            pronunciation: pronunciation,
+            meaning: definition.removingContextLeadIn(),
+            example: example,
+            context: context
+        )
     }
 }
 

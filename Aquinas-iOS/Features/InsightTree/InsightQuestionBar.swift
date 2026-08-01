@@ -16,6 +16,7 @@ struct EphemeralMessage: Identifiable {
     var text: String
     var isComplete: Bool
     var contextInsight: InsightModel? = nil
+    var funStatusText: String? = nil
 }
 
 // MARK: - ViewModel
@@ -33,12 +34,20 @@ final class InsightQuestionBarViewModel: ObservableObject {
         messages.contains { $0.role == .assistant && $0.isComplete }
     }
 
+    var currentFunStatusText: String? {
+        guard let pendingAssistantID else { return nil }
+        return messages.first { $0.id == pendingAssistantID }?.funStatusText
+    }
+
     // Prototype response — replace with real API call when backend is wired.
     private static let simulatedResponse = """
     Thomas Aquinas is one of the most influential figures in western thought. Often referred to as the Doctor Angelicus (the Angelic Doctor), he is the primary architect of [Thomism](aq://thomism), a philosophical system that synthesized Aristotelian logic with Christian doctrine. The Didache (pronounced DID-ah-kay), also known as "The Teaching of the Twelve Apostles," is one of the most significant documents from the early Christian era. It's essentially the first church manual — a concise guide on ethics, rituals, and organizational hierarchy. It comes from the same root as the English word "didactic."
     """
 
-    func send(contextInsight: InsightModel?) {
+    func send(
+        contextInsight: InsightModel?,
+        personality: ConversationPersonality
+    ) {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isThinking else { return }
         inputText = ""
@@ -48,7 +57,14 @@ final class InsightQuestionBarViewModel: ObservableObject {
         }
         isThinking = true
 
-        let assistantMsg = EphemeralMessage(role: .assistant, text: "", isComplete: false)
+        let assistantMsg = EphemeralMessage(
+            role: .assistant,
+            text: "",
+            isComplete: false,
+            funStatusText: personality == .fun
+                ? FunModelStatusCopy.randomThinkingStatus()
+                : nil
+        )
         pendingAssistantID = assistantMsg.id
         withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
             messages.append(assistantMsg)
@@ -92,6 +108,8 @@ struct InsightQuestionBar: View {
     var expandTrigger: Int = 0
 
     @StateObject private var viewModel = InsightQuestionBarViewModel()
+    @AppStorage("aquinas.settings.conversationPersonality")
+    private var conversationPersonality: ConversationPersonality = .balanced
     @State private var isExpanded: Bool = false
     @State private var isBarOpen: Bool = false      // drives layout; focus fires after render
     @FocusState private var isInputFocused: Bool
@@ -143,9 +161,10 @@ struct InsightQuestionBar: View {
                 ZStack(alignment: isBarOpen ? .center : .leading) {
                     // Thinking shimmer overlays the (hidden) TextField in collapsed+thinking state
                     if !isBarOpen && viewModel.isThinking {
-                        Text("Thinking...")
+                        Text(viewModel.currentFunStatusText ?? "Thinking...")
                             .font(inputFont.textFont(size: conversationFontSize))
                             .modifier(ThinkingShimmer(isActive: true, color: AquinasTheme.Colors.primaryReadable))
+                            .accessibilityLabel("Thinking")
                     }
 
                     TextField("Ask Theo a question...", text: $viewModel.inputText, axis: .vertical)
@@ -424,10 +443,11 @@ struct InsightQuestionBar: View {
                 VStack(alignment: .leading, spacing: 0) {
                     // "Thinking…" shimmer → "Show Thinking >" when done
                     HStack(spacing: 6) {
-                        Text("Thinking...")
+                        Text(message.funStatusText ?? "Thinking...")
                             .font(.figtreeParagraphLarge)
                             .fontWeight(.bold)
                             .modifier(ThinkingShimmer(isActive: !message.isComplete, color: brandBrown))
+                            .accessibilityLabel("Thinking")
 
                         if message.isComplete {
                             Image(systemName: "chevron.right")
@@ -568,7 +588,10 @@ struct InsightQuestionBar: View {
             isExpanded = true
             dragOffset = 0
         }
-        viewModel.send(contextInsight: contextInsight)
+        viewModel.send(
+            contextInsight: contextInsight,
+            personality: conversationPersonality
+        )
         // Clear the pocket so follow-up questions don't inherit this insight
         contextInsight = nil
     }

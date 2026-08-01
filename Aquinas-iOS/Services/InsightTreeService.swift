@@ -59,6 +59,11 @@ struct InsightTreeAnalysisResult: Equatable {
     }
 }
 
+struct InsightTreeAssignmentResult: Equatable {
+    let nodeID: UUID
+    let didCreateNode: Bool
+}
+
 protocol InsightTreeService {
     func tree(for conversationID: UUID) async throws -> PersistedInsightTree
     func analyzeResponse(
@@ -72,7 +77,7 @@ protocol InsightTreeService {
         _ concept: ConceptDefinition,
         to conversationID: UUID,
         suggestedNodeLabel: String?
-    ) async throws
+    ) async throws -> InsightTreeAssignmentResult
     func remove(insightID: UUID, from conversationID: UUID) async throws
     func labelNode(
         nodeID: UUID,
@@ -124,19 +129,20 @@ struct BackendInsightTreeService: InsightTreeService {
         _ concept: ConceptDefinition,
         to conversationID: UUID,
         suggestedNodeLabel: String?
-    ) async throws {
-        let _: TreeAssignmentResponse = try await request(
+    ) async throws -> InsightTreeAssignmentResult {
+        let response: TreeAssignmentResponse = try await request(
             path: "insight-tree/\(conversationID.uuidString)/insights",
             method: "POST",
             body: TreeAssignmentRequest(
                 insight: TreeInsightRequest(
                     id: concept.id.uuidString,
                     title: concept.word,
-                    definition: concept.meaning
+                    definition: concept.semanticDefinition
                 ),
                 suggestedNodeLabel: suggestedNodeLabel
             )
         )
+        return try response.domainValue
     }
 
     func remove(insightID: UUID, from conversationID: UUID) async throws {
@@ -274,9 +280,25 @@ private struct ResponseTreeAnalysisResponse: Decodable {
 
 private struct TreeAssignmentResponse: Decodable {
     let conversationID: String
+    let action: String
+    let nodeID: String
 
     enum CodingKeys: String, CodingKey {
         case conversationID = "conversation_id"
+        case action
+        case nodeID = "node_id"
+    }
+
+    var domainValue: InsightTreeAssignmentResult {
+        get throws {
+            guard let nodeID = UUID(uuidString: nodeID) else {
+                throw InsightTreeServiceError.invalidIdentifier
+            }
+            return InsightTreeAssignmentResult(
+                nodeID: nodeID,
+                didCreateNode: action == "created"
+            )
+        }
     }
 }
 

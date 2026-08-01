@@ -33,6 +33,26 @@ struct UploadedFile: Identifiable, Equatable, Hashable, Codable {
     }
 }
 
+struct InsightDefinition: Identifiable, Equatable, Hashable, Codable {
+    let id: UUID
+    let context: String
+    let meaning: String
+
+    init(id: UUID? = nil, context: String, meaning: String) {
+        let cleanedContext = context.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanedMeaning = meaning.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.id = id ?? stableUUID(
+            from: "insight-definition:\(cleanedContext.lowercased()):\(cleanedMeaning.lowercased())"
+        )
+        self.context = cleanedContext
+        self.meaning = cleanedMeaning
+    }
+
+    fileprivate var deduplicationKey: String {
+        "\(context.lowercased())\u{1f}\(meaning.lowercased())"
+    }
+}
+
 struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable {
     let id: UUID
     let word: String
@@ -40,6 +60,7 @@ struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable {
     let pronunciation: String
     let meaning: String
     let example: String
+    let definitions: [InsightDefinition]
 
     init(
         id: UUID = UUID(),
@@ -47,7 +68,9 @@ struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable {
         partOfSpeech: String,
         pronunciation: String,
         meaning: String,
-        example: String
+        example: String,
+        context: String = "",
+        definitions: [InsightDefinition]? = nil
     ) {
         self.id = id
         self.word = word
@@ -55,6 +78,51 @@ struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable {
         self.pronunciation = pronunciation
         self.meaning = meaning
         self.example = example
+        self.definitions = definitions ?? (
+            meaning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? []
+                : [InsightDefinition(context: context, meaning: meaning)]
+        )
+    }
+
+    var contextualDefinitions: [InsightDefinition] {
+        definitions.isEmpty && !meaning.isEmpty
+            ? [InsightDefinition(context: "", meaning: meaning)]
+            : definitions
+    }
+
+    var semanticDefinition: String {
+        contextualDefinitions.map { definition in
+            definition.context.isEmpty
+                ? definition.meaning
+                : "\(definition.context): \(definition.meaning)"
+        }
+        .joined(separator: "\n")
+    }
+
+    func containsDefinitions(from other: ConceptDefinition) -> Bool {
+        let savedKeys = Set(contextualDefinitions.map(\.deduplicationKey))
+        let incoming = other.contextualDefinitions
+        return !incoming.isEmpty
+            && incoming.allSatisfy { savedKeys.contains($0.deduplicationKey) }
+    }
+
+    func mergingDefinitions(from other: ConceptDefinition) -> ConceptDefinition {
+        var merged = contextualDefinitions
+        var seen = Set(merged.map(\.deduplicationKey))
+        for definition in other.contextualDefinitions
+        where seen.insert(definition.deduplicationKey).inserted {
+            merged.append(definition)
+        }
+        return ConceptDefinition(
+            id: id,
+            word: word,
+            partOfSpeech: "",
+            pronunciation: "",
+            meaning: merged.first?.meaning ?? meaning,
+            example: "",
+            definitions: merged
+        )
     }
 
     /// A stable id derived from the term's canonical text, so re-defining/re-saving the same term
@@ -63,6 +131,43 @@ struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable {
     /// than the default random `id` whenever a concept originates from a highlighted term.
     static func stableID(forTerm term: String) -> UUID {
         stableUUID(from: "term:\(term.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())")
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case word
+        case partOfSpeech
+        case pronunciation
+        case meaning
+        case example
+        case definitions
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        word = try container.decode(String.self, forKey: .word)
+        partOfSpeech = try container.decodeIfPresent(String.self, forKey: .partOfSpeech) ?? ""
+        pronunciation = try container.decodeIfPresent(String.self, forKey: .pronunciation) ?? ""
+        meaning = try container.decodeIfPresent(String.self, forKey: .meaning) ?? ""
+        example = try container.decodeIfPresent(String.self, forKey: .example) ?? ""
+        definitions = try container.decodeIfPresent(
+            [InsightDefinition].self,
+            forKey: .definitions
+        ) ?? (
+            meaning.isEmpty ? [] : [InsightDefinition(context: "", meaning: meaning)]
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(word, forKey: .word)
+        try container.encode(partOfSpeech, forKey: .partOfSpeech)
+        try container.encode(pronunciation, forKey: .pronunciation)
+        try container.encode(meaning, forKey: .meaning)
+        try container.encode(example, forKey: .example)
+        try container.encode(definitions, forKey: .definitions)
     }
 }
 
@@ -80,6 +185,7 @@ enum AppPage: Equatable {
 struct ContentView: View {
     @Environment(\.aquinasModel) private var aquinasModel
     @Environment(\.embeddingProvider) private var embeddingProvider
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var questionText: String = ""
     @State private var isAtBottom: Bool = false
@@ -90,6 +196,12 @@ struct ContentView: View {
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var showCamera: Bool = false
     @State private var collectedDefinitions: [ConceptDefinition] = []
+    @State private var globalTreeInsights: [ConceptDefinition] =
+        GlobalInsightTreeStore.load()
+    @State private var isGlobalTreeUpdatePromptVisible: Bool = false
+    /// After accepting an update, Global Insights stays quiet until model work originating on a
+    /// different page completes. Global-page actions must not repeatedly re-offer the same sync.
+    @State private var suppressGlobalTreePromptUntilExternalModelCompletion: Bool = false
     @State private var activePage: AppPage = .home
     @State private var displayedPage: AppPage = .home
     @State private var isPageContentVisible: Bool = true
@@ -99,6 +211,7 @@ struct ContentView: View {
     // Set while a Study Topic's detail view is open, so the global edge-swipe
     // gesture below yields to that screen's own swipe-to-go-back gesture.
     @State private var isStudyTopicDetailVisible: Bool = false
+    @State private var isSettingsDetailVisible: Bool = false
     @State private var isConversationCanvasMode: Bool = false
     @State private var globalInsightsContextCardState = ContextCardState()
     // Live drag state for the pull-from-left-edge gesture.
@@ -110,16 +223,19 @@ struct ContentView: View {
     @State private var sideMenuCurrentTitle: String = "New Conversation"
     @State private var requestedConversationID: UUID? = nil
     @State private var requestedTopicID: UUID? = nil
+    @State private var studyTopicInsightQuoteRequest: StudyTopicInsightQuoteRequest? = nil
+    @State private var studyTopicTreeSelectionRequest: StudyTopicTreeSelectionRequest? = nil
     @State private var newConversationRequest: Int = 0
     @State private var pendingNewConversationQuestion: String = ""
     @State private var pendingNewConversationEyebrow: String = ""
+    @State private var pendingNewConversationPromptContext: String = ""
     @State private var newConversationTopicID: UUID? = nil
     @State private var newConversationIsStudyTopic: Bool = false
     @State private var deletedConversationID: UUID? = nil
     @State private var colorSchemeOverride: ColorScheme? = nil
     @State private var requestedForkConcept: ConceptDefinition? = nil
     @AppStorage("aquinas.settings.userName") private var userName: String = ""
-    @State private var customInstructions: String = ""
+    @AppStorage(SettingsStorageKey.customInstructions) private var customInstructions: String = ""
     @State private var globalInsightSelectionRequest: Int = 0
     @State private var globalInsightClearSelectionRequest: Int = 0
     @State private var globalInsightDismissHoverRequest: Int = 0
@@ -135,21 +251,43 @@ struct ContentView: View {
     @State private var globalInsightQuoteTarget: ConceptDefinition? = nil
     @State private var globalInsightIsMidpointMode: Bool = false
     @State private var globalInsightIsGenerating: Bool = false
-    @State private var globalInsightSelectedPersonality: String = "Scholarly"
+    @State private var globalInsightSelectedPersonality: String = "Balanced"
     @State private var globalInsightIsPersonalityMenuOpen: Bool = false
     @State private var globalInsightHighlightedBridge: (UUID, UUID)? = nil
     @State private var globalInsightHighlightRequest: Int = 0
+    @State private var globalInsightIsSearchActive: Bool = false
+    @State private var globalInsightSearchQuery: String = ""
+    @State private var globalInsightSearchResultIndex: Int = 0
+    @State private var globalInsightSearchResultCount: Int = 0
+    @State private var globalInsightSearchPreviousRequest: Int = 0
+    @State private var globalInsightSearchNextRequest: Int = 0
+    /// Shell-owned so model work and its popup survive page navigation.
+    @State private var modelTasks: ModelTaskQueue
+    @State private var modelTasksPopupState = ModelTasksPopupState()
+    @State private var modelCompletionNotifications = ModelCompletionNotificationCenter()
+    @State private var questionOfTheDay = HomeQuestionOfTheDayStore.loadPending()
+    @State private var dailyQuestionRefreshTask: Task<Void, Never>? = nil
+    @State private var isDailyQuestionGenerationErrorPresented: Bool = false
     @AppStorage("aquinas.settings.conversationFontSize") private var conversationFontSize: ConversationFontSizeOption = .small
-    @State private var inputTextAlignment: InputTextAlignmentOption = .center
-    @State private var inputFont: ConversationFontOption = .serif
+    @AppStorage("aquinas.settings.inputTextAlignment") private var inputTextAlignment: InputTextAlignmentOption = .center
+    @AppStorage("aquinas.settings.inputFont") private var inputFont: ConversationFontOption = .serif
     @AppStorage("aquinas.settings.responseTextAlignment") private var responseTextAlignment: ResponseTextAlignmentOption = .center
-    @State private var responseFont: ConversationFontOption = .sans
+    @AppStorage("aquinas.settings.responseFont") private var responseFont: ConversationFontOption = .sans
+    @AppStorage("aquinas.settings.conversationPersonality") private var conversationPersonality: ConversationPersonality = .balanced
 
 
-    let canvasColor = AquinasTheme.Colors.canvasSecondary
+    let canvasColor = AquinasTheme.Colors.canvas
     private let pageFadeDuration: TimeInterval = 0.25
     private let pageFadePauseDuration: TimeInterval = 0.15
     private let pageTransitionOffset: CGFloat = 8
+
+    init() {
+        _modelTasks = State(initialValue: ModelTaskQueue())
+    }
+
+    init(modelTasks: ModelTaskQueue) {
+        _modelTasks = State(initialValue: modelTasks)
+    }
 
     private var rootSafeAreaColor: Color {
         activePage == .conversation && isConversationCanvasMode
@@ -165,26 +303,60 @@ struct ContentView: View {
     }
 
     private var globalInsightContextWordCount: Int {
-        collectedDefinitions
+        globalTreeInsights
             .flatMap { [$0.word, $0.meaning, $0.example] }
             .joined(separator: " ")
             .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
             .count
     }
 
+    private func openModelTaskPage(_ task: ModelTaskSnapshot) {
+        let page: AppPage
+        switch task.originPage {
+        case .home:
+            page = .home
+        case .conversation:
+            page = .conversation
+        case .openConversations:
+            page = .openConversations
+        case .settings:
+            page = .settings
+        case .insights:
+            page = .insights
+        case .studyTopics:
+            page = .studyTopics
+        }
+
+        modelTasksPopupState.reset()
+        guard activePage != page else { return }
+        activePage = page
+    }
+
     @ViewBuilder private var insightTreePage: some View {
         InsightTreeView(
-            insights: collectedDefinitions,
+            insights: globalTreeInsights,
             selectionRequest: globalInsightSelectionRequest,
             clearSelectionRequest: globalInsightClearSelectionRequest,
             dismissHoverRequest: globalInsightDismissHoverRequest,
             createConceptRequest: globalInsightCreateConceptRequest,
             promotedInsightIDs: globalInsightPromotedIDs,
             onRemoveInsight: { def in
-                withAnimation { collectedDefinitions.removeAll { $0.id == def.id } }
+                withAnimation {
+                    collectedDefinitions.removeAll { $0.id == def.id }
+                    globalTreeInsights.removeAll { $0.id == def.id }
+                }
+                GlobalInsightTreeStore.save(globalTreeInsights)
             },
             onRestoreInsight: { def in
-                withAnimation { collectedDefinitions.append(def) }
+                withAnimation {
+                    if !collectedDefinitions.contains(where: { $0.id == def.id }) {
+                        collectedDefinitions.append(def)
+                    }
+                    if !globalTreeInsights.contains(where: { $0.id == def.id }) {
+                        globalTreeInsights.append(def)
+                    }
+                }
+                GlobalInsightTreeStore.save(globalTreeInsights)
             },
             onForkInsight: { def in
                 requestedForkConcept = def
@@ -208,7 +380,8 @@ struct ContentView: View {
                 }
             },
             inquireConnectionRequest: globalInsightInquireConnectionRequest,
-            onInquireConnectionConcepts: { first, _ in
+            onInquireConnectionConcepts: { concepts in
+                guard let first = concepts.first else { return }
                 requestedForkConcept = first
                 withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
                     activePage = .conversation
@@ -217,6 +390,13 @@ struct ContentView: View {
             midpointEnterRequest: globalInsightMidpointEnterRequest,
             midpointCenterRequest: globalInsightMidpointCenterRequest,
             midpointPlaceRequest: globalInsightMidpointPlaceRequest,
+            searchQuery: globalInsightSearchQuery,
+            searchPreviousRequest: globalInsightSearchPreviousRequest,
+            searchNextRequest: globalInsightSearchNextRequest,
+            onSearchResultsChange: { current, total in
+                globalInsightSearchResultIndex = current
+                globalInsightSearchResultCount = total
+            },
             highlightedInsightPair: globalInsightHighlightedBridge,
             highlightPairRequest: globalInsightHighlightRequest,
             startsMidpointForHighlightedPair: true,
@@ -225,6 +405,7 @@ struct ContentView: View {
             inputFont: inputFont,
             conversationFontSize: conversationFontSize,
             showQuestionBar: false,
+            modelTasks: modelTasks,
             model: aquinasModel,
             embeddingProvider: embeddingProvider
         )
@@ -242,6 +423,12 @@ struct ContentView: View {
                 isMidpointMode: globalInsightIsMidpointMode,
                 isCanvasInsightLoading: globalInsightIsGenerating,
                 contextWordCount: globalInsightContextWordCount,
+                modelTasks: modelTasks,
+                modelTasksPopupState: modelTasksPopupState,
+                searchText: $globalInsightSearchQuery,
+                isSearchActive: $globalInsightIsSearchActive,
+                searchResultIndex: globalInsightSearchResultIndex,
+                searchResultCount: globalInsightSearchResultCount,
                 onSelectCanvasItem: { globalInsightSelectionRequest += 1 },
                 onCreateCanvasConcept: { globalInsightCreateConceptRequest += 1 },
                 onInquireConnection: { globalInsightInquireConnectionRequest += 1 },
@@ -255,15 +442,23 @@ struct ContentView: View {
                 onMidpointConcepts: { globalInsightMidpointEnterRequest += 1 },
                 onMidpointCenter: { globalInsightMidpointCenterRequest += 1 },
                 onMidpointPlace: { globalInsightMidpointPlaceRequest += 1 },
+                onSearchPrevious: { globalInsightSearchPreviousRequest += 1 },
+                onSearchNext: { globalInsightSearchNextRequest += 1 },
+                onSearchActivated: {
+                    globalInsightsContextCardState.reset()
+                    modelTasksPopupState.reset()
+                    globalInsightDismissHoverRequest += 1
+                },
                 onClearCanvasSelection: { globalInsightClearSelectionRequest += 1 },
                 onContextWillOpen: { globalInsightDismissHoverRequest += 1 },
+                confirmationTitle: isGlobalTreeUpdatePromptVisible
+                    ? "Update Global Insights Tree?"
+                    : nil,
+                onConfirmUpdate: updateGlobalInsightTree,
+                onDeclineUpdate: dismissGlobalInsightTreeUpdate,
                 contextCard: globalInsightsContextCardState
             )
         }
-        .contextCardOverlay(
-            globalInsightsContextCardState,
-            wordCount: globalInsightContextWordCount
-        )
         .background(canvasColor)
         .ignoresSafeArea(.container)  // edges/notch only — keyboard safe area is respected
     }
@@ -278,6 +473,15 @@ struct ContentView: View {
                 }
             },
             onCanvasModeChange: { isConversationCanvasMode = $0 },
+            onRequestConversationPage: {
+                activePage = .conversation
+            },
+            onReturnToStudyTopicTree: { request in
+                requestedTopicID = request.topicID
+                studyTopicTreeSelectionRequest = request
+                activePage = .studyTopics
+            },
+            onQuestionOfTheDayAnswered: markQuestionOfTheDayAnswered,
             collectedDefinitions: $collectedDefinitions,
             sideMenuConversations: $sideMenuConversations,
             sideMenuCurrentTitle: $sideMenuCurrentTitle,
@@ -286,16 +490,22 @@ struct ContentView: View {
             newConversationRequest: $newConversationRequest,
             pendingNewConversationQuestion: $pendingNewConversationQuestion,
             pendingNewConversationEyebrow: $pendingNewConversationEyebrow,
+            pendingNewConversationPromptContext: $pendingNewConversationPromptContext,
             newConversationTopicID: $newConversationTopicID,
             newConversationIsStudyTopic: $newConversationIsStudyTopic,
             deletedConversationID: $deletedConversationID,
             requestedForkConcept: $requestedForkConcept,
+            studyTopicInsightQuoteRequest: $studyTopicInsightQuoteRequest,
             conversationFontSize: conversationFontSize,
             inputTextAlignment: inputTextAlignment,
             inputFont: inputFont,
             responseTextAlignment: responseTextAlignment,
             responseFont: responseFont,
+            conversationPersonality: $conversationPersonality,
             userName: userName,
+            isPageVisible: activePage == .conversation,
+            modelTasks: modelTasks,
+            modelTasksPopupState: modelTasksPopupState,
             uploadedFiles: $uploadedFiles,
             showFilePicker: $showFilePicker
         )
@@ -309,7 +519,17 @@ struct ContentView: View {
                     .animation(.easeInOut(duration: 0.2), value: isConversationCanvasMode)
 
                 VStack(spacing: 0) {
-                    VStack(spacing: 0) {
+                    ZStack {
+                        // Do not keep the UIKit-backed editor and its geometry preferences in the
+                        // layout tree while another page is visible. An opacity-only hiding path
+                        // left that tree active and could drive a runaway AttributeGraph update
+                        // loop on device. Model work itself is owned by the shell-level queue.
+                        if displayedPage == .conversation {
+                            conversationView
+                            .opacity(isPageContentVisible ? 1 : 0)
+                            .offset(y: pageContentOffsetY)
+                        }
+
                         Group {
                             switch displayedPage {
                             case .home:
@@ -318,6 +538,7 @@ struct ContentView: View {
                                     activeConversationID: sideMenuActiveConversationID,
                                     savedInsights: collectedDefinitions,
                                     userName: userName,
+                                    questionOfTheDay: questionOfTheDay,
                                     onOpenMenu: {
                                         dismissKeyboard()
                                         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
@@ -332,9 +553,11 @@ struct ContentView: View {
                                         newConversationRequest += 1
                                         activePage = .conversation
                                     },
-                                    onStartQuestion: { question in
-                                        pendingNewConversationQuestion = question
+                                    onStartQuestion: { dailyQuestion in
+                                        pendingNewConversationQuestion = dailyQuestion.question
                                         pendingNewConversationEyebrow = "QUESTION OF THE DAY"
+                                        pendingNewConversationPromptContext =
+                                            dailyQuestion.taggedPromptContext
                                         newConversationRequest += 1
                                         activePage = .conversation
                                     },
@@ -345,30 +568,39 @@ struct ContentView: View {
                                     },
                                     onRefresh: refreshPersistedContent
                                 )
+                                .safeAreaInset(edge: .bottom) {
+                                    PageModelControls(
+                                        modelTasks: modelTasks,
+                                        popupState: modelTasksPopupState,
+                                        actionTitle: "New Conversation",
+                                        action: {
+                                            newConversationRequest += 1
+                                            activePage = .conversation
+                                        }
+                                    )
+                                    .background(alignment: .bottom) {
+                                        LinearGradient(
+                                            colors: [
+                                                AquinasTheme.Colors.canvas.opacity(0),
+                                                AquinasTheme.Colors.canvas
+                                            ],
+                                            startPoint: .top,
+                                            endPoint: .bottom
+                                        )
+                                        .frame(height: 350)
+                                        .allowsHitTesting(false)
+                                    }
+                                }
                             case .conversation:
-                                conversationView
-                                // ActiveInquiryView(
-                                //     activePage: $activePage,
-                                //     sideMenuConversations: $sideMenuConversations,
-                                //     sideMenuActiveConversationID: $sideMenuActiveConversationID,
-                                //     sideMenuCurrentTitle: $sideMenuCurrentTitle,
-                                //     requestedConversationID: $requestedConversationID,
-                                //     newConversationRequest: $newConversationRequest,
-                                //     requestedForkConcept: $requestedForkConcept,
-                                //     colorSchemeOverride: $colorSchemeOverride,
-                                //     isAtBottom: $isAtBottom,
-                                //     showFilePicker: $showFilePicker,
-                                //     showPhotoPicker: $showPhotoPicker,
-                                //     showCamera: $showCamera,
-                                //     questionText: $questionText,
-                                //     uploadedFiles: $uploadedFiles,
-                                //     collectedDefinitions: $collectedDefinitions
-                                // )
+                                Color.clear
+                                    .allowsHitTesting(false)
                             case .openConversations:
                                 OpenConversationsView(
                                     conversations: sideMenuConversations,
                                     activeConversationID: sideMenuActiveConversationID,
                                     savedInsights: $collectedDefinitions,
+                                    modelTasks: modelTasks,
+                                    modelTasksPopupState: modelTasksPopupState,
                                     onOpenMenu: {
                                         dismissKeyboard()
                                         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
@@ -413,13 +645,21 @@ struct ContentView: View {
                                     inputFont: $inputFont,
                                     responseTextAlignment: $responseTextAlignment,
                                     responseFont: $responseFont,
+                                    conversationPersonality: $conversationPersonality,
                                     onOpenMenu: {
                                         dismissKeyboard()
                                         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
                                             isGlobalSideMenuOpen = true
                                         }
-                                    }
+                                    },
+                                    onDetailVisibilityChange: { isSettingsDetailVisible = $0 }
                                 )
+                                .safeAreaInset(edge: .bottom) {
+                                    PageModelControls(
+                                        modelTasks: modelTasks,
+                                        popupState: modelTasksPopupState
+                                    )
+                                }
                             case .insights:
                                 insightTreePage
                             case .studyTopics:
@@ -427,6 +667,8 @@ struct ContentView: View {
                                     conversations: sideMenuConversations,
                                     activeConversationID: sideMenuActiveConversationID,
                                     savedInsights: $collectedDefinitions,
+                                    modelTasks: modelTasks,
+                                    modelTasksPopupState: modelTasksPopupState,
                                     onOpenMenu: {
                                         dismissKeyboard()
                                         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
@@ -444,6 +686,14 @@ struct ContentView: View {
                                     onNewChatInTopic: { topicID in
                                         newConversationTopicID = topicID
                                         newConversationRequest += 1
+                                        activePage = .conversation
+                                    },
+                                    onQuoteInsightIntoConversation: { conversation, insight, topicID in
+                                        studyTopicInsightQuoteRequest = StudyTopicInsightQuoteRequest(
+                                            topicID: topicID,
+                                            conversationID: conversation.id,
+                                            insight: insight
+                                        )
                                         activePage = .conversation
                                     },
                                     onAttachConversationToTopic: { conversation, topicID in
@@ -465,6 +715,10 @@ struct ContentView: View {
                                         deleteConversation(conversation)
                                     },
                                     requestedTopicID: requestedTopicID,
+                                    requestedTreeSelection: studyTopicTreeSelectionRequest,
+                                    onConsumeTreeSelectionRequest: {
+                                        studyTopicTreeSelectionRequest = nil
+                                    },
                                     onRefresh: refreshPersistedContent,
                                     onDetailVisibilityChange: { isVisible in
                                         isStudyTopicDetailVisible = isVisible
@@ -472,6 +726,9 @@ struct ContentView: View {
                                 )
                             }
                         }
+                        .opacity(displayedPage == .conversation ? 0 : 1)
+                        .allowsHitTesting(displayedPage != .conversation)
+                        .accessibilityHidden(displayedPage == .conversation)
                         .opacity(isPageContentVisible ? 1 : 0)
                         .offset(y: pageContentOffsetY)
                     }
@@ -489,6 +746,9 @@ struct ContentView: View {
                             // A Study Topic's detail view owns the swipe-to-go-back gesture
                             // while it's open — don't compete with it for the same drag.
                             guard !(activePage == .studyTopics && isStudyTopicDetailVisible) else { return }
+                            // Settings submenus use the same leading-edge gesture to navigate
+                            // back within their own NavigationStack.
+                            guard !(activePage == .settings && isSettingsDetailVisible) else { return }
                             guard abs(value.translation.width) > abs(value.translation.height) else { return }
                             if !isDraggingToOpenMenu {
                                 guard value.translation.width > 0 else { return }
@@ -651,7 +911,8 @@ struct ContentView: View {
                         conversations: sideMenuConversations,
                         activeConversationID: sideMenuActiveConversationID,
                         activePage: activePage,
-                        selectedPersonality: "Friendly",
+                        modelTasks: modelTasks,
+                        selectedPersonality: conversationPersonality.displayName,
                         isPresented: isGlobalSideMenuOpen,
                         onNewChat: {
                             dismissGlobalSideMenu {
@@ -730,6 +991,10 @@ struct ContentView: View {
                         : (-345 + min(345, max(0, sideMenuDragOffset))))
                     .opacity(isGlobalSideMenuOpen || isDraggingToOpenMenu ? 1 : 0.96)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    // The outer alignment frame covers the whole screen even while the panel is
+                    // translated offscreen. Disable it while closed so it cannot swallow taps
+                    // intended for the visible page underneath.
+                    .allowsHitTesting(isGlobalSideMenuOpen || isDraggingToOpenMenu)
                     // Guaranteed topmost: a direct ZStack sibling (not a nested
                     // .overlay()) so this zIndex is actually compared against the
                     // page content's zIndex, rather than being the sole child of
@@ -740,8 +1005,29 @@ struct ContentView: View {
             }
             .ignoresSafeArea(.container, edges: .bottom)
         }
+        .environment(
+            \.modelCompletionNotifications,
+            modelCompletionNotifications
+        )
+        .environment(\.openModelTaskPage, openModelTaskPage)
         .preferredColorScheme(colorSchemeOverride)
+        .alert(
+            "Couldn’t generate Question of the Day",
+            isPresented: $isDailyQuestionGenerationErrorPresented
+        ) {
+            Button("Cancel", role: .cancel) { }
+            Button("Try Again") {
+                scheduleDailyQuestionRefreshIfNeeded(minimumDelay: 0)
+            }
+        } message: {
+            Text("No placeholder question was created. Check that the Aquinas backend is available and try again.")
+        }
         .onAppear {
+            modelTasks.setPersonality(conversationPersonality)
+            modelTasks.setApplicationActive(scenePhase == .active)
+            modelTasks.updateThermalPressure(
+                ProcessInfo.processInfo.thermalState.modelRuntimePressure
+            )
             loadShellConversationState()
             displayedPage = activePage
             isPageContentVisible = true
@@ -750,12 +1036,70 @@ struct ContentView: View {
             if !savedInsights.isEmpty {
                 collectedDefinitions = savedInsights
             }
+            questionOfTheDay = HomeQuestionOfTheDayStore.loadPending()
+            Task { @MainActor in
+                await Task.yield()
+                scheduleDailyQuestionRefreshIfNeeded()
+            }
         }
         .onChange(of: activePage) { oldValue, newValue in
+            modelTasksPopupState.reset()
+            if oldValue == .insights, newValue != .insights {
+                isGlobalTreeUpdatePromptVisible = false
+                globalInsightIsSearchActive = false
+                globalInsightSearchQuery = ""
+                globalInsightSearchResultIndex = 0
+                globalInsightSearchResultCount = 0
+            }
+            if newValue == .insights {
+                refreshGlobalInsightTreeUpdatePrompt()
+            }
             transitionDisplayedPage(to: newValue)
+            scheduleDailyQuestionRefreshIfNeeded()
+        }
+        .onChange(of: modelTasks.isBusy) { _, _ in
+            scheduleDailyQuestionRefreshIfNeeded()
+        }
+        .onChange(of: modelTasks.latestCompletedTask) { _, completedTask in
+            guard let completedTask, completedTask.originPage != .insights else { return }
+            suppressGlobalTreePromptUntilExternalModelCompletion = false
+            guard activePage == .insights else { return }
+            refreshGlobalInsightTreeUpdatePrompt()
+        }
+        .onChange(of: conversationPersonality) { _, personality in
+            modelTasks.setPersonality(personality)
+        }
+        .onChange(of: sideMenuConversations) { _, _ in
+            scheduleDailyQuestionRefreshIfNeeded()
+        }
+        .onChange(of: collectedDefinitions) { _, _ in
+            scheduleDailyQuestionRefreshIfNeeded()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            modelTasks.setApplicationActive(phase == .active)
+            scheduleDailyQuestionRefreshIfNeeded()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication.didReceiveMemoryWarningNotification
+            )
+        ) { _ in
+            modelTasks.handleMemoryPressure()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: ProcessInfo.thermalStateDidChangeNotification
+            )
+        ) { _ in
+            modelTasks.updateThermalPressure(
+                ProcessInfo.processInfo.thermalState.modelRuntimePressure
+            )
         }
         .onChange(of: collectedDefinitions) { oldValue, newValue in
             InsightLibraryStore.save(newValue)
+            guard activePage == .insights,
+                  !suppressGlobalTreePromptUntilExternalModelCompletion else { return }
+            isGlobalTreeUpdatePromptVisible = globalTreeNeedsUpdate
         }
     }
 
@@ -775,6 +1119,114 @@ struct ContentView: View {
             sideMenuDragOffset = 0
         } completion: {
             action()
+        }
+    }
+
+    private func markQuestionOfTheDayAnswered() {
+        guard let questionOfTheDay else { return }
+        HomeQuestionOfTheDayStore.save(questionOfTheDay.markingAnswered())
+        withAnimation(.easeInOut(duration: 0.25)) {
+            self.questionOfTheDay = nil
+        }
+        scheduleDailyQuestionRefreshIfNeeded()
+    }
+
+    private func scheduleDailyQuestionRefreshIfNeeded(
+        minimumDelay: TimeInterval = 15
+    ) {
+        guard activePage != .conversation else {
+            dailyQuestionRefreshTask?.cancel()
+            dailyQuestionRefreshTask = nil
+            return
+        }
+        guard scenePhase == .active,
+              !modelTasks.isBusy else {
+            dailyQuestionRefreshTask?.cancel()
+            dailyQuestionRefreshTask = nil
+            return
+        }
+        guard dailyQuestionRefreshTask == nil,
+              !modelTasks.contains(where: {
+                  $0.kind == .refreshQuestionOfTheDay
+              }) else {
+            return
+        }
+
+        let eligibilityDate = HomeQuestionOfTheDayStore.nextEligibleRefreshDate()
+        let delay = max(minimumDelay, eligibilityDate.timeIntervalSinceNow)
+        dailyQuestionRefreshTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .seconds(delay))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  activePage != .conversation,
+                  scenePhase == .active,
+                  !modelTasks.isBusy else {
+                dailyQuestionRefreshTask = nil
+                return
+            }
+
+            questionOfTheDay = HomeQuestionOfTheDayStore.loadPending()
+            guard questionOfTheDay == nil,
+                  HomeQuestionOfTheDayStore.isEligibleForRefresh(),
+                  let source = DailyQuestionSourceSelector.select(
+                      conversations: sideMenuConversations,
+                      activeConversationID: sideMenuActiveConversationID,
+                      savedInsights: collectedDefinitions
+                  ) else {
+                dailyQuestionRefreshTask = nil
+                scheduleDailyQuestionRefreshIfNeeded()
+                return
+            }
+
+            dailyQuestionRefreshTask = nil
+            modelTasks.enqueue(
+                kind: .refreshQuestionOfTheDay,
+                originPage: .home,
+                priority: .background
+            ) {
+                let draft: DailyQuestionDraft
+                do {
+                    draft = try await aquinasModel.generateQuestionOfTheDay(
+                        from: source.context,
+                        conversationTitle: source.conversation.title,
+                        insights: Array(source.insights.prefix(4))
+                    )
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    isDailyQuestionGenerationErrorPresented = true
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                let trimmedQuestion = draft.question.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+                guard !trimmedQuestion.isEmpty else { return }
+
+                let citedInsight = draft.citedInsightTitle.flatMap { citedTitle in
+                    source.insights.first {
+                        $0.word.compare(
+                            citedTitle,
+                            options: [.caseInsensitive, .diacriticInsensitive]
+                        ) == .orderedSame
+                    }
+                }
+                let generated = HomeQuestionOfTheDay(
+                    question: trimmedQuestion,
+                    reasonForAsking: draft.reasonForAsking.trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    ),
+                    citedInsight: citedInsight,
+                    sourceConversationID: source.conversation.id,
+                    sourceConversationTitle: source.conversation.title
+                )
+                HomeQuestionOfTheDayStore.save(generated)
+                withAnimation(.easeInOut(duration: 0.35)) {
+                    questionOfTheDay = generated
+                }
+            }
         }
     }
 
@@ -841,6 +1293,34 @@ struct ContentView: View {
         }
 
         collectedDefinitions = InsightLibraryStore.load()
+    }
+
+    private var globalTreeNeedsUpdate: Bool {
+        Set(globalTreeInsights.uniquedByWord())
+            != Set(collectedDefinitions.uniquedByWord())
+    }
+
+    private func refreshGlobalInsightTreeUpdatePrompt() {
+        isGlobalTreeUpdatePromptVisible = !suppressGlobalTreePromptUntilExternalModelCompletion
+            && globalTreeNeedsUpdate
+    }
+
+    private func updateGlobalInsightTree() {
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+            globalTreeInsights = collectedDefinitions.uniquedByWord()
+            isGlobalTreeUpdatePromptVisible = false
+            suppressGlobalTreePromptUntilExternalModelCompletion = true
+        }
+        GlobalInsightTreeStore.save(globalTreeInsights)
+        globalInsightsContextCardState.reset()
+        modelTasksPopupState.reset()
+        UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.7)
+    }
+
+    private func dismissGlobalInsightTreeUpdate() {
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+            isGlobalTreeUpdatePromptVisible = false
+        }
     }
 
     private func deleteConversation(_ conversation: InquiryConversation) {
@@ -937,6 +1417,23 @@ struct ContentView: View {
     }
 }
 
+private extension ProcessInfo.ThermalState {
+    var modelRuntimePressure: ModelRuntimeThermalPressure {
+        switch self {
+        case .nominal:
+            return .nominal
+        case .fair:
+            return .fair
+        case .serious:
+            return .serious
+        case .critical:
+            return .critical
+        @unknown default:
+            return .serious
+        }
+    }
+}
+
 private struct GlobalInsightsModelControls: View {
     @Binding var showFilePicker: Bool
     @Binding var showPhotoPicker: Bool
@@ -950,6 +1447,12 @@ private struct GlobalInsightsModelControls: View {
     let isMidpointMode: Bool
     let isCanvasInsightLoading: Bool
     let contextWordCount: Int
+    let modelTasks: ModelTaskQueue
+    let modelTasksPopupState: ModelTasksPopupState
+    @Binding var searchText: String
+    @Binding var isSearchActive: Bool
+    let searchResultIndex: Int
+    let searchResultCount: Int
     var onSelectCanvasItem: () -> Void
     var onCreateCanvasConcept: () -> Void
     var onInquireConnection: () -> Void
@@ -957,8 +1460,14 @@ private struct GlobalInsightsModelControls: View {
     var onMidpointConcepts: () -> Void
     var onMidpointCenter: () -> Void
     var onMidpointPlace: () -> Void
+    var onSearchPrevious: () -> Void
+    var onSearchNext: () -> Void
+    var onSearchActivated: () -> Void
     var onClearCanvasSelection: () -> Void
     var onContextWillOpen: () -> Void
+    let confirmationTitle: String?
+    var onConfirmUpdate: () -> Void
+    var onDeclineUpdate: () -> Void
     let contextCard: ContextCardState
 
     var body: some View {
@@ -984,14 +1493,44 @@ private struct GlobalInsightsModelControls: View {
             onMidpointConcepts: onMidpointConcepts,
             isMidpointMode: isMidpointMode,
             isCanvasInsightLoading: isCanvasInsightLoading,
+            modelTasks: modelTasks,
+            modelTasksPopupState: modelTasksPopupState,
+            canvasSearchText: $searchText,
+            isCanvasSearchActive: $isSearchActive,
+            canvasSearchResultIndex: searchResultIndex,
+            canvasSearchResultCount: searchResultCount,
+            onCanvasSearchPrevious: onSearchPrevious,
+            onCanvasSearchNext: onSearchNext,
+            onCanvasSearchActivated: onSearchActivated,
+            onModelStatusTap: {
+                globalModelStatusTap()
+            },
+            confirmationTitle: confirmationTitle,
+            onConfirm: onConfirmUpdate,
+            onDecline: onDeclineUpdate,
             onMidpointCenter: onMidpointCenter,
             onMidpointPlace: onMidpointPlace,
             onClearCanvasSelection: onClearCanvasSelection,
             contextWordCount: contextWordCount,
             onClearConversation: {},
-            onContextWillOpen: onContextWillOpen,
+            onContextWillOpen: {
+                modelTasksPopupState.reset()
+                onContextWillOpen()
+            },
             contextCard: contextCard
         )
+    }
+
+    private func globalModelStatusTap() {
+        contextCard.reset()
+        if !modelTasksPopupState.isOpen {
+            let generator = UIImpactFeedbackGenerator(style: .light)
+            generator.prepare()
+            generator.impactOccurred(intensity: 0.65)
+        }
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+            modelTasksPopupState.isOpen.toggle()
+        }
     }
 }
 

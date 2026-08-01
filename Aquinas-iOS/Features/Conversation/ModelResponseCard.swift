@@ -21,13 +21,20 @@ struct ModelResponseCard: View {
     let isQueuedForModel: Bool
     let usesNetworkStream: Bool
     let thinkingSummary: [String]
+    let funStatusText: String?
     let responseTextAlignment: ResponseTextAlignmentOption
     let responseFont: ConversationFontOption
     let conversationFontSize: ConversationFontSizeOption
     let loadingInsightKey: String?
     let queuedInsightKeys: Set<String>
+    let savedInsightIDs: Set<UUID>
     var onDuplicateBranch: (() -> Void)? = nil
     var onInsightTap: ((String, String) -> Void)? = nil
+    var onInlineInsightQuote: ((ConceptDefinition) -> Void)? = nil
+    var onInlineInsightFork: ((ConceptDefinition) -> Void)? = nil
+    var onInlineInsightToggleSaved: ((ConceptDefinition) -> Void)? = nil
+    var showsResponseActions: Bool = true
+    var onRevealStart: (() -> Void)? = nil
     var onFinish: (() -> Void)? = nil
 
     @State private var isThinking: Bool
@@ -44,12 +51,14 @@ struct ModelResponseCard: View {
 
     let brandBrown = AquinasTheme.Colors.primaryReadable
     private var thinkingSummaryLines: [String] {
-        thinkingSummary.isEmpty
-            ? ["No reasoning summary was returned for this response."]
-            : thinkingSummary
+        thinkingSummary
     }
     private var canShowThinkingSummaryButton: Bool {
-        showsThinkingIntro && !isThinking && !isAwaitingResponse
+        showsThinkingIntro
+            && !thinkingSummary.isEmpty
+            && !isThinking
+            && !isAwaitingResponse
+            && showResponseContent
     }
 
     init(
@@ -62,13 +71,20 @@ struct ModelResponseCard: View {
         isQueuedForModel: Bool = false,
         usesNetworkStream: Bool = false,
         thinkingSummary: [String] = [],
+        funStatusText: String? = nil,
         responseTextAlignment: ResponseTextAlignmentOption = .center,
         responseFont: ConversationFontOption = .sans,
         conversationFontSize: ConversationFontSizeOption = .large,
         loadingInsightKey: String? = nil,
         queuedInsightKeys: Set<String> = [],
+        savedInsightIDs: Set<UUID> = [],
         onDuplicateBranch: (() -> Void)? = nil,
         onInsightTap: ((String, String) -> Void)? = nil,
+        onInlineInsightQuote: ((ConceptDefinition) -> Void)? = nil,
+        onInlineInsightFork: ((ConceptDefinition) -> Void)? = nil,
+        onInlineInsightToggleSaved: ((ConceptDefinition) -> Void)? = nil,
+        showsResponseActions: Bool = true,
+        onRevealStart: (() -> Void)? = nil,
         onFinish: (() -> Void)? = nil
     ) {
         self.title = title
@@ -80,13 +96,20 @@ struct ModelResponseCard: View {
         self.isQueuedForModel = isQueuedForModel
         self.usesNetworkStream = usesNetworkStream
         self.thinkingSummary = thinkingSummary
+        self.funStatusText = funStatusText
         self.responseTextAlignment = responseTextAlignment
         self.responseFont = responseFont
         self.conversationFontSize = conversationFontSize
         self.loadingInsightKey = loadingInsightKey
         self.queuedInsightKeys = queuedInsightKeys
+        self.savedInsightIDs = savedInsightIDs
         self.onDuplicateBranch = onDuplicateBranch
         self.onInsightTap = onInsightTap
+        self.onInlineInsightQuote = onInlineInsightQuote
+        self.onInlineInsightFork = onInlineInsightFork
+        self.onInlineInsightToggleSaved = onInlineInsightToggleSaved
+        self.showsResponseActions = showsResponseActions
+        self.onRevealStart = onRevealStart
         self.onFinish = onFinish
         let shouldShowThinking = showsThinkingIntro
             && (isAwaitingResponse || shouldAnimateOnAppear)
@@ -113,13 +136,13 @@ struct ModelResponseCard: View {
                             summaryLines: thinkingSummary,
                             isWritingResponse: isShowingWritingStatus,
                             isQueuedForModel: isQueuedForModel,
+                            funStatusText: funStatusText,
                             font: responseFont.textFont(size: conversationFontSize),
                             color: brandBrown
                         )
                             .transition(.opacity.combined(with: .scale(scale: 0.96)))
-                    } else {
+                    } else if canShowThinkingSummaryButton {
                         Button(action: {
-                            guard canShowThinkingSummaryButton else { return }
                             if isThinkingExpanded {
                                 collapseThinking()
                             } else {
@@ -148,7 +171,6 @@ struct ModelResponseCard: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .disabled(!canShowThinkingSummaryButton)
                         .accessibilityLabel(isThinkingExpanded ? "Hide Thinking" : "Show Thinking")
                         .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
                         .transition(.opacity.combined(with: .move(edge: .top)))
@@ -217,7 +239,9 @@ struct ModelResponseCard: View {
                 }
 
                 // ── Title + response body (card state only) ───────────────────
-                if !isThinking && !isAwaitingResponse && showResponseContent {
+                if !isThinking
+                    && !isAwaitingResponse
+                    && showResponseContent {
                     if showTitle, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Text(title)
                             .font(.baskervilleDisplay)
@@ -237,8 +261,14 @@ struct ModelResponseCard: View {
                         conversationFontSize: conversationFontSize,
                         loadingInsightKey: loadingInsightKey,
                         queuedInsightKeys: queuedInsightKeys,
+                        savedInsightIDs: savedInsightIDs,
+                        showsResponseActions: showsResponseActions,
                         onBranch: onDuplicateBranch,
                         onInsightTap: onInsightTap,
+                        onInlineInsightQuote: onInlineInsightQuote,
+                        onInlineInsightFork: onInlineInsightFork,
+                        onInlineInsightToggleSaved: onInlineInsightToggleSaved,
+                        onRevealStart: onRevealStart,
                         onFinish: onFinish
                     )
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
@@ -296,10 +326,7 @@ struct ModelResponseCard: View {
             }
         }
         .onChange(of: isReceivingStream) { _, isReceiving in
-            guard isReceiving else { return }
-            if shouldBeginThinking {
-                startThinking()
-            }
+            guard isReceiving, isThinking else { return }
             withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                 isShowingWritingStatus = true
                 isThinkingDocked = true
@@ -354,8 +381,8 @@ struct ModelResponseCard: View {
             isThinking = false
         }
 
-        // Let the progress stack finish collapsing into "Show Thinking"
-        // before the title and response begin their own entrance.
+        // Let the progress stack finish collapsing before the response and its
+        // persistent "Show Thinking" disclosure enter together.
         try? await Task.sleep(for: .milliseconds(420))
         guard !Task.isCancelled else { return }
         withAnimation(.easeOut(duration: 0.22)) {
@@ -386,6 +413,7 @@ private struct LiveThinkingProgressView: View {
     let summaryLines: [String]
     let isWritingResponse: Bool
     let isQueuedForModel: Bool
+    let funStatusText: String?
     let font: Font
     let color: Color
 
@@ -413,7 +441,7 @@ private struct LiveThinkingProgressView: View {
                     }
 
                     if isWritingResponse {
-                        Text("Writing response...")
+                        Text(funStatusText ?? "Writing response...")
                             .font(font)
                             .fontWeight(.bold)
                             .lineSpacing(8)
@@ -421,25 +449,28 @@ private struct LiveThinkingProgressView: View {
                             .fixedSize(horizontal: false, vertical: true)
                             .modifier(ThinkingShimmer(isActive: true, color: color))
                             .transition(.glideFadeUp)
+                            .accessibilityLabel("Writing response")
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
             } else {
                 if isQueuedForModel {
-                    Text("Question queued")
+                    Text(funStatusText ?? "Question queued")
                         .font(font)
                         .fontWeight(.bold)
                         .modifier(QueuedWorkBreatheModifier(isQueued: true))
                         .frame(maxWidth: .infinity, alignment: .center)
                         .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                        .accessibilityLabel("Question queued")
                 } else {
-                    Text("Thinking...")
+                    Text(funStatusText ?? "Thinking...")
                         .font(font)
                         .fontWeight(.bold)
                         .modifier(ThinkingShimmer(isActive: true, color: color))
                         .frame(maxWidth: .infinity, alignment: .center)
                         .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                        .accessibilityLabel("Thinking")
                 }
             }
         }

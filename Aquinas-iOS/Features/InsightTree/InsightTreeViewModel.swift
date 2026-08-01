@@ -18,6 +18,9 @@ final class InsightTreeViewModel: ObservableObject {
     @Published private(set) var nodes: [NodeModel] = []
     @Published private(set) var edges: [EdgeModel] = []
     @Published private(set) var makeNodeChildIDs: Set<UUID> = []
+    /// Child IDs whose generated title/definition have replaced their stable loading content.
+    /// The canvas uses this to begin the three-stop reveal tour only after generation completes.
+    @Published private(set) var generatedMakeNodeChildIDs: Set<UUID> = []
     /// Node IDs for user-placed midpoints. These render as a bare insight chip (no
     /// node-concept circle) pinned at their placed position.
     @Published private(set) var placedMidpointNodeIDs: Set<UUID> = []
@@ -47,6 +50,9 @@ final class InsightTreeViewModel: ObservableObject {
     private let model: AquinasModel
     /// The source of insight embedding vectors. See `EmbeddingProvider`'s doc comment.
     private let embeddingProvider: EmbeddingProvider
+    /// Global Insights graphs every cluster member. Persisted conversation trees retain their
+    /// intentionally compact six-member presentation.
+    private let showsAllClusterInsights: Bool
     /// Real Make Node children once generated, keyed by the promoted node's id — checked before
     /// the synchronous placeholder in `appendPromotedNodes`. Populated by `requestChildren`, which
     /// requests them once per newly-promoted insight and triggers a rebuild when they arrive.
@@ -69,11 +75,13 @@ final class InsightTreeViewModel: ObservableObject {
     init(
         insights: [ConceptDefinition],
         promotedInsightIDs: [UUID] = [],
+        showsAllClusterInsights: Bool = false,
         model: AquinasModel = MockAquinasModel(),
         embeddingProvider: EmbeddingProvider = NLEmbeddingProvider()
     ) {
         self.insights = Self.deduplicated(insights.map { InsightModel(concept: $0) })
         self.promotedInsightIDs = promotedInsightIDs
+        self.showsAllClusterInsights = showsAllClusterInsights
         self.model = model
         self.embeddingProvider = embeddingProvider
         generatedClusterLabels = Self.loadClusterLabels(
@@ -98,6 +106,18 @@ final class InsightTreeViewModel: ObservableObject {
         }
         if let promotedInsightIDs {
             self.promotedInsightIDs = promotedInsightIDs
+            let retainedNodeIDs = Set(promotedInsightIDs.map {
+                promotedNodeID(for: $0)
+            })
+            generatedChildInsights = generatedChildInsights.filter {
+                retainedNodeIDs.contains($0.key)
+            }
+            childGenerationInFlight.formIntersection(retainedNodeIDs)
+            let retainedChildIDs = Set(promotedInsightIDs.flatMap { insightID in
+                let nodeID = promotedNodeID(for: insightID)
+                return (0..<3).map { makeNodeChildID(for: nodeID, index: $0) }
+            })
+            generatedMakeNodeChildIDs.formIntersection(retainedChildIDs)
         }
         rebuildTree()
         if persistedTree == nil {
@@ -194,6 +214,39 @@ final class InsightTreeViewModel: ObservableObject {
         rebuildTree()
     }
 
+    /// Replaces a placed Midpoint's loading placeholder without changing its application-owned
+    /// identity, position, or source connectors. Keeping the id stable prevents the canvas from
+    /// treating the generated contents as a second Insight and replaying the entrance sequence.
+    func replacePlacedMidpoint(id: UUID, with generatedConcept: ConceptDefinition) {
+        guard let index = placedMidpoints.firstIndex(where: { $0.concept.id == id }) else {
+            return
+        }
+        let placed = placedMidpoints[index]
+        let replacement = ConceptDefinition(
+            id: id,
+            word: generatedConcept.word,
+            partOfSpeech: generatedConcept.partOfSpeech,
+            pronunciation: generatedConcept.pronunciation,
+            meaning: generatedConcept.meaning,
+            example: generatedConcept.example
+        )
+        placedMidpoints[index] = PlacedMidpoint(
+            concept: replacement,
+            position: placed.position,
+            sources: placed.sources
+        )
+        rebuildTree()
+    }
+
+    func removePlacedMidpoint(id: UUID) {
+        placedMidpoints.removeAll { $0.concept.id == id }
+        rebuildTree()
+    }
+
+    func placedMidpointConcept(for id: UUID) -> ConceptDefinition? {
+        placedMidpoints.first(where: { $0.concept.id == id })?.concept
+    }
+
     func generateSuggestedNode(between nodeA: NodeModel, and nodeB: NodeModel) {
         let temporaryEdge = EdgeModel(
             id: UUID(),
@@ -247,7 +300,14 @@ final class InsightTreeViewModel: ObservableObject {
         let suggestionInsights = Array(suggestions)
         guard !suggestionInsights.isEmpty else { return }
 
-        let label = await model.labelSubject(forTitles: suggestionInsights.map(\.title))
+        let descriptions = suggestionInsights.map {
+            "\($0.title): \($0.definition)"
+        }
+        guard let label = try? await model.labelSubject(
+            forTitles: descriptions
+        ) else {
+            return
+        }
         let suggestedNode = NodeModel(
             id: UUID(),
             conceptLabel: label,
@@ -320,7 +380,7 @@ final class InsightTreeViewModel: ObservableObject {
     private func recomputeBondLengths(for nodes: [NodeModel]) {
         var lengths: [UUID: CGFloat] = [:]
         for node in nodes where !placedMidpointNodeIDs.contains(node.id) {
-            for insight in node.insights.prefix(6) {
+            for insight in canvasInsights(for: node) {
                 let dist = insight.distanceToNode
                     ?? semanticDistance(insight.embedding ?? [], node.embedding)
                 lengths[insight.id] = insightBondLength(dist)
@@ -557,8 +617,14 @@ final class InsightTreeViewModel: ObservableObject {
             let nodeID = cluster.id
             let subjects = cluster.insights.map { "\($0.title): \($0.definition)" }
             Task { @MainActor in
-                let label = await model.labelSubject(forTitles: subjects)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let label: String
+                do {
+                    label = try await model.labelSubject(forTitles: subjects)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                } catch {
+                    clusterLabelGenerationInFlight.remove(nodeID)
+                    return
+                }
                 clusterLabelGenerationInFlight.remove(nodeID)
                 guard !label.isEmpty else { return }
                 generatedClusterLabels[nodeID] = label
@@ -587,14 +653,13 @@ final class InsightTreeViewModel: ObservableObject {
             let sourceNode = nodes[sourceIndex]
             let promotedNodeID = promotedNodeID(for: insightID)
 
-            // Turning an insight into a concept spawns 3 relevant child insights around it. Real
-            // content once `requestChildren` resolves; a synchronous "New Insight" placeholder
-            // until then. IDs are stable either way, so rebuilds — and the placeholder → real
-            // swap — never recreate them (which would re-trigger their load animation).
+            // Turning an insight into a concept spawns 3 relevant child insights around it.
+            // Identity-only loading children exist until `requestChildren` resolves. Their IDs
+            // remain stable across the generated-content swap so the canvas runs one animation.
             let childInsights = generatedChildInsights[promotedNodeID] ?? (0..<3).map { childIndex in
                 InsightModel(
                     id: makeNodeChildID(for: promotedNodeID, index: childIndex),
-                    title: "New Insight",
+                    title: "",
                     definition: ""
                 )
             }
@@ -643,11 +708,57 @@ final class InsightTreeViewModel: ObservableObject {
         }
     }
 
-    /// Requests the real Make Node children from the model, once per promoted node. The
-    /// synchronous "New Insight" placeholder (same stable ids) stays visible until the result
-    /// arrives, then a rebuild swaps in the real content.
+    /// Requests the real Make Node children once per promoted node. Generated content replaces
+    /// the identity-only children in place, then publishes readiness after the rebuilt nodes are
+    /// available so the canvas can safely begin its camera tour.
     private func requestChildren(for insight: InsightModel, promotedNodeID: UUID) {
         guard childGenerationInFlight.insert(promotedNodeID).inserted else { return }
+        Task { @MainActor in
+            do {
+                try await generateMakeNodeChildren(
+                    for: insight,
+                    promotedNodeID: promotedNodeID
+                )
+            } catch {
+                cancelMakeNodeGeneration(for: insight.id)
+            }
+        }
+    }
+
+    /// Reserves the generation slot before a queued Make Node task publishes its promoted id.
+    /// This prevents the normal tree rebuild from launching an untracked duplicate request.
+    func reserveMakeNodeGeneration(for insightID: UUID) {
+        childGenerationInFlight.insert(promotedNodeID(for: insightID))
+        if !promotedInsightIDs.contains(insightID) {
+            promotedInsightIDs.append(insightID)
+        }
+        rebuildTree()
+    }
+
+    func generateReservedMakeNodeChildren(
+        for insight: InsightModel
+    ) async throws {
+        try await generateMakeNodeChildren(
+            for: insight,
+            promotedNodeID: promotedNodeID(for: insight.id)
+        )
+    }
+
+    func cancelMakeNodeGeneration(for insightID: UUID) {
+        let nodeID = promotedNodeID(for: insightID)
+        promotedInsightIDs.removeAll { $0 == insightID }
+        childGenerationInFlight.remove(nodeID)
+        generatedChildInsights.removeValue(forKey: nodeID)
+        generatedMakeNodeChildIDs.subtract(
+            (0..<3).map { makeNodeChildID(for: nodeID, index: $0) }
+        )
+        rebuildTree()
+    }
+
+    private func generateMakeNodeChildren(
+        for insight: InsightModel,
+        promotedNodeID: UUID
+    ) async throws {
         let sourceConcept = ConceptDefinition(
             word: insight.title,
             partOfSpeech: "",
@@ -655,20 +766,32 @@ final class InsightTreeViewModel: ObservableObject {
             meaning: insight.definition,
             example: ""
         )
-        Task { @MainActor in
-            let generated = await model.generateChildren(for: sourceConcept)
-            generatedChildInsights[promotedNodeID] = (0..<3).map { index in
-                let concept = index < generated.count
-                    ? generated[index]
-                    : ConceptDefinition(word: "New Insight", partOfSpeech: "", pronunciation: "", meaning: "", example: "")
-                return InsightModel(
-                    id: makeNodeChildID(for: promotedNodeID, index: index),
-                    title: concept.word,
-                    definition: concept.meaning
-                )
-            }
-            rebuildTree()
+        let generated: [ConceptDefinition]
+        do {
+            generated = try await model.generateChildren(for: sourceConcept)
+        } catch {
+            childGenerationInFlight.remove(promotedNodeID)
+            throw error
         }
+        guard !Task.isCancelled, promotedInsightIDs.contains(insight.id) else {
+            childGenerationInFlight.remove(promotedNodeID)
+            return
+        }
+        guard generated.count == 3 else {
+            childGenerationInFlight.remove(promotedNodeID)
+            throw AquinasModelActionError.invalidResponse
+        }
+        let children = generated.enumerated().map { index, concept in
+            return InsightModel(
+                id: makeNodeChildID(for: promotedNodeID, index: index),
+                title: concept.word,
+                definition: concept.meaning
+            )
+        }
+        generatedChildInsights[promotedNodeID] = children
+        childGenerationInFlight.remove(promotedNodeID)
+        rebuildTree()
+        generatedMakeNodeChildIDs.formUnion(children.map(\.id))
     }
 
     /// Appends user-placed midpoint nodes at their pinned positions, each connected by an edge
@@ -764,10 +887,20 @@ final class InsightTreeViewModel: ObservableObject {
     /// used to keep whole nodes from overlapping during the separation pass.
     private func nodeFootprintRadius(_ node: NodeModel) -> CGFloat {
         if placedMidpointNodeIDs.contains(node.id) { return 70 }   // bare single-chip midpoint
-        let longest = node.insights.prefix(6).map { $0.title.count }.max() ?? 0
+        let visibleInsights = canvasInsights(for: node)
+        let longest = visibleInsights.map { $0.title.count }.max() ?? 0
         return insightOrbitRadius(longestTitleChars: longest,
-                                  count: min(node.insights.count, 6),
+                                  count: visibleInsights.count,
                                   isSuggested: node.isSuggested) + 64   // ring + chip extent
+    }
+
+    private func canvasInsights(for node: NodeModel) -> [InsightModel] {
+        let members = canvasInsightMembers(
+            nodeLabel: node.conceptLabel,
+            insights: node.insights,
+            preservesMatchingTitle: placedMidpointNodeIDs.contains(node.id)
+        )
+        return showsAllClusterInsights ? members : Array(members.prefix(6))
     }
 
     /// Gently pushes apart only the nodes whose footprints overlap, starting from their current

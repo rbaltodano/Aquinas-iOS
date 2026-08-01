@@ -175,6 +175,7 @@ struct InsightLibraryCard: View {
     let insight: ConceptDefinition
     let isSaved: Bool
     var maxWidth: CGFloat? = 315
+    var shadowOpacity: Double = 0.15
     var onQuote: () -> Void
     var onFork: () -> Void
     var onToggleSaved: () -> Void
@@ -210,21 +211,25 @@ struct InsightLibraryCard: View {
                 )
             }
 
-            Text(insight.meaning)
-                .font(.figtreeParagraph)
-                .lineSpacing(12)
-                .foregroundColor(AquinasTheme.Colors.paragraphText)
-                .fixedSize(horizontal: false, vertical: true)
+            InsightDefinitionsContent(
+                definitions: insight.contextualDefinitions
+            )
         }
-        .padding(32)
+        .padding(24)
         .frame(maxWidth: maxWidth)
         .background(AquinasTheme.Colors.canvasSecondary)
-        .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 36, style: .continuous)
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
         )
-        .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 16)
+        .shadow(
+            color: Color(red: 0.13, green: 0.06, blue: 0)
+                .opacity(shadowOpacity),
+            radius: 24,
+            x: 0,
+            y: 16
+        )
         .alert("Remove bookmark?", isPresented: $isConfirmingUnbookmark) {
             Button("Cancel", role: .cancel) {}
             Button("Remove", role: .destructive) {

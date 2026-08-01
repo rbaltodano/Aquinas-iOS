@@ -183,7 +183,8 @@ extension AnyTransition {
 
 /// Compiled once per process — never inside init or hot-path functions.
 private enum CachedRegex {
-    static let listLine    = try! NSRegularExpression(pattern: #"^\s*\d+[.)]\s+(.+)"#)
+    static let orderedListLine = try! NSRegularExpression(pattern: #"^\s*\d+[.)]\s+(.+)"#)
+    static let unorderedListLine = try! NSRegularExpression(pattern: #"^\s*[-*+]\s+(.+)"#)
     static let insightLink = try! NSRegularExpression(pattern: #"\[([^\]]+)\]\(([^)]+)\)"#)
     static let tokenizer   = try! NSRegularExpression(pattern: #"\S*\[[^\]]+\]\([^)]+\)\S*|\*\*[^*]+\*\*[.,!?;:]*|\*[^*]+\*[.,!?;:]*|\S+"#)
 }
@@ -227,12 +228,14 @@ private struct ParsedInsightLink {
 
 // MARK: - Response Segment Model
 
-/// A parsed block of text — either a normal paragraph or a numbered list.
+/// A parsed response block with its Markdown-level structure preserved.
 private struct ResponseSegment: Identifiable {
     enum Kind {
         case paragraph
         case heading(level: Int)
-        case orderedList([String])  // item texts, already stripped of "1." prefix
+        case orderedList([String])
+        case unorderedList([String])
+        case insight(ConceptDefinition)
     }
 
     /// Stable for the lifetime of a response because generated blocks append in order.
@@ -242,16 +245,21 @@ private struct ResponseSegment: Identifiable {
     let words: [String]
     /// Where this segment starts in the global flat word array.
     let wordStart: Int
-    /// For orderedList: word index (relative to segment start) where each item begins.
+    /// For lists: word index (relative to segment start) where each item begins.
     let itemWordOffsets: [Int]
 
     var wordCount: Int { words.count }
+
+    var isInsight: Bool {
+        if case .insight = kind { return true }
+        return false
+    }
 }
 
 // MARK: - Streaming Message View
 
-/// Renders the model response body, animated word-by-word, with ordered-list bubble formatting
-/// and bookmark/copy/fork actions.
+/// Renders the model response body, animated word-by-word, with heading/list formatting and
+/// bookmark/copy/fork actions.
 struct StreamingMessageView: View {
     let fullText: String
     let shouldStream: Bool
@@ -262,9 +270,15 @@ struct StreamingMessageView: View {
     let conversationFontSize: ConversationFontSizeOption
     let loadingInsightKey: String?
     let queuedInsightKeys: Set<String>
+    let savedInsightIDs: Set<UUID>
+    let showsResponseActions: Bool
     var onQuote: ((String) -> Void)? = nil
     var onBranch: (() -> Void)? = nil
     var onInsightTap: ((String, String) -> Void)? = nil
+    var onInlineInsightQuote: ((ConceptDefinition) -> Void)? = nil
+    var onInlineInsightFork: ((ConceptDefinition) -> Void)? = nil
+    var onInlineInsightToggleSaved: ((ConceptDefinition) -> Void)? = nil
+    var onRevealStart: (() -> Void)? = nil
     var onFinish: (() -> Void)? = nil
 
     private let segments: [ResponseSegment]
@@ -287,6 +301,7 @@ struct StreamingMessageView: View {
     @State private var displayedWords: [String] = []
     @State private var isFinished: Bool = false
     @State private var hasReportedFinish = false
+    @State private var hasReportedRevealStart = false
     @State private var showsInsightUnderlines: Bool
     @Environment(\.openURL) private var openURL
 
@@ -300,9 +315,15 @@ struct StreamingMessageView: View {
         conversationFontSize: ConversationFontSizeOption = .large,
         loadingInsightKey: String? = nil,
         queuedInsightKeys: Set<String> = [],
+        savedInsightIDs: Set<UUID> = [],
+        showsResponseActions: Bool = true,
         onQuote: ((String) -> Void)? = nil,
         onBranch: (() -> Void)? = nil,
         onInsightTap: ((String, String) -> Void)? = nil,
+        onInlineInsightQuote: ((ConceptDefinition) -> Void)? = nil,
+        onInlineInsightFork: ((ConceptDefinition) -> Void)? = nil,
+        onInlineInsightToggleSaved: ((ConceptDefinition) -> Void)? = nil,
+        onRevealStart: (() -> Void)? = nil,
         onFinish: (() -> Void)? = nil
     ) {
         self.fullText = fullText
@@ -314,9 +335,15 @@ struct StreamingMessageView: View {
         self.conversationFontSize = conversationFontSize
         self.loadingInsightKey = loadingInsightKey
         self.queuedInsightKeys = queuedInsightKeys
+        self.savedInsightIDs = savedInsightIDs
+        self.showsResponseActions = showsResponseActions
         self.onQuote = onQuote
         self.onBranch = onBranch
         self.onInsightTap = onInsightTap
+        self.onInlineInsightQuote = onInlineInsightQuote
+        self.onInlineInsightFork = onInlineInsightFork
+        self.onInlineInsightToggleSaved = onInlineInsightToggleSaved
+        self.onRevealStart = onRevealStart
         self.onFinish = onFinish
 
         let cached: (
@@ -390,7 +417,7 @@ struct StreamingMessageView: View {
                 onInsightTap: onInsightTap
             )
 
-            if isFinished {
+            if isFinished && showsResponseActions {
                 responseButtons
             }
         }
@@ -417,7 +444,7 @@ struct StreamingMessageView: View {
                 value: usesNetworkStream ? responseWords.count : displayedWords.count
             )
 
-            if isFinished {
+            if isFinished && showsResponseActions {
                 responseButtons
             }
         }
@@ -427,9 +454,11 @@ struct StreamingMessageView: View {
         ResponseButtons(
             canCopy: true,
             canFork: onBranch != nil,
-            copyText: fullText,
+            copyText: InlineInsightMarkup.plainText(from: fullText),
             onSave: { print("Saved to bookmarks!") },
-            onQuote: onQuote.map { q in { q(fullText) } },
+            onQuote: onQuote.map { q in {
+                q(InlineInsightMarkup.plainText(from: fullText))
+            } },
             onFork: onBranch
         )
         .padding(.top, 8)
@@ -452,11 +481,17 @@ struct StreamingMessageView: View {
 
     @ViewBuilder
     private func segmentsView(displayedCount: Int) -> some View {
-        VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 16) {
-            ForEach(segments) { segment in
+        VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 0) {
+            ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
                 segmentView(segment: segment, displayedCount: displayedCount)
+                    .padding(.top, spacingBeforeSegment(at: index))
             }
         }
+    }
+
+    private func spacingBeforeSegment(at index: Int) -> CGFloat {
+        guard index > 0 else { return 0 }
+        return segments[index].isInsight || segments[index - 1].isInsight ? 24 : 16
     }
 
     @ViewBuilder
@@ -478,13 +513,37 @@ struct StreamingMessageView: View {
                 headingFlow(words: segment.words, visibleCount: available, level: level)
 
             case .orderedList(let items):
-                orderedListBubble(
+                listView(
                     items: items,
                     allWords: segment.words,
                     segmentWordStart: segment.wordStart,
                     itemOffsets: segment.itemWordOffsets,
-                    available: available
+                    available: available,
+                    marker: { "\($0 + 1)." }
                 )
+
+            case .unorderedList(let items):
+                listView(
+                    items: items,
+                    allWords: segment.words,
+                    segmentWordStart: segment.wordStart,
+                    itemOffsets: segment.itemWordOffsets,
+                    available: available,
+                    marker: { _ in "•" }
+                )
+
+            case .insight(let insight):
+                InsightLibraryCard(
+                    insight: insight,
+                    isSaved: savedInsightIDs.contains(insight.id),
+                    maxWidth: 315,
+                    shadowOpacity: 0.075,
+                    onQuote: { onInlineInsightQuote?(insight) },
+                    onFork: { onInlineInsightFork?(insight) },
+                    onToggleSaved: { onInlineInsightToggleSaved?(insight) }
+                )
+                .frame(maxWidth: .infinity, alignment: .center)
+                .transition(.glideFadeUp)
             }
         }
     }
@@ -514,15 +573,16 @@ struct StreamingMessageView: View {
         }
     }
 
-    // MARK: - Ordered list bubble
+    // MARK: - Lists
 
     @ViewBuilder
-    private func orderedListBubble(
+    private func listView(
         items: [String],
         allWords: [String],
         segmentWordStart: Int,
         itemOffsets: [Int],
-        available: Int
+        available: Int,
+        marker: @escaping (Int) -> String
     ) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             ForEach(Array(items.enumerated()), id: \.offset) { index, _ in
@@ -531,7 +591,7 @@ struct StreamingMessageView: View {
                 let itemWords = Array(allWords[itemStart..<itemEnd])
 
                 HStack(alignment: .top, spacing: 10) {
-                    Text("\(index + 1).")
+                    Text(marker(index))
                         .font(responseFont.textFont(size: conversationFontSize))
                         .foregroundColor(AquinasTheme.Colors.bodyText)
                         .frame(minWidth: 22, alignment: .trailing)
@@ -546,14 +606,6 @@ struct StreamingMessageView: View {
                 }
             }
         }
-        .padding(24)
-        .frame(maxWidth: .infinity, alignment: .center)
-        .background(AquinasTheme.Colors.card)
-        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .stroke(AquinasTheme.Colors.quietBorder, lineWidth: 1)
-        )
     }
 
     // MARK: - Word flow (unchanged)
@@ -717,16 +769,18 @@ struct StreamingMessageView: View {
 
     // MARK: - Parsing
 
-    /// Splits fullText into paragraph and ordered-list segments.
-    /// Consecutive lines matching `^\d+[.)]\s+` form one orderedList segment.
+    /// Splits fullText into paragraph, heading, ordered-list, and unordered-list segments.
     private static func parseSegments(from text: String) -> [ResponseSegment] {
-        // Matches "1. ", "2) ", "10. " etc. and captures the item text.
-        let listLineRegex = CachedRegex.listLine
+        enum ListKind: Equatable {
+            case ordered
+            case unordered
+        }
 
         struct RawLine {
-            let isListItem: Bool
+            let listKind: ListKind?
             let headingLevel: Int?
             let content: String
+            let insight: ConceptDefinition?
         }
 
         var rawLines: [RawLine] = []
@@ -734,13 +788,59 @@ struct StreamingMessageView: View {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             guard !trimmed.isEmpty else { continue }
 
-            if let match = listLineRegex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)),
+            if let insight = InlineInsightMarkup.insight(from: trimmed) {
+                rawLines.append(
+                    RawLine(
+                        listKind: nil,
+                        headingLevel: nil,
+                        content: "",
+                        insight: insight
+                    )
+                )
+            } else if let match = CachedRegex.orderedListLine.firstMatch(
+                in: trimmed,
+                range: NSRange(trimmed.startIndex..., in: trimmed)
+            ),
                let itemRange = Range(match.range(at: 1), in: trimmed) {
-                rawLines.append(RawLine(isListItem: true, headingLevel: nil, content: String(trimmed[itemRange])))
+                rawLines.append(
+                    RawLine(
+                        listKind: .ordered,
+                        headingLevel: nil,
+                        content: String(trimmed[itemRange]),
+                        insight: nil
+                    )
+                )
+            } else if let match = CachedRegex.unorderedListLine.firstMatch(
+                in: trimmed,
+                range: NSRange(trimmed.startIndex..., in: trimmed)
+            ),
+                      let itemRange = Range(match.range(at: 1), in: trimmed) {
+                rawLines.append(
+                    RawLine(
+                        listKind: .unordered,
+                        headingLevel: nil,
+                        content: String(trimmed[itemRange]),
+                        insight: nil
+                    )
+                )
             } else if let heading = markdownHeading(from: trimmed) {
-                rawLines.append(RawLine(isListItem: false, headingLevel: heading.level, content: heading.text))
+                rawLines.append(
+                    RawLine(
+                        listKind: nil,
+                        headingLevel: heading.level,
+                        content: heading.text,
+                        insight: nil
+                    )
+                )
             } else {
-                rawLines.append(RawLine(isListItem: false, headingLevel: nil, content: trimmed))
+                rawLines.append(
+                    RawLine(
+                        listKind: nil,
+                        headingLevel: nil,
+                        content: trimmed,
+                        insight: nil
+                    )
+                )
             }
         }
 
@@ -749,10 +849,22 @@ struct StreamingMessageView: View {
         var i = 0
 
         while i < rawLines.count {
-            if rawLines[i].isListItem {
-                // Gather all consecutive list items into one segment.
+            if let insight = rawLines[i].insight {
+                result.append(
+                    ResponseSegment(
+                        id: result.count,
+                        kind: .insight(insight),
+                        words: [insight.word],
+                        wordStart: wordCursor,
+                        itemWordOffsets: []
+                    )
+                )
+                wordCursor += 1
+                i += 1
+            } else if let listKind = rawLines[i].listKind {
+                // Gather consecutive items of the same list style into one segment.
                 var items: [String] = []
-                while i < rawLines.count && rawLines[i].isListItem {
+                while i < rawLines.count && rawLines[i].listKind == listKind {
                     items.append(rawLines[i].content)
                     i += 1
                 }
@@ -764,7 +876,9 @@ struct StreamingMessageView: View {
                 }
                 result.append(ResponseSegment(
                     id: result.count,
-                    kind: .orderedList(items),
+                    kind: listKind == .ordered
+                        ? .orderedList(items)
+                        : .unorderedList(items),
                     words: allWords,
                     wordStart: wordCursor,
                     itemWordOffsets: itemOffsets
@@ -784,7 +898,10 @@ struct StreamingMessageView: View {
             } else {
                 // Gather consecutive non-list lines into one paragraph segment.
                 var paraWords: [String] = []
-                while i < rawLines.count && !rawLines[i].isListItem && rawLines[i].headingLevel == nil {
+                while i < rawLines.count
+                    && rawLines[i].listKind == nil
+                    && rawLines[i].headingLevel == nil
+                    && rawLines[i].insight == nil {
                     paraWords.append(contentsOf: tokenize(rawLines[i].content))
                     i += 1
                 }
@@ -854,13 +971,18 @@ struct StreamingMessageView: View {
         displayedWords = []
         isFinished = false
         showsInsightUnderlines = false
-        guard !responseWords.isEmpty else { return }
+        guard !responseWords.isEmpty else {
+            reportRevealStartIfNeeded()
+            return
+        }
 
         try? await Task.sleep(nanoseconds: 80_000_000)
+        guard !Task.isCancelled else { return }
         let words = responseWords
 
         for batchStart in stride(from: 0, to: words.count, by: streamBatchSize) {
             let batchEnd = min(batchStart + streamBatchSize, words.count)
+            reportRevealStartIfNeeded()
             displayedWords.append(contentsOf: words[batchStart..<batchEnd])
             try? await Task.sleep(nanoseconds: streamBatchDelay)
         }
@@ -884,6 +1006,12 @@ struct StreamingMessageView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             onFinish?()
         }
+    }
+
+    private func reportRevealStartIfNeeded() {
+        guard !hasReportedRevealStart else { return }
+        hasReportedRevealStart = true
+        onRevealStart?()
     }
 }
 
@@ -1013,45 +1141,50 @@ private struct LiveResponseBlockView: View {
             )
 
         case .orderedList(let items):
-            VStack(alignment: .leading, spacing: 12) {
-                ForEach(items.enumerated(), id: \.offset) { index, item in
-                    HStack(alignment: .top, spacing: 10) {
-                        Text("\(index + 1).")
-                            .font(responseFont.textFont(size: conversationFontSize))
-                            .foregroundColor(AquinasTheme.Colors.bodyText)
-                            .frame(minWidth: 22, alignment: .trailing)
+            listView(items: items, marker: { "\($0 + 1)." })
 
-                        LiveTokenFlow(
-                            source: item,
-                            sourceResponseBlock: sourceResponseBlock,
-                            font: responseFont.textFont(size: conversationFontSize),
-                            color: AquinasTheme.Colors.bodyText,
-                            allowsInlineMarkdown: true,
-                            spacing: 4.5,
-                            responseTextAlignment: responseTextAlignment,
-                            annotationSequenceStart: annotationSequenceStart(forItemAt: index),
-                            loadingInsightKey: loadingInsightKey,
-                            queuedInsightKeys: queuedInsightKeys,
-                            onInsightTap: onInsightTap
-                        )
-                    }
+        case .unorderedList(let items):
+            listView(items: items, marker: { _ in "•" })
+        }
+    }
+
+    private func listView(
+        items: [String],
+        marker: @escaping (Int) -> String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(items.enumerated(), id: \.offset) { index, item in
+                HStack(alignment: .top, spacing: 10) {
+                    Text(marker(index))
+                        .font(responseFont.textFont(size: conversationFontSize))
+                        .foregroundColor(AquinasTheme.Colors.bodyText)
+                        .frame(minWidth: 22, alignment: .trailing)
+
+                    LiveTokenFlow(
+                        source: item,
+                        sourceResponseBlock: sourceResponseBlock,
+                        font: responseFont.textFont(size: conversationFontSize),
+                        color: AquinasTheme.Colors.bodyText,
+                        allowsInlineMarkdown: true,
+                        spacing: 4.5,
+                        responseTextAlignment: responseTextAlignment,
+                        annotationSequenceStart: annotationSequenceStart(
+                            forItemAt: index,
+                            in: items
+                        ),
+                        loadingInsightKey: loadingInsightKey,
+                        queuedInsightKeys: queuedInsightKeys,
+                        onInsightTap: onInsightTap
+                    )
                 }
-            }
-            .padding(24)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .background(AquinasTheme.Colors.card)
-            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .stroke(AquinasTheme.Colors.quietBorder, lineWidth: 1)
             }
         }
     }
 
-    private func annotationSequenceStart(forItemAt index: Int) -> Int {
-        guard case .orderedList(let items) = block.kind else {
-            return block.annotationSequenceStart
-        }
+    private func annotationSequenceStart(
+        forItemAt index: Int,
+        in items: [String]
+    ) -> Int {
         return block.annotationSequenceStart
             + items.prefix(index).reduce(0) {
                 $0 + LiveResponseBlock.insightCount(in: $1)
@@ -1352,6 +1485,7 @@ private struct LiveResponseBlock: Identifiable {
         case paragraph(String)
         case heading(level: Int, text: String)
         case orderedList([String])
+        case unorderedList([String])
     }
 
     let id: Int
@@ -1362,6 +1496,7 @@ private struct LiveResponseBlock: Identifiable {
         var blocks: [LiveResponseBlock] = []
         var paragraphLines: [String] = []
         var orderedItems: [String] = []
+        var unorderedItems: [String] = []
         var nextAnnotationSequence = 0
 
         func appendBlock(_ kind: Kind) {
@@ -1387,6 +1522,12 @@ private struct LiveResponseBlock: Identifiable {
             orderedItems.removeAll(keepingCapacity: true)
         }
 
+        func flushUnorderedList() {
+            guard !unorderedItems.isEmpty else { return }
+            appendBlock(.unorderedList(unorderedItems))
+            unorderedItems.removeAll(keepingCapacity: true)
+        }
+
         for line in text.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             // Match the completed response parser, which skips blank lines and
@@ -1396,11 +1537,20 @@ private struct LiveResponseBlock: Identifiable {
 
             if let item = orderedListItem(from: trimmed) {
                 flushParagraph()
+                flushUnorderedList()
                 orderedItems.append(item)
                 continue
             }
 
+            if let item = unorderedListItem(from: trimmed) {
+                flushParagraph()
+                flushOrderedList()
+                unorderedItems.append(item)
+                continue
+            }
+
             flushOrderedList()
+            flushUnorderedList()
             if let heading = heading(from: trimmed) {
                 flushParagraph()
                 appendBlock(.heading(level: heading.level, text: heading.text))
@@ -1411,6 +1561,7 @@ private struct LiveResponseBlock: Identifiable {
 
         flushParagraph()
         flushOrderedList()
+        flushUnorderedList()
         return blocks
     }
 
@@ -1434,13 +1585,24 @@ private struct LiveResponseBlock: Identifiable {
         switch kind {
         case .paragraph(let source), .heading(_, let source):
             insightCount(in: source)
-        case .orderedList(let items):
+        case .orderedList(let items), .unorderedList(let items):
             items.reduce(0) { $0 + insightCount(in: $1) }
         }
     }
 
     private static func orderedListItem(from line: String) -> String? {
-        guard let match = CachedRegex.listLine.firstMatch(
+        guard let match = CachedRegex.orderedListLine.firstMatch(
+            in: line,
+            range: NSRange(line.startIndex..., in: line)
+        ),
+        let itemRange = Range(match.range(at: 1), in: line) else {
+            return nil
+        }
+        return String(line[itemRange])
+    }
+
+    private static func unorderedListItem(from line: String) -> String? {
+        guard let match = CachedRegex.unorderedListLine.firstMatch(
             in: line,
             range: NSRange(line.startIndex..., in: line)
         ),

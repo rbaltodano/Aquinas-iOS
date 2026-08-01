@@ -11,6 +11,8 @@ struct OpenConversationsView: View {
     let conversations: [InquiryConversation]
     let activeConversationID: UUID?
     @Binding var savedInsights: [ConceptDefinition]
+    let modelTasks: ModelTaskQueue
+    let modelTasksPopupState: ModelTasksPopupState
     var onOpenMenu: () -> Void
     var onSelectConversation: (InquiryConversation) -> Void
     var onNewChat: () -> Void
@@ -181,25 +183,14 @@ struct OpenConversationsView: View {
             .allowsHitTesting(true)
             .zIndex(10)
 
-            Button(action: onNewChat) {
-                HStack(spacing: 10) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 12, weight: .bold))
-                        .sfSymbolDrawOn()
-
-                    Text("New Conversation")
-                        .font(.custom("Figtree-Regular", size: 14))
-                }
-                .foregroundColor(AquinasTheme.Colors.canvas)
-                .padding(.horizontal, 22)
-                .frame(height: 52)
-                .background(AquinasTheme.Colors.secondaryMuted)
-                .clipShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .padding(.trailing, 24)
-            .padding(.bottom, 24)
-            .shadow(color: AquinasTheme.Colors.dropShadow.opacity(0.16), radius: 16, x: 0, y: 10)
+        }
+        .safeAreaInset(edge: .bottom) {
+            PageModelControls(
+                modelTasks: modelTasks,
+                popupState: modelTasksPopupState,
+                actionTitle: "New Conversation",
+                action: onNewChat
+            )
         }
         .onAppear {
             studyTopics = StudyTopicStore.load()

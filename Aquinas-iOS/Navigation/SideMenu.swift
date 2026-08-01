@@ -247,6 +247,7 @@ struct AquinasSideMenu: View {
     let conversations: [InquiryConversation]
     let activeConversationID: UUID?
     let activePage: AppPage
+    let modelTasks: ModelTaskQueue
     let selectedPersonality: String
     let isPresented: Bool
     var onNewChat: () -> Void
@@ -356,10 +357,14 @@ struct AquinasSideMenu: View {
                                 StudyTopicMenuRow(
                                     topic: topic,
                                     conversations: conversations.filter { $0.studyTopicID == topic.id },
+                                    conversationActivity: conversationActivity,
                                     isPresented: isPresented,
                                     delay: 0.20 + (Double(index) * 0.05),
                                     onSelect: { onSelectStudyTopic(topic) },
-                                    onSelectConversation: { onSelectConversation($0) },
+                                    onSelectConversation: { conversation in
+                                        markConversationViewed(conversation)
+                                        onSelectConversation(conversation)
+                                    },
                                     onRename: {
                                         topicRenameDraft = topic.title
                                         topicBeingRenamed = topic
@@ -387,10 +392,12 @@ struct AquinasSideMenu: View {
                         ForEach(Array(sortedConversations.enumerated()), id: \.element.id) { index, conversation in
                             ConversationMenuRow(
                                 conversation: conversation,
+                                modelActivity: conversationActivity(for: conversation),
                                 isActive: activePage == .conversation && conversation.id == activeConversationID,
                                 isPresented: isPresented,
                                 delay: 0.20 + (Double(index) * 0.05),
                                 onSelect: {
+                                    markConversationViewed(conversation)
                                     onSelectConversation(conversation)
                                 },
                                 onRename: {
@@ -584,6 +591,29 @@ struct AquinasSideMenu: View {
         )
     }
 
+    private func conversationActivity(
+        for conversation: InquiryConversation
+    ) -> ConversationModelActivity {
+        let branchIDs = Set(conversation.branches.map(\.id))
+        let pendingTasks = [modelTasks.currentTask].compactMap { $0 } + modelTasks.upcomingTasks
+        let isLoading = pendingTasks.contains { task in
+            guard let branchID = task.kind.userQuestionBranchID else { return false }
+            return branchIDs.contains(branchID)
+        }
+
+        if isLoading {
+            return .loading
+        }
+        if !modelTasks.completedUserQuestionBranchIDs.isDisjoint(with: branchIDs) {
+            return .completed
+        }
+        return .idle
+    }
+
+    private func markConversationViewed(_ conversation: InquiryConversation) {
+        modelTasks.markUserQuestionsViewed(branchIDs: Set(conversation.branches.map(\.id)))
+    }
+
     private var topicRenamePromptBinding: Binding<Bool> {
         Binding(
             get: { topicBeingRenamed != nil },
@@ -740,8 +770,48 @@ private struct PinBlurModifier: ViewModifier, Animatable {
     }
 }
 
+private enum ConversationModelActivity: Equatable {
+    case idle
+    case loading
+    case completed
+}
+
+private struct ConversationActivityIndicator: View {
+    let activity: ConversationModelActivity
+
+    var body: some View {
+        ZStack {
+            switch activity {
+            case .idle:
+                Color.clear
+            case .loading:
+                ContextUsageIcon(
+                    progress: 0,
+                    color: AquinasTheme.Colors.paragraphText.opacity(0.75),
+                    isSpinning: true
+                )
+                .transition(.opacity)
+            case .completed:
+                Circle()
+                    .fill(Color(red: 0.25, green: 0.55, blue: 1.0))
+                    .frame(width: 9, height: 9)
+                    .overlay(
+                        Circle()
+                            .stroke(AquinasTheme.Colors.sideMenuSurface, lineWidth: 1.5)
+                    )
+                    .transition(.scale.combined(with: .opacity))
+            }
+        }
+        .frame(width: 14, height: 14)
+        .animation(.easeInOut(duration: 0.2), value: activity)
+        .accessibilityHidden(activity == .idle)
+        .accessibilityLabel(activity == .loading ? "Model working" : "New response")
+    }
+}
+
 private struct ConversationMenuRow: View {
     let conversation: InquiryConversation
+    let modelActivity: ConversationModelActivity
     let isActive: Bool
     let isPresented: Bool
     let delay: TimeInterval
@@ -784,6 +854,10 @@ private struct ConversationMenuRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .animation(.spring(response: 0.40, dampingFraction: 0.78), value: isPinRevealed)
+
+            if modelActivity != .idle {
+                ConversationActivityIndicator(activity: modelActivity)
+            }
 
             if isActive {
                 Menu {
@@ -879,6 +953,7 @@ private struct ConversationMenuRow: View {
 private struct StudyTopicMenuRow: View {
     let topic: StudyTopic
     let conversations: [InquiryConversation]
+    let conversationActivity: (InquiryConversation) -> ConversationModelActivity
     let isPresented: Bool
     let delay: TimeInterval
     var onSelect: () -> Void
@@ -974,6 +1049,7 @@ private struct StudyTopicMenuRow: View {
                     ForEach(Array(conversations.enumerated()), id: \.element.id) { index, conversation in
                         TopicConversationRow(
                             conversation: conversation,
+                            modelActivity: conversationActivity(conversation),
                             index: index,
                             onTap: { onSelectConversation(conversation) }
                         )
@@ -1012,6 +1088,7 @@ private struct StudyTopicMenuRow: View {
 
 private struct TopicConversationRow: View {
     let conversation: InquiryConversation
+    let modelActivity: ConversationModelActivity
     let index: Int
     var onTap: () -> Void
 
@@ -1031,6 +1108,9 @@ private struct TopicConversationRow: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                if modelActivity != .idle {
+                    ConversationActivityIndicator(activity: modelActivity)
+                }
             }
             .padding(.leading, 52)
             .padding(.trailing, 24)

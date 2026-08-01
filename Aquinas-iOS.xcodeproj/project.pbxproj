@@ -6,7 +6,22 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		A20000000000000000000001 /* LiteRTLM in Frameworks */ = {isa = PBXBuildFile; productRef = A20000000000000000000003 /* LiteRTLM */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A1000000000000000000000A /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = D61EFA6D2F8AAB5B0081D843 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = D61EFA742F8AAB5B0081D843;
+			remoteInfo = "Aquinas-iOS";
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
+		A10000000000000000000001 /* Aquinas-iOSTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Aquinas-iOSTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		D61EFA752F8AAB5B0081D843 /* Aquinas-iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Aquinas-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -22,6 +37,11 @@
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		A10000000000000000000002 /* Aquinas-iOSTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "Aquinas-iOSTests";
+			sourceTree = "<group>";
+		};
 		D61EFA772F8AAB5B0081D843 /* Aquinas-iOS */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
@@ -33,10 +53,18 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		A10000000000000000000005 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		D61EFA722F8AAB5B0081D843 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A20000000000000000000001 /* LiteRTLM in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -47,6 +75,7 @@
 			isa = PBXGroup;
 			children = (
 				D61EFA772F8AAB5B0081D843 /* Aquinas-iOS */,
+				A10000000000000000000002 /* Aquinas-iOSTests */,
 				D61EFA762F8AAB5B0081D843 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -55,6 +84,7 @@
 			isa = PBXGroup;
 			children = (
 				D61EFA752F8AAB5B0081D843 /* Aquinas-iOS.app */,
+				A10000000000000000000001 /* Aquinas-iOSTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -62,6 +92,29 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		A10000000000000000000003 /* Aquinas-iOSTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000007 /* Build configuration list for PBXNativeTarget "Aquinas-iOSTests" */;
+			buildPhases = (
+				A10000000000000000000004 /* Sources */,
+				A10000000000000000000005 /* Frameworks */,
+				A10000000000000000000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A1000000000000000000000B /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				A10000000000000000000002 /* Aquinas-iOSTests */,
+			);
+			name = "Aquinas-iOSTests";
+			packageProductDependencies = (
+			);
+			productName = "Aquinas-iOSTests";
+			productReference = A10000000000000000000001 /* Aquinas-iOSTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		D61EFA742F8AAB5B0081D843 /* Aquinas-iOS */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = D61EFA802F8AAB5C0081D843 /* Build configuration list for PBXNativeTarget "Aquinas-iOS" */;
@@ -79,6 +132,7 @@
 			);
 			name = "Aquinas-iOS";
 			packageProductDependencies = (
+				A20000000000000000000003 /* LiteRTLM */,
 			);
 			productName = "Aquinas-iOS";
 			productReference = D61EFA752F8AAB5B0081D843 /* Aquinas-iOS.app */;
@@ -94,6 +148,10 @@
 				LastSwiftUpdateCheck = 2640;
 				LastUpgradeCheck = 2700;
 				TargetAttributes = {
+					A10000000000000000000003 = {
+						CreatedOnToolsVersion = 27.0;
+						TestTargetID = D61EFA742F8AAB5B0081D843;
+					};
 					D61EFA742F8AAB5B0081D843 = {
 						CreatedOnToolsVersion = 26.4;
 					};
@@ -108,17 +166,28 @@
 			);
 			mainGroup = D61EFA6C2F8AAB5B0081D843;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				A20000000000000000000002 /* XCLocalSwiftPackageReference "Vendor/LiteRTLM" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = D61EFA762F8AAB5B0081D843 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
 				D61EFA742F8AAB5B0081D843 /* Aquinas-iOS */,
+				A10000000000000000000003 /* Aquinas-iOSTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		A10000000000000000000006 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		D61EFA732F8AAB5B0081D843 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -129,6 +198,13 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		A10000000000000000000004 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		D61EFA712F8AAB5B0081D843 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -138,7 +214,67 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		A1000000000000000000000B /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = D61EFA742F8AAB5B0081D843 /* Aquinas-iOS */;
+			targetProxy = A1000000000000000000000A /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		A10000000000000000000008 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 7XG2DHY989;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.4;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.ryanbaltodano.Aquinas-iOSTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Aquinas-iOS.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Aquinas-iOS";
+			};
+			name = Debug;
+		};
+		A10000000000000000000009 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 7XG2DHY989;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.4;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.ryanbaltodano.Aquinas-iOSTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Aquinas-iOS.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Aquinas-iOS";
+			};
+			name = Release;
+		};
 		D61EFA7E2F8AAB5C0081D843 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -333,6 +469,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		A10000000000000000000007 /* Build configuration list for PBXNativeTarget "Aquinas-iOSTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000008 /* Debug */,
+				A10000000000000000000009 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		D61EFA702F8AAB5B0081D843 /* Build configuration list for PBXProject "Aquinas-iOS" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -352,6 +497,21 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A20000000000000000000002 /* XCLocalSwiftPackageReference "Vendor/LiteRTLM" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Vendor/LiteRTLM;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A20000000000000000000003 /* LiteRTLM */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A20000000000000000000002 /* XCLocalSwiftPackageReference "Vendor/LiteRTLM" */;
+			productName = LiteRTLM;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = D61EFA6D2F8AAB5B0081D843 /* Project object */;
 }

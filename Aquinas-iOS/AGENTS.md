@@ -4,7 +4,8 @@
 
 This is a SwiftUI iOS app organized by feature. App entry and shell code live in `App/`. Shared visual tokens, typography, colors, and reusable style helpers live in `DesignSystem/`. Feature screens and components are grouped under `Features/`, including `Conversation`, `Home`, `InsightTree`, `InsightLibrary`, `StudyTopics`, `Settings`, and `Canvas`. App-wide data models are in `Models/`, navigation components are in `Navigation/`, and lightweight local persistence helpers are in `Persistence/`. Assets are in `Assets.xcassets`; custom fonts are in `Fonts/`.
 
-There is currently no dedicated test target in the project. Add tests in a new Xcode test target when introducing logic with meaningful regression risk.
+Focused regression tests live in the `Aquinas-iOSTests` target. Add behavior-oriented coverage
+there when introducing logic with meaningful regression risk.
 
 ## Current Architecture
 
@@ -13,10 +14,16 @@ There is currently no dedicated test target in the project. Add tests in a new X
 - `CurrentConversationView` owns the active conversation/branch state, Model Task queue,
   conversation-scoped definition state, slash-command execution, and Insight Tree analysis retry
   pipeline.
-- All generative calls go through `AquinasModel`; `BackendAquinasModel` is the live default.
-  `MockAquinasModel` is for previews and explicit task fallbacks, not the normal conversation path.
-- `ModelTaskQueue` serializes user questions, dynamic definitions, and Insight Tree updates. Keep
-  cancellation handlers synchronized with visible pending/breathing state.
+- All generative calls go through `AquinasModel`. `AquinasApplicationRuntime` selects
+  `LiteRTAquinasModel` when a verified package is available and injects its exact
+  `LiteRTAquinasRuntime` into `ModelTaskQueue`; never create separate live runtime instances for
+  the model and queue. `BackendAquinasModel` is recovery when local generation fails or the model
+  is not installed. `MockAquinasModel` is for previews and tests only. Live special actions fail
+  explicitly and must never substitute mock content that could be mistaken for generated
+  knowledge.
+- `ModelTaskQueue` serializes user questions, dynamic definitions, Insight Tree updates, and
+  Question of the Day consolidation. Keep cancellation handlers synchronized with visible
+  pending/breathing state.
 - `InsightTreeService` owns backend-persisted conversation tree operations. Do not recompute its
   MiniLM topology with the on-device `NLEmbeddingProvider`; the latter is for the global in-memory
   Insight Library canvas and client-only features.
@@ -25,14 +32,24 @@ There is currently no dedicated test target in the project. Add tests in a new X
 
 ## Current Product Behaviors
 
-- Deep-think is always enabled. The visible thinking copy is a model-generated, user-facing
-  approach summary, not private chain-of-thought.
+- The visible thinking copy is an app-generated, question-specific public approach summary, not
+  private chain-of-thought. Local LiteRT generation currently delivers its answer after native
+  decoding completes rather than as reliable token deltas.
+- Ordinary conversation stays deterministic because sampled decoding corrupts the 4-bit
+  checkpoint. Substantial separated phrase loops preserve their coherent prefix, while
+  mixed-script token corruption is rejected. Do not add prompt-forced word targets or automatic
+  short-answer retries without a new checkpoint comparison; the exact package failed that test.
 - Only `/compact` and `/clear` are supported. `/compact` stores a hidden branch checkpoint while
   preserving the visible transcript; `/clear` resets the active conversation in place.
 - The dock contains Model Status and a non-spinning context gauge. Model Status is available in
   Branch and conversation Canvas modes but hides while an Insight is hovered.
 - Cached contextual definitions must open immediately even while the model is occupied. Check the
   conversation/source cache before enqueueing a definition.
+- A direct definition request such as “What does X mean?” renders an in-text Insight. Saved terms
+  deduplicate by normalized title and append a new context-definition entry when the same term is
+  encountered with a different meaning.
+- Question of the Day generation is queued as `Consolidate information`, shows
+  `Consolidating...`, and does not cancel when an active conversation opens.
 - Automatic response analysis may create a Node Concept; it must never create an automatic
   Insight. Manual definition saves create Insights.
 - Conversation Node-to-Node lines have a 360-point minimum. Insight-to-Node bonds use a separate
@@ -54,10 +71,16 @@ xcodebuild -project ../Aquinas-iOS.xcodeproj -scheme Aquinas-iOS -destination 'g
 
 Builds the app for the iOS Simulator. Use this before handing off changes.
 
-If a test target is added later, prefer:
+The exact bundled LiteRT package has an arm64 simulator slice. Use
+`--litert-probe --litert-probe-auto` for cable-free local-inference checks on Apple-silicon Macs;
+simulator timing does not replace final physical-device thermal and memory verification.
+For pre-LiteRT comparison, launch a Debug simulator build with `--force-backend-model` while the
+Mac backend is running; release builds ignore this diagnostic override.
+
+Run focused simulator tests with:
 
 ```sh
-xcodebuild -project ../Aquinas-iOS.xcodeproj -scheme Aquinas-iOS -destination 'platform=iOS Simulator,name=iPhone 16' test
+xcodebuild -project ../Aquinas-iOS.xcodeproj -scheme Aquinas-iOS -destination 'platform=iOS Simulator,name=iPhone 17,OS=27.0' test
 ```
 
 ## Coding Style & Naming Conventions

@@ -12,10 +12,11 @@ struct HomeDashboardView: View {
     let activeConversationID: UUID?
     let savedInsights: [ConceptDefinition]
     let userName: String
+    let questionOfTheDay: HomeQuestionOfTheDay?
     var onOpenMenu: () -> Void
     var onSelectConversation: (InquiryConversation) -> Void
     var onNewConversation: () -> Void
-    var onStartQuestion: (String) -> Void
+    var onStartQuestion: (HomeQuestionOfTheDay) -> Void
     var onOpenInsightBridge: (UUID, UUID) -> Void
     var onRefresh: () -> Void = {}
 
@@ -28,22 +29,16 @@ struct HomeDashboardView: View {
     }
 
     private var featuredConversation: InquiryConversation? {
-        if let activeConversationID,
-           let active = regularConversations.first(where: { $0.id == activeConversationID }) {
-            return active
-        }
-
-        return regularConversations.first
+        HomeConversationResume.featuredConversation(
+            in: regularConversations,
+            activeConversationID: activeConversationID
+        )
     }
 
     private var unfinishedConversations: [InquiryConversation] {
         regularConversations
             .filter(HomeDashboardContent.isUnfinished)
             .filter { $0.id != featuredConversation?.id }
-    }
-
-    private var questionOfTheDay: String {
-        HomeDashboardContent.questionOfTheDay()
     }
 
     private var bridgeSuggestion: HomeInsightBridgeSuggestion? {
@@ -77,8 +72,8 @@ struct HomeDashboardView: View {
                             insightCount: savedInsights.count,
                             studyTopicCount: studyTopics.count,
                             unfinishedCount: unfinishedConversations.count,
-                            question: questionOfTheDay,
-                            onStartQuestion: { onStartQuestion(questionOfTheDay) }
+                            questionOfTheDay: questionOfTheDay,
+                            onStartQuestion: onStartQuestion
                         )
 
                         HomeFigmaDivider()
@@ -123,15 +118,6 @@ struct HomeDashboardView: View {
             .refreshable {
                 refreshContent()
             }
-            .overlay(alignment: .bottom) {
-                LinearGradient(
-                    colors: [AquinasTheme.Colors.canvas.opacity(0), AquinasTheme.Colors.canvas],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .frame(height: 350)
-                .allowsHitTesting(false)
-            }
 
             AquinasNavButton(onMenuTap: onOpenMenu)
                 .padding(.leading, 24)
@@ -169,8 +155,8 @@ private struct HomeFigmaOpeningSection: View {
     let insightCount: Int
     let studyTopicCount: Int
     let unfinishedCount: Int
-    let question: String
-    var onStartQuestion: () -> Void
+    let questionOfTheDay: HomeQuestionOfTheDay?
+    var onStartQuestion: (HomeQuestionOfTheDay) -> Void
 
     var body: some View {
         VStack(alignment: .center, spacing: 84) {
@@ -211,7 +197,12 @@ private struct HomeFigmaOpeningSection: View {
                 }
             }
 
-            HomeFigmaQuestionCard(question: question, action: onStartQuestion)
+            if let questionOfTheDay {
+                HomeFigmaQuestionCard(
+                    question: questionOfTheDay.question,
+                    action: { onStartQuestion(questionOfTheDay) }
+                )
+            }
         }
     }
 }

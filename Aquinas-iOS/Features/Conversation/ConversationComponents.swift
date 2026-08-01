@@ -9,6 +9,45 @@ import Foundation
 import SwiftUI
 import UIKit
 
+private let questionCanceledResponseText = "Question canceled"
+
+/// Keeps a model task current until its response actually begins revealing in the UI.
+/// Backend completion alone is not the user-visible completion boundary.
+@MainActor
+private final class ResponseRevealGate {
+    private(set) var hasStarted = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func markStarted() {
+        guard !hasStarted else { return }
+        hasStarted = true
+        continuation?.resume()
+        continuation = nil
+    }
+
+    func waitUntilStarted() async {
+        guard !hasStarted, !Task.isCancelled else { return }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !hasStarted, !Task.isCancelled else {
+                    continuation.resume()
+                    return
+                }
+                self.continuation = continuation
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.resumeWaiter()
+            }
+        }
+    }
+
+    private func resumeWaiter() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 // MARK: - Chat Thread Column
 
 /// The actual vertical conversation: branch title, locked questions, model responses, and next input.
@@ -26,13 +65,21 @@ struct ChatThreadColumn: View {
     var inputFont: ConversationFontOption = .serif
     var responseTextAlignment: ResponseTextAlignmentOption = .center
     var responseFont: ConversationFontOption = .sans
+    var personality: ConversationPersonality = .balanced
     var loadingInsightKey: String? = nil
     var queuedInsightKeys: Set<String> = []
+    var savedInsightIDs: Set<UUID> = []
     let modelTasks: ModelTaskQueue
     /// True when another serialized model task is already running at submit time.
     var isModelBusy: Bool = false
+    /// Prevents a restored queued draft from focusing its hidden UIKit editor while the user
+    /// is browsing another page. The draft remains ready when they return.
+    var isPageVisible: Bool = true
     var emptyStateUserName: String = "Ryan"
     var emptyStateEyebrow: String = ""
+    /// Height available above the bottom model controls. The pristine new-conversation
+    /// prompt uses this to center its heading and composer as one unit.
+    var newConversationViewportHeight: CGFloat = 0
     /// The conversation's study topic name, if it belongs to one — takes priority over
     /// `emptyStateEyebrow` in the header eyebrow, and makes it tappable to change the topic.
     var studyTopicTitle: String? = nil
@@ -46,6 +93,7 @@ struct ChatThreadColumn: View {
     var onDeleteBranch: () -> Void
     var onConversationTitleChange: (String) -> Void
     var onTopInputFocused: () -> Void = {}
+    var onTopQuestionSubmitted: () -> Void = {}
     var onBottomInputFocused: () -> Void
     var onActiveInputTextChange: (String) -> Void = { _ in }
     /// Incremented by the parent to request inserting `commandToInsert` into whichever
@@ -57,12 +105,19 @@ struct ChatThreadColumn: View {
     var onSelectSlashCommand: (SlashCommand) -> Void = { _ in }
     var onExecuteSlashCommand: (SlashCommandInvocation) -> Void = { _ in }
     var onQuoteHandled: () -> Void
-    var connectionConcepts: (ConceptDefinition, ConceptDefinition)? = nil
+    var onQuotedConceptRemoved: () -> Void = {}
+    var onQuotedConceptSubmitted: () -> Void = {}
+    var onQuotedConceptTap: (ConceptDefinition) -> Void = { _ in }
+    var connectionConcepts: [ConceptDefinition]? = nil
     var onConnectionHandled: (() -> Void)? = nil
+    var onResponseGenerated: (Int) -> Void = { _ in }
     var onResponseCompleted: (Int) -> Void = { _ in }
     var onResponseStarted: () -> Void = {}
     var onResponseCancelled: () -> Void = {}
     var onInsightTap: (String, String) -> Void = { _, _ in }
+    var onInlineInsightQuote: (ConceptDefinition) -> Void = { _ in }
+    var onInlineInsightFork: (ConceptDefinition, Int) -> Void = { _, _ in }
+    var onInlineInsightToggleSaved: (ConceptDefinition) -> Void = { _ in }
 
     private var modelResponseLineHeight: CGFloat {
         let fontName = responseFont == .sans
@@ -71,6 +126,15 @@ struct ChatThreadColumn: View {
         let font = UIFont(name: fontName, size: conversationFontSize.pointSize)
             ?? .systemFont(ofSize: conversationFontSize.pointSize)
         return ceil(font.lineHeight + 8)
+    }
+
+    private func funStatusText(for responseIndex: Int) -> String? {
+        modelTasks.allTasks.first { task in
+            guard case .userQuestion(let branchID, let taskResponseIndex) = task.kind else {
+                return false
+            }
+            return branchID == branchData.id && taskResponseIndex == responseIndex
+        }?.funStatusText
     }
 
     @Environment(\.colorScheme) private var colorScheme
@@ -83,8 +147,9 @@ struct ChatThreadColumn: View {
     @State private var modelQueuedResponseIndices: Set<Int> = []
     @State private var responseThinkingIntroByIndex: [Int: Bool] = [:]
     @State private var responseThinkingSummaryByIndex: [Int: [String]] = [:]
+    @State private var responseRevealGatesByIndex: [Int: ResponseRevealGate] = [:]
     @State private var pendingGeneratedTitleQuestion: String? = nil
-    @State private var localConnectionConcepts: (ConceptDefinition, ConceptDefinition)?
+    @State private var localConnectionConcepts: [ConceptDefinition]?
     @Namespace private var quotedContextChipNamespace
     @FocusState private var isTopQuestionFocused: Bool
     @FocusState private var isBottomQuestionFocused: Bool
@@ -258,16 +323,24 @@ struct ChatThreadColumn: View {
     }
 
     // Routes through BackendAquinasModel for structured prose and tappable key terms.
-    private func appendSimulatedResponse() {
+    private func appendSimulatedResponse(
+        connectionConcepts: [ConceptDefinition]? = nil,
+        restoreQueuedQuestion: @escaping () -> Void
+    ) {
         let context = ConversationContext(
             compactedContext: branchData.compactedContext,
-            transcript: modelTranscriptForResponse()
+            transcript: modelTranscriptForResponse(
+                connectionConcepts: connectionConcepts
+            ),
+            personality: personality
         )
         let responseIndex = branchData.activeChatBlocks.count
         let thinkingEnabled = showsThinkingIntro
+        let revealGate = ResponseRevealGate()
 
         animatedResponseIndices.insert(responseIndex)
         pendingResponseIndices.insert(responseIndex)
+        responseRevealGatesByIndex[responseIndex] = revealGate
         if isModelBusy || !pendingResponseIndices.subtracting([responseIndex]).isEmpty {
             modelQueuedResponseIndices.insert(responseIndex)
         }
@@ -282,13 +355,17 @@ struct ChatThreadColumn: View {
                 branchID: branchData.id,
                 responseIndex: responseIndex
             ),
+            originPage: .conversation,
             onStart: {
-                withAnimation(.easeInOut(duration: 0.25)) {
+                _ = withAnimation(.easeInOut(duration: 0.25)) {
                     modelQueuedResponseIndices.remove(responseIndex)
                 }
             },
             onCancel: {
-                cancelResponse(at: responseIndex)
+                cancelResponse(
+                    at: responseIndex,
+                    restoreQueuedQuestion: restoreQueuedQuestion
+                )
             }
         ) {
             let response = await aquinasModel.respond(
@@ -308,6 +385,10 @@ struct ChatThreadColumn: View {
                 case .thinkingSummary(let summary):
                     responseThinkingSummaryByIndex[responseIndex] = summary
                 case .responseText(let streamedText):
+                    // Keep the network stream buffered until the backend returns the
+                    // fully annotated response. This prevents unannotated text from
+                    // flashing before its Insight links are ready, while still letting
+                    // the thinking UI transition to "Writing response...".
                     guard !streamedText.isEmpty else { return }
                     streamingResponseIndices.insert(responseIndex)
                 }
@@ -324,11 +405,28 @@ struct ChatThreadColumn: View {
                 branchData.activeChatBlocks[responseIndex] = .text(response.annotatedText)
                 pendingResponseIndices.remove(responseIndex)
                 streamingResponseIndices.remove(responseIndex)
+                // The composer is functional state, so it must not depend on the
+                // response's ornamental word/underline animation completing without
+                // cancellation. The response reserves its final height while animating.
+                branchData.showBottomInput = true
             }
+            onResponseGenerated(responseIndex)
+            if response.annotatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                revealGate.markStarted()
+            }
+            await revealGate.waitUntilStarted()
+            responseRevealGatesByIndex.removeValue(forKey: responseIndex)
         }
     }
 
-    private func cancelResponse(at responseIndex: Int) {
+    private func cancelResponse(
+        at responseIndex: Int,
+        restoreQueuedQuestion: () -> Void
+    ) {
+        // Upcoming questions keep the existing draft-restoration behavior. Once a question
+        // is current, cancellation leaves a durable transcript marker and opens a fresh composer.
+        let wasStillQueued = modelQueuedResponseIndices.contains(responseIndex)
+        responseRevealGatesByIndex.removeValue(forKey: responseIndex)
         modelQueuedResponseIndices.remove(responseIndex)
         pendingResponseIndices.remove(responseIndex)
         streamingResponseIndices.remove(responseIndex)
@@ -336,22 +434,118 @@ struct ChatThreadColumn: View {
         responseThinkingSummaryByIndex.removeValue(forKey: responseIndex)
 
         guard branchData.activeChatBlocks.indices.contains(responseIndex) else {
+            if wasStillQueued {
+                restoreQueuedQuestion()
+            } else {
+                showFollowUpComposerAfterCancellation()
+            }
             onResponseCancelled()
             return
         }
 
         withAnimation(.spring(response: 0.4, dampingFraction: 0.84)) {
-            if responseIndex == branchData.activeChatBlocks.count - 1 {
-                branchData.activeChatBlocks.removeLast()
+            if wasStillQueued {
+                if responseIndex == branchData.activeChatBlocks.count - 1 {
+                    branchData.activeChatBlocks.removeLast()
+                } else {
+                    branchData.activeChatBlocks[responseIndex] = .text("Response stopped.")
+                }
             } else {
-                branchData.activeChatBlocks[responseIndex] = .text("Response stopped.")
+                animatedResponseIndices.remove(responseIndex)
+                responseThinkingIntroByIndex[responseIndex] = false
+                branchData.activeChatBlocks[responseIndex] = .text(questionCanceledResponseText)
+                branchData.showBottomInput = true
             }
+        }
+        if wasStillQueued {
+            restoreQueuedQuestion()
+        } else {
+            showFollowUpComposerAfterCancellation()
+            finalizePendingGeneratedTitleIfNeeded()
         }
         onResponseCancelled()
     }
 
-    private func modelTranscriptForResponse() -> [ChatBlock] {
+    private func showFollowUpComposerAfterCancellation() {
+        bottomFieldIsEmpty = true
+        branchData.bottomQuestionText = ""
+        branchData.showBottomInput = true
+        bottomFieldRelay.replaceAll("")
+        onActiveInputTextChange("")
+    }
+
+    private func restoreQueuedTopQuestion(
+        _ question: String,
+        uploads: [UploadedFile]
+    ) {
+        pendingGeneratedTitleQuestion = nil
+        topFieldSubmittedWidth = 0
+        topFieldIsEmpty = question.isEmpty
+        if showsPendingUploads {
+            uploadedFiles = uploads
+        }
+
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.84)) {
+            branchData.topQuestionText = question
+            branchData.topQuestionUploads = []
+            branchData.topQuestionSubmitted = false
+        }
+        onActiveInputTextChange(question)
+
+        guard isPageVisible else { return }
+        Task { @MainActor in
+            await Task.yield()
+            topFieldRelay.replaceAll(question)
+            bottomFieldIsActive = false
+            isBottomQuestionFocused = false
+            isTopQuestionFocused = true
+            topFieldRelay.focus()
+        }
+    }
+
+    private func restoreQueuedBottomQuestion(
+        _ question: String,
+        quotedConcept: ConceptDefinition?,
+        uploads: [UploadedFile],
+        connectionConcepts: [ConceptDefinition]?
+    ) {
+        if showsPendingUploads {
+            uploadedFiles = uploads
+        }
+        bottomFieldIsEmpty = question.isEmpty
+
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.84)) {
+            if case .user(let text, _, _) = branchData.activeChatBlocks.last,
+               text == question {
+                branchData.activeChatBlocks.removeLast()
+            }
+            branchData.bottomQuestionText = question
+            branchData.attachedConcept = quotedConcept
+            localConnectionConcepts = connectionConcepts
+            branchData.showBottomInput = true
+        }
+        onActiveInputTextChange(question)
+
+        guard isPageVisible else { return }
+        Task { @MainActor in
+            await Task.yield()
+            bottomFieldRelay.replaceAll(question)
+            bottomFieldIsActive = true
+            isTopQuestionFocused = false
+            isBottomQuestionFocused = true
+            bottomFieldRelay.focus()
+        }
+    }
+
+    private func modelTranscriptForResponse(
+        connectionConcepts: [ConceptDefinition]? = nil
+    ) -> [ChatBlock] {
         var transcript: [ChatBlock] = []
+        if let hiddenPromptContext = branchData.hiddenPromptContext?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !hiddenPromptContext.isEmpty {
+            transcript.append(.user(hiddenPromptContext, nil, []))
+        }
         if branchData.compactedContext == nil {
             let topQuestion = branchData.topQuestionText.trimmingCharacters(in: .whitespacesAndNewlines)
             if branchData.topQuestionSubmitted, !topQuestion.isEmpty {
@@ -362,16 +556,68 @@ struct ChatThreadColumn: View {
             branchData.compactedThroughBlockCount ?? 0,
             branchData.activeChatBlocks.count
         )
-        transcript.append(contentsOf: branchData.activeChatBlocks.dropFirst(compactedBlockCount))
+        transcript.append(
+            contentsOf: branchData.activeChatBlocks
+                .dropFirst(compactedBlockCount)
+                .filter { block in
+                    guard case .text(let text) = block else { return true }
+                    return text != questionCanceledResponseText
+                }
+        )
+        if let connectionConcepts,
+           connectionConcepts.count >= 2,
+           let userIndex = transcript.lastIndex(where: { block in
+               if case .user = block { return true }
+               return false
+           }),
+           case .user(let question, let concept, let uploads) = transcript[userIndex] {
+            transcript[userIndex] = .user(
+                connectionInquiryPrompt(
+                    concepts: connectionConcepts,
+                    question: question
+                ),
+                concept,
+                uploads
+            )
+        }
         return transcript
     }
 
-    private func responseShowsThinkingIntro(at index: Int) -> Bool {
-        responseThinkingIntroByIndex[index] ?? true
+    private func connectionInquiryPrompt(
+        concepts: [ConceptDefinition],
+        question: String
+    ) -> String {
+        let conceptLines = concepts.map { concept in
+            let title = concept.word.replacingOccurrences(of: "<", with: "‹")
+            let definition = concept.semanticDefinition
+                .replacingOccurrences(of: "<", with: "‹")
+            return "- \(title): \(definition)"
+        }
+        return """
+        <inquire_connection>
+        Selected concepts:
+        \(conceptLines.joined(separator: "\n"))
+        </inquire_connection>
+
+        User's connection inquiry:
+        \(question)
+        """
+    }
+
+    private func responseShowsThinkingIntro(at index: Int, text: String) -> Bool {
+        guard text != questionCanceledResponseText else { return false }
+        return responseThinkingIntroByIndex[index] ?? true
     }
 
     private func responseThinkingSummary(at index: Int) -> [String] {
         responseThinkingSummaryByIndex[index] ?? []
+    }
+
+    private func quotedConceptMatchID(
+        _ conceptID: UUID,
+        responseIndex: Int
+    ) -> String {
+        "\(branchData.id)-quoted-concept-\(responseIndex)-\(conceptID)"
     }
 
     private func finalizePendingGeneratedTitleIfNeeded() {
@@ -433,7 +679,13 @@ struct ChatThreadColumn: View {
         withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
             branchData.topQuestionSubmitted = true
         }
-        appendSimulatedResponse()
+        onTopQuestionSubmitted()
+        appendSimulatedResponse {
+            restoreQueuedTopQuestion(
+                submittedQuestion,
+                uploads: submittedUploads
+            )
+        }
     }
 
     // Adds a follow-up question lower in the thread and locks its attachments/context.
@@ -456,9 +708,13 @@ struct ChatThreadColumn: View {
 
         let quotedConcept = branchData.attachedConcept
         let submittedUploads = visibleUploads
+        let submittedConnectionConcepts = localConnectionConcepts
         withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
             branchData.showBottomInput = false
             branchData.activeChatBlocks.append(.user(submittedQuestion, quotedConcept, submittedUploads))
+        }
+        if quotedConcept != nil {
+            onQuotedConceptSubmitted()
         }
         if showsPendingUploads {
             uploadedFiles.removeAll()
@@ -466,7 +722,14 @@ struct ChatThreadColumn: View {
         branchData.attachedConcept = nil
         localConnectionConcepts = nil
         branchData.bottomQuestionText = ""
-        appendSimulatedResponse()
+        appendSimulatedResponse(connectionConcepts: submittedConnectionConcepts) {
+            restoreQueuedBottomQuestion(
+                submittedQuestion,
+                quotedConcept: quotedConcept,
+                uploads: submittedUploads,
+                connectionConcepts: submittedConnectionConcepts
+            )
+        }
     }
 
     private var newConversationPromptHeader: some View {
@@ -503,11 +766,13 @@ struct ChatThreadColumn: View {
                 }
 
                 if isEditingBigTitle {
-                    TextField("Conversation title", text: $bigTitleDraft)
+                    TextField("Conversation title", text: $bigTitleDraft, axis: .vertical)
                         .font(.custom("LibreBaskerville-Regular", size: 28))
                         .foregroundColor(AquinasTheme.Colors.headingText)
+                        .lineSpacing(14)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: .infinity, alignment: .center)
+                        .fixedSize(horizontal: false, vertical: true)
                         .focused($isBigTitleFocused)
                         .submitLabel(.done)
                         .onSubmit {
@@ -580,7 +845,27 @@ struct ChatThreadColumn: View {
     }
 
     var body: some View {
-        VStack(alignment: .center, spacing: 48) {
+        Group {
+            if usesOnlyNewConversationPrompt {
+                ZStack(alignment: .top) {
+                    Color.clear
+                        .frame(height: 1)
+                        .id(branchAnchor)
+
+                    VStack(alignment: .center, spacing: 48) {
+                        newConversationPromptHeader
+
+                        newConversationQuestionField
+                            .id("top-input-anchor-\(branchData.id)")
+                    }
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: max(newConversationViewportHeight, 1),
+                        alignment: .center
+                    )
+                }
+            } else {
+                VStack(alignment: .center, spacing: 48) {
             // MARK: Branch Header
             // Cross, branch title, starting context chip, and the first editable/locked question.
             Color.clear
@@ -637,7 +922,12 @@ struct ChatThreadColumn: View {
                         isFilled: branchData.topQuestionSubmitted,
                         appearDelay: 0.25,
                         showRemove: branchData.parentBranchID != nil && !branchData.topQuestionSubmitted,
+                        onTap: { onQuotedConceptTap(concept) },
                         onRemove: onDeleteBranch
+                    )
+                    .matchedGeometryEffect(
+                        id: quotedConceptMatchID(concept.id, responseIndex: 0),
+                        in: quotedContextChipNamespace
                     )
                 } else if let branchResponseTitle {
                     BranchContextChip(
@@ -724,60 +1014,84 @@ struct ChatThreadColumn: View {
                 ForEach(Array(branchData.activeChatBlocks.enumerated()), id: \.offset) { index, block in
                     switch block {
                     case .text(let textContent):
-                        TrackedResponseCard(
-                            textContent: textContent,
-                            responseIndex: index,
-                            shouldAnimateOnAppear: animatedResponseIndices.contains(index),
-                            showsThinkingIntro: responseShowsThinkingIntro(at: index),
-                            isAwaitingResponse: pendingResponseIndices.contains(index),
-                            isReceivingStream: streamingResponseIndices.contains(index),
-                            isQueuedForModel: modelQueuedResponseIndices.contains(index),
-                            usesNetworkStream: false,
-                            thinkingSummary: responseThinkingSummary(at: index),
-                            targetSpawnY: $targetSpawnY,
-                            targetSpawnResponseIndex: $targetSpawnResponseIndex,
-                            columnSpaceName: "ColumnContent-\(branchData.id)",
-                            responseTextAlignment: responseTextAlignment,
-                            responseFont: responseFont,
-                            conversationFontSize: conversationFontSize,
-                            loadingInsightKey: loadingInsightKey,
-                            queuedInsightKeys: queuedInsightKeys,
-                            onCenterChange: onSpawnYChange,
-                            onDuplicateBranch: {
-                                onDuplicateResponse(textContent, index)
-                            },
-                            onInsightTap: onInsightTap,
-                            onFinish: {
-                                animatedResponseIndices.remove(index)
-                                finalizePendingGeneratedTitleIfNeeded()
-                                withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) { branchData.showBottomInput = true }
-                                onResponseCompleted(index)
-                            }
-                        )
-                        .id("\(branchData.id)-response-\(index)")
+                        VStack(spacing: 16) {
+                            TrackedResponseCard(
+                                textContent: textContent,
+                                responseIndex: index,
+                                shouldAnimateOnAppear: animatedResponseIndices.contains(index),
+                                showsThinkingIntro: responseShowsThinkingIntro(at: index, text: textContent),
+                                isAwaitingResponse: pendingResponseIndices.contains(index),
+                                isReceivingStream: streamingResponseIndices.contains(index),
+                                isQueuedForModel: modelQueuedResponseIndices.contains(index),
+                                usesNetworkStream: false,
+                                thinkingSummary: responseThinkingSummary(at: index),
+                                funStatusText: funStatusText(for: index),
+                                targetSpawnY: $targetSpawnY,
+                                targetSpawnResponseIndex: $targetSpawnResponseIndex,
+                                columnSpaceName: "ColumnContent-\(branchData.id)",
+                                responseTextAlignment: responseTextAlignment,
+                                responseFont: responseFont,
+                                conversationFontSize: conversationFontSize,
+                                loadingInsightKey: loadingInsightKey,
+                                queuedInsightKeys: queuedInsightKeys,
+                                savedInsightIDs: savedInsightIDs,
+                                onCenterChange: onSpawnYChange,
+                                onDuplicateBranch: {
+                                    onDuplicateResponse(textContent, index)
+                                },
+                                onInsightTap: onInsightTap,
+                                onInlineInsightQuote: onInlineInsightQuote,
+                                onInlineInsightFork: { insight in
+                                    onInlineInsightFork(insight, index)
+                                },
+                                onInlineInsightToggleSaved: onInlineInsightToggleSaved,
+                                showsResponseActions: textContent != questionCanceledResponseText,
+                                onRevealStart: {
+                                    responseRevealGatesByIndex[index]?.markStarted()
+                                },
+                                onFinish: {
+                                    animatedResponseIndices.remove(index)
+                                    finalizePendingGeneratedTitleIfNeeded()
+                                    withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) { branchData.showBottomInput = true }
+                                    onResponseCompleted(index)
+                                }
+                            )
+                            .id(
+                                "\(branchData.id)-response-\(index)-"
+                                    + (textContent == questionCanceledResponseText ? "canceled" : "standard")
+                            )
+                        }
                         .transition(
                             animatedResponseIndices.contains(index)
                             ? .opacity.combined(with: .scale(scale: 0.5))
                             : .identity
                         )
 
-                    case .user(let questionText, let quotedConcept, let attachments):
+                    case .user(let questionText, let concept, let attachments):
                         VStack(spacing: 48) {
                             ConversationSeparator()
 
                             VStack(spacing: 16) {
                                 UploadedFileStrip(files: attachments)
 
-                                if let concept = quotedConcept {
+                                if let concept {
                                     BranchContextChip(
                                         title: concept.word.capitalized,
                                         icon: "text.bubble.fill",
                                         isFilled: true,
                                         animatesAppearance: false,
-                                        showRemove: false
+                                        showRemove: false,
+                                        onTap: { onQuotedConceptTap(concept) }
                                     )
-                                    .matchedGeometryEffect(id: concept.id, in: quotedContextChipNamespace)
+                                    .matchedGeometryEffect(
+                                        id: quotedConceptMatchID(
+                                            concept.id,
+                                            responseIndex: index + 1
+                                        ),
+                                        in: quotedContextChipNamespace
+                                    )
                                 }
+
                                 // Same component the top field uses post-submit (locked,
                                 // isSubmitted), not a plain Text — so a follow-up question
                                 // renders and behaves identically to the branch's first question.
@@ -820,20 +1134,28 @@ struct ChatThreadColumn: View {
                                 icon: "text.bubble",
                                 isFilled: false,
                                 showRemove: true,
+                                onTap: { onQuotedConceptTap(concept) },
                                 onRemove: {
                                     withAnimation {
                                         branchData.attachedConcept = nil
                                     }
+                                    onQuotedConceptRemoved()
                                 }
                             )
-                            .matchedGeometryEffect(id: concept.id, in: quotedContextChipNamespace)
+                            .matchedGeometryEffect(
+                                id: quotedConceptMatchID(
+                                    concept.id,
+                                    responseIndex:
+                                        branchData.activeChatBlocks.count + 1
+                                ),
+                                in: quotedContextChipNamespace
+                            )
                             .transition(.scale.combined(with: .opacity))
                         }
 
-                        if let (c1, c2) = localConnectionConcepts {
+                        if let concepts = localConnectionConcepts {
                             ConnectionContextChip(
-                                conceptA: c1,
-                                conceptB: c2,
+                                concepts: concepts,
                                 onRemove: {
                                     withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
                                         localConnectionConcepts = nil
@@ -889,6 +1211,8 @@ struct ChatThreadColumn: View {
                 }
                 .transition(.move(edge: .top).combined(with: .opacity).combined(with: .scale(scale: 0.95)))
             }
+                }
+            }
         }
         .padding(.bottom, 40)
         .coordinateSpace(name: "ColumnContent-\(branchData.id)")
@@ -909,10 +1233,10 @@ struct ChatThreadColumn: View {
                 onQuoteHandled()
             }
         }
-        .onChange(of: connectionConcepts?.0.id) { _, _ in
-            guard let pair = connectionConcepts else { return }
+        .onChange(of: connectionConcepts?.map(\.id)) { _, _ in
+            guard let concepts = connectionConcepts else { return }
             withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-                localConnectionConcepts = pair
+                localConnectionConcepts = concepts
                 branchData.showBottomInput = true
             }
             onConnectionHandled?()
@@ -1205,7 +1529,14 @@ private struct QuestionInputField: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .center)
-        .onPreferenceChange(QuestionInputWidthKey.self) { availableWidth = $0 }
+        .onPreferenceChange(QuestionInputWidthKey.self) { width in
+            guard width.isFinite,
+                  width > 0,
+                  abs(availableWidth - width) > 0.5 else {
+                return
+            }
+            availableWidth = width
+        }
         .animation(.spring(response: 0.32, dampingFraction: 0.82), value: boxWidth)
         .contentShape(Rectangle())
         .onTapGesture { onTapToFocus?() }
@@ -1225,6 +1556,7 @@ struct TrackedResponseCard: View {
     let isQueuedForModel: Bool
     let usesNetworkStream: Bool
     let thinkingSummary: [String]
+    let funStatusText: String?
     @Binding var targetSpawnY: CGFloat
     @Binding var targetSpawnResponseIndex: Int?
     let columnSpaceName: String
@@ -1233,9 +1565,15 @@ struct TrackedResponseCard: View {
     let conversationFontSize: ConversationFontSizeOption
     let loadingInsightKey: String?
     let queuedInsightKeys: Set<String>
+    let savedInsightIDs: Set<UUID>
     var onCenterChange: (Int, CGFloat) -> Void = { _, _ in }
     var onDuplicateBranch: () -> Void = {}
     var onInsightTap: (String, String) -> Void = { _, _ in }
+    var onInlineInsightQuote: (ConceptDefinition) -> Void = { _ in }
+    var onInlineInsightFork: (ConceptDefinition) -> Void = { _ in }
+    var onInlineInsightToggleSaved: (ConceptDefinition) -> Void = { _ in }
+    var showsResponseActions: Bool = true
+    var onRevealStart: () -> Void = {}
     var onFinish: () -> Void
 
     @State private var myYCenter: CGFloat = 0
@@ -1264,13 +1602,24 @@ struct TrackedResponseCard: View {
             isQueuedForModel: isQueuedForModel,
             usesNetworkStream: usesNetworkStream,
             thinkingSummary: thinkingSummary,
+            funStatusText: funStatusText,
             responseTextAlignment: responseTextAlignment,
             responseFont: responseFont,
             conversationFontSize: conversationFontSize,
             loadingInsightKey: loadingInsightKey,
             queuedInsightKeys: queuedInsightKeys,
+            savedInsightIDs: savedInsightIDs,
             onDuplicateBranch: onDuplicateBranch,
             onInsightTap: onInsightTap,
+            onInlineInsightQuote: onInlineInsightQuote,
+            onInlineInsightFork: { insight in
+                targetSpawnY = myYCenter
+                targetSpawnResponseIndex = responseIndex
+                onInlineInsightFork(insight)
+            },
+            onInlineInsightToggleSaved: onInlineInsightToggleSaved,
+            showsResponseActions: showsResponseActions,
+            onRevealStart: onRevealStart,
             onFinish: {
                 hasFinishedStreaming = true
                 onCenterChange(responseIndex, myYCenter)

@@ -9,9 +9,16 @@ import SwiftUI
 
 @main
 struct Aquinas_iOSApp: App {
+    private let runtime = AquinasApplicationRuntime.shared
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            if ProcessInfo.processInfo.arguments.contains("--litert-probe") {
+                LiteRTDeviceProbeView()
+            } else {
+                ContentView(modelTasks: runtime.modelTasks)
+                    .environment(\.aquinasModel, runtime.model)
+            }
         }
     }
 }

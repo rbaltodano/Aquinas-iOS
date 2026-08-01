@@ -15,11 +15,13 @@ struct InsightTreeCanvasView: View {
     let edges: [EdgeModel]
     let restoreFocusedCameraRequest: Int
     let focusedInsightID: UUID?
+    let focusedSearchNodeID: UUID?
     let pulsingInsightID: UUID?
     let pulsingNodeID: UUID?
     let selectedCanvasTargets: [CanvasSelectionTarget]
     let selectionPulseRequest: Int
     var makeNodeChildIDs: Set<UUID> = []
+    var generatedMakeNodeChildIDs: Set<UUID> = []
     /// Nodes that are user-placed midpoints — rendered as a bare insight chip (no
     /// node-concept circle), pinned at the node position.
     var placedMidpointNodeIDs: Set<UUID> = []
@@ -33,6 +35,15 @@ struct InsightTreeCanvasView: View {
     /// Normalized [0,1] depth per node (1 = nearest) from the third MDS component,
     /// driving the 2.5D depth cues. Missing entries render at full depth.
     var nodeDepths: [UUID: Double] = [:]
+    /// Global Insights renders every member in each cluster. Conversation trees remain compact.
+    var showsAllClusterInsights: Bool = false
+    /// Conversation trees begin with an in-memory fallback and replace it asynchronously with
+    /// backend-owned topology. Their entrance must wait for that persisted snapshot.
+    var defersEntranceUntilPersistedTree: Bool = false
+    /// Advances after a fully reconciled persisted snapshot is applied.
+    var persistedTreePresentationRevision: Int = 0
+    /// Matches the presentation revision only when that snapshot follows a real mutation.
+    var animatedPersistedTreePresentationRevision: Int = 0
     var isHoveringTarget: Bool = false
     var isMidpointMode: Bool = false
     var midpointCenterRequest: Int = 0
@@ -49,6 +60,8 @@ struct InsightTreeCanvasView: View {
     var onMidpointPlaced: (CGPoint, CanvasSelectionTarget, [Double]) -> Void = { _, _, _ in }
     /// The insight id of a just-placed midpoint, so it runs the loading-icon → text-reveal sequence.
     var midpointPlacedInsightID: UUID? = nil
+    /// Matches the placed id after generated content has replaced the loading placeholder.
+    var midpointGeneratedInsightID: UUID? = nil
     /// Fired once the placed midpoint insight has "loaded" (icon flash → text reveal → dot pulse),
     /// so the orchestration layer can pop its card.
     var onMidpointInsightLoaded: (UUID) -> Void = { _ in }
@@ -62,7 +75,7 @@ struct InsightTreeCanvasView: View {
     /// Fired to clear any currently hovered/docked insight or node card (e.g. before a
     /// generation zoom-out, so the previously hovered card doesn't linger).
     var onRequestDismissHover: () -> Void = {}
-    /// Reports the current blue-dot count whenever insights become discovered or undiscovered.
+    /// Reports the current blue-dot count whenever Insights or Node Concepts change discovery.
     var onUndiscoveredInsightCountChange: (Int) -> Void = { _ in }
 
     @Environment(\.scenePhase) private var scenePhase
@@ -79,9 +92,20 @@ struct InsightTreeCanvasView: View {
     @State private var selectionRipples:   [RippleTrigger] = []
     @State private var hasAppeared:        Bool = false
     @State private var revealedInsightIDs: Set<UUID> = []
+    @State private var revealedNodeIDs: Set<UUID> = []
     /// Insights the user hasn't opened yet — they show a blue "new" dot until first hovered.
     @State private var undiscoveredInsightIDs: Set<UUID> = []
+    /// New Node Concepts keep their own discovery state and clear it when first opened.
+    @State private var undiscoveredNodeIDs: Set<UUID> = []
     @State private var entranceTask:       Task<Void, Never>? = nil
+    @State private var midpointRevealTask: Task<Void, Never>? = nil
+    @State private var midpointLoadingStartedAt: [UUID: TimeInterval] = [:]
+    @State private var makeNodeRevealTask: Task<Void, Never>? = nil
+    @State private var makeNodeLoadingStartedAt: TimeInterval?
+    @State private var pendingMakeNodeChildren: [PendingMakeNodeChild] = []
+    /// Baseline for detecting Insights and Node Concepts added by a persisted tree mutation.
+    @State private var confirmedPersistedInsightIDs: Set<UUID> = []
+    @State private var confirmedPersistedNodeIDs: Set<UUID> = []
     @State private var pulseCycleStartedAt = Date().timeIntervalSinceReferenceDate
     @State private var connectorPulseDelayUntil = Date().timeIntervalSinceReferenceDate
     @State private var selectionPulseStartTime: TimeInterval?
@@ -97,6 +121,19 @@ struct InsightTreeCanvasView: View {
     /// stops chasing the generating insight and the user can look around freely.
     @State private var userMovedSincePlacement: Bool = false
     @GestureState private var dragOffset:  CGSize = .zero
+
+    private struct PendingMakeNodeChild: Equatable {
+        let id: UUID
+        let orbitIndex: Int
+    }
+
+    /// The narrow slice of node state that actually changes graph geometry.
+    /// Labels, definitions, embeddings, and refreshed snapshots with identical membership
+    /// must not wake the physics simulation.
+    private struct PhysicsNodeSignature: Equatable {
+        let id: UUID
+        let visibleInsightIDs: [UUID]
+    }
 
     // MARK: - Live physics simulation
     /// Per-node simulated position + velocity. The canvas briefly relaxes these from the
@@ -121,28 +158,30 @@ struct InsightTreeCanvasView: View {
     private static let simDamping: CGFloat = 0.62       // lower = settles faster, less wobble
     private static let simMaxStep: CGFloat = 4          // per-frame move clamp
     private static let simMaxDt: CFTimeInterval = 1.0 / 30
-    private static let alphaDecay: Double = 0.08
-    private static let updateAlphaDecay: Double = 0.025
-    private static let updateIntensity: Double = 0.28
-    private static let breezeForce: CGFloat = 0.7
+    private static let alphaDecay: Double = 0.045
+    private static let updateAlphaDecay: Double = 0.05
+    private static let updateIntensity: Double = 0.14
+    private static let breezeDuration: CFTimeInterval = 1.5
+    private static let breezeForce: CGFloat = 0.9
     private static let alphaFloor: Double = 0
     private static let jitterAmplitude: CGFloat = 0
     private static let settleFrameBudget: Int = 150   // longer: chip bonds rotate into place
     private static let settleVelocityThreshold: CGFloat = 0.02
-    // Per-insight "inner tube": when two chips get within this radius they bounce apart.
-    // Cross-node overlap also nudges the parent nodes apart.
-    private static let insightBubbleRadius: CGFloat = 48
-    private static let insightBubblePadding: CGFloat = 12
-    private static let bubblePushK: CGFloat = 0.06
+    // Insight collision uses the chip's measured horizontal label footprint, not a fixed circle.
+    // Cross-node contact both separates parent nodes and rotates each free Insight bond.
+    private static let insightCollisionPadding: CGFloat = 24
+    private static let bubblePushK: CGFloat = 0.08
+    private static let crossNodeChipTorqueK: Double = 2.4
     private static let forceGain: CGFloat = 0.5          // scales summed force → velocity
-    // Chip-label angular spread: every domain around a node — insight bonds AND the fixed
-    // directions of node-to-node lines — repels EQUALLY (`domainK`), settling chips to
-    // maximum separation from each other and from the lines. Only chip angles move; node
-    // positions are owned by the MDS targets.
-    private static let domainK: Double = 1.0
-    private static let chipAngGain: Double = 0.4         // viscous angular response speed
-    private static let chipMaxAngStep: Double = 0.05     // max radians a bond rotates per frame
+    // Chip-label angular spread: every bond domain around a Node Concept has equal angular
+    // weight, including both Insight bonds and fixed node-to-node lines. Only chip angles move;
+    // node positions remain anchored to the semantic MDS targets.
+    private static let bondDomainK: Double = 1.4
+    private static let chipAngGain: Double = 0.45        // viscous angular response speed
+    private static let chipMaxAngStep: Double = 0.07     // max radians a bond rotates per frame
     private static let chipAngleEps: Double = 0.12       // softens the 1/Δθ repulsion
+    private static let insightCollisionFont =
+        UIFont(name: "Figtree-Bold", size: 14) ?? .boldSystemFont(ofSize: 14)
     // 2.5D depth cues from the third MDS component. One switch: false → pure 2D rendering.
     private static let depthCuesEnabled = true
     private static let depthMinScale: CGFloat = 0.85     // farthest node's scale
@@ -160,6 +199,15 @@ struct InsightTreeCanvasView: View {
         )
     }
 
+    private var physicsTopologySignature: [PhysicsNodeSignature] {
+        nodes.map {
+            PhysicsNodeSignature(
+                id: $0.id,
+                visibleInsightIDs: canvasInsights(for: $0).map(\.id)
+            )
+        }
+    }
+
     private var insightTreeCanvasColor: Color {
         AquinasTheme.Colors.canvas
     }
@@ -167,7 +215,10 @@ struct InsightTreeCanvasView: View {
     /// While a selection exists and nothing is hovered, the unselected nodes/insights flash
     /// (mirroring the "Add concept to selection" button) to invite adding another. Hovering stops it.
     private var insightsFlashing: Bool {
-        !selectedCanvasTargets.isEmpty && !isHoveringTarget && !isMidpointMode
+        !selectedCanvasTargets.isEmpty
+            && selectedCanvasTargets.count < CanvasSelectionPolicy.maximumCount
+            && !isHoveringTarget
+            && !isMidpointMode
     }
 
     private func itemFlashOpacity(selected: Bool) -> Double {
@@ -211,18 +262,20 @@ struct InsightTreeCanvasView: View {
                     edgeHitTargets(camera: camera, size: size)
 
                     ForEach(displayNodes) { node in
+                        let visibleInsights = canvasInsights(for: node)
                         // Placed-midpoint nodes render as just their insight chip — no concept circle.
-                        if !placedMidpointNodeIDs.contains(node.id) {
+                        if !placedMidpointNodeIDs.contains(node.id),
+                           revealedNodeIDs.contains(node.id) {
                             nodeGroup(node, camera: camera, size: size, labelOpacity: nodeLabelOpacity)
                                 .opacity(itemFlashOpacity(selected: selectedCanvasTargets.contains(.node(node.id))))
                         }
 
-                        ForEach(Array(node.insights.prefix(6).enumerated()), id: \.element.id) { index, insight in
+                        ForEach(Array(visibleInsights.enumerated()), id: \.element.id) { index, insight in
                             insightLabel(
                                 insight,
                                 node: node,
                                 index: index,
-                                count: min(node.insights.count, 6),
+                                count: visibleInsights.count,
                                 camera: camera,
                                 size: size,
                                 labelOpacity: labelOpacity
@@ -256,17 +309,39 @@ struct InsightTreeCanvasView: View {
 
                 focusHoveredTarget(at: focusTarget, in: size)
             }
+            .onChange(of: focusedSearchNodeID) { _, newValue in
+                guard let newValue,
+                      let focusTarget = simPosition(of: newValue) else { return }
+
+                focusHoveredTarget(at: focusTarget, in: size)
+            }
             .onAppear {
                 hasAppeared = true
                 reconcileBodies()   // seed live physics bodies + start the tick
-                let newInsights = computeNewInsights()
                 undiscoveredInsightIDs = loadUndiscoveredInsightIDs()
-                markUndiscovered(newInsights.map(\.id))   // new since last open → blue dot
-                reportUndiscoveredInsightCount()
-                saveAllInsightIDsAsSeen()
-                entranceTask = Task {
-                    await runEntranceSequence(newInsights: newInsights, in: size)
+                undiscoveredNodeIDs = loadUndiscoveredNodeIDs()
+                revealedNodeIDs = Set(nodes.map(\.id))
+                if defersEntranceUntilPersistedTree {
+                    // Show the fallback tree without moving the camera or marking it as the
+                    // persisted baseline. A completed backend load will do both.
+                    revealedInsightIDs = visibleInsightIDs(in: nodes)
+                    reportUndiscoveredInsightCount()
+                } else {
+                    let newInsights = computeNewInsights()
+                    markUndiscovered(newInsights.map(\.id))   // new since last open → blue dot
+                    reportUndiscoveredInsightCount()
+                    saveAllInsightIDsAsSeen()
+                    entranceTask = Task {
+                        await runEntranceSequence(newInsights: newInsights, in: size)
+                    }
                 }
+            }
+            .onChange(of: persistedTreePresentationRevision) { _, revision in
+                guard defersEntranceUntilPersistedTree, revision > 0 else { return }
+                presentPersistedTree(
+                    animated: animatedPersistedTreePresentationRevision == revision,
+                    in: size
+                )
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase != .active { persistLivePositions() }
@@ -285,20 +360,9 @@ struct InsightTreeCanvasView: View {
                     withAnimation(.easeInOut(duration: 0.2)) { selectionFlashOpacity = 1 }
                 }
             }
-            .onChange(of: selectedCanvasTargets.count) { oldCount, newCount in
-                // When the first insight is added, drift the whole camera in a random
-                // direction (and stay there) to hint that the canvas can be panned.
-                guard oldCount == 0, newCount == 1, !isMidpointMode else { return }
-                let angle = Double.random(in: 0..<(2 * Double.pi))
-                let distance: CGFloat = 90
-                withAnimation(.spring(response: 0.6, dampingFraction: 0.82)) {
-                    offset.width += cos(angle) * distance
-                    offset.height += sin(angle) * distance
-                }
-            }
-            .onChange(of: nodes) { _, _ in
-                // Seed/drop live physics bodies as the topology changes (preserving existing
-                // bodies so the tree doesn't jump), then wake the sim.
+            .onChange(of: physicsTopologySignature) { _, _ in
+                // Only membership changes wake the layout. Content-only updates such as
+                // generated labels and definitions leave the settled tree completely still.
                 reconcileBodies()
                 reportUndiscoveredInsightCount()
             }
@@ -308,7 +372,7 @@ struct InsightTreeCanvasView: View {
                 startSim(
                     intensity: Self.updateIntensity,
                     alphaDecay: Self.updateAlphaDecay,
-                    addsBreeze: true
+                    frameBudget: 90
                 )
             }
             .onChange(of: nodes) { _, newNodes in
@@ -316,12 +380,20 @@ struct InsightTreeCanvasView: View {
                 // they start as a flashing icon at the node center, splay out to their orbit
                 // staggered by 0.15s each, then once "loaded" the title blurs up.
                 guard hasAppeared else { return }
+                if !defersEntranceUntilPersistedTree {
+                    let newNodeIDs = Set(newNodes.map(\.id)).subtracting(revealedNodeIDs)
+                    if !newNodeIDs.isEmpty {
+                        withAnimation(.easeOut(duration: 0.22)) {
+                            revealedNodeIDs.formUnion(newNodeIDs)
+                        }
+                    }
+                }
                 let known = revealedInsightIDs.union(loadingInsightIDs)
                 var newOnes: [(id: UUID, orbitIndex: Int)] = []
                 var plainNewIDs: [UUID] = []
                 var placedMidpointID: UUID? = nil
                 for node in newNodes {
-                    for (i, insight) in Array(node.insights.prefix(6)).enumerated() where !known.contains(insight.id) {
+                    for (i, insight) in canvasInsights(for: node).enumerated() where !known.contains(insight.id) {
                         if insight.id == midpointPlacedInsightID {
                             placedMidpointID = insight.id     // just-placed midpoint → simulated load + hover
                         } else if makeNodeChildIDs.contains(insight.id) {
@@ -333,7 +405,7 @@ struct InsightTreeCanvasView: View {
                 }
 
                 // Other new insights just appear with the standard blur + transform reveal.
-                if !plainNewIDs.isEmpty {
+                if !plainNewIDs.isEmpty && !defersEntranceUntilPersistedTree {
                     withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
                         for id in plainNewIDs { revealedInsightIDs.insert(id) }
                     }
@@ -345,127 +417,11 @@ struct InsightTreeCanvasView: View {
                 //      cross-fade in (fade/transform/blur), AND a big shockwave radiates — together
                 //   3. shortly after, the insight card pops up
                 if let placedID = placedMidpointID {
-                    loadingInsightIDs.insert(placedID)
-                    userMovedSincePlacement = false
-                    // Gets a blue "undiscovered" dot until first hovered, same as other new insights.
-                    markUndiscovered([placedID])
-                    if let pos = worldPosition(forInsightID: placedID) {
-                        focusHoveredTarget(at: pos, in: size)
-                    }
-                    Task {
-                        // Simulate the model generating this insight (loading icon flashes).
-                        try? await Task.sleep(for: .seconds(3.5))
-                        await MainActor.run {
-                            // Re-center the hover on the icon the instant it's generated (unless
-                            // the user has since moved), then draw on the solid icon + fire the
-                            // big shockwave simultaneously.
-                            if let pos = worldPosition(forInsightID: placedID) {
-                                if !userMovedSincePlacement {
-                                    focusHoveredTarget(at: pos, in: size)
-                                }
-                                rippleTrigger = RippleTrigger(
-                                    worldOrigin: pos,
-                                    startTime: Date().timeIntervalSinceReferenceDate,
-                                    strength: 2.8,
-                                    radiusScale: 0.5
-                                )
-                                // Two quick haptic taps as the shockwave bursts out.
-                                playGeneratedHaptics()
-                            }
-                            // Cross-fade: hollow loading icon fades+blurs out as the solid
-                            // icon+title fade/transform/blur in, together.
-                            withAnimation(.easeOut(duration: 0.32)) {
-                                loadingInsightIDs.remove(placedID)
-                                revealedInsightIDs.insert(placedID)
-                            }
-                        }
-                        // After the reveal settles, bring up the card.
-                        try? await Task.sleep(for: .milliseconds(650))
-                        await MainActor.run { onMidpointInsightLoaded(placedID) }
-                    }
+                    beginMidpointLoading(placedID, in: size)
                 }
 
                 guard !newOnes.isEmpty else { return }
-
-                for one in newOnes {
-                    loadingInsightIDs.insert(one.id)
-                    unsplayedInsightIDs.insert(one.id)
-                }
-                // Spin the Context wheel while these generate (same as the midpoint tool).
-                onGeneratingChange(true)
-                // New generated insights get a blue "undiscovered" dot until first hovered.
-                markUndiscovered(newOnes.map(\.id))
-
-                // Zoom out so the parent node and all its new children are visible together
-                // before the per-child tour begins, centered on the node itself.
-                onRequestDismissHover()
-                let genNodeIDs = Set(newOnes.compactMap { one in
-                    newNodes.first(where: { $0.insights.contains { $0.id == one.id } })?.id
-                })
-                let genNodePositions = genNodeIDs.compactMap { simPosition(of: $0) }
-                let framePositions = genNodePositions
-                    + newOnes.compactMap { worldPosition(forInsightID: $0.id) }
-                if !framePositions.isEmpty {
-                    zoomToFit(
-                        worldPositions: framePositions, in: size,
-                        padding: 90, fitFactor: 1.0,
-                        center: genNodePositions.count == 1 ? genNodePositions.first : nil
-                    )
-                }
-
-                // Splay each child out from the node center, staggered per orbit index.
-                for one in newOnes {
-                    let delay = Double(one.orbitIndex) * 0.15
-                    Task {
-                        try? await Task.sleep(for: .seconds(delay))
-                        await MainActor.run {
-                            withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) {
-                                _ = unsplayedInsightIDs.remove(one.id)
-                            }
-                        }
-                    }
-                }
-
-                // Generation completes after the same dwell the midpoint tool uses. Then the
-                // camera pans to each new child in turn so the user can see what was made: as it
-                // settles on each one, the hollow loading icon cross-fades to the solid icon+title,
-                // a big shockwave bursts out from it, and two haptic taps fire. The Context wheel
-                // stops once every child has been revealed.
-                Task {
-                    try? await Task.sleep(for: .seconds(3.5))
-                    for (index, one) in newOnes.enumerated() {
-                        guard !Task.isCancelled else { break }
-                        await MainActor.run {
-                            if let pos = worldPosition(forInsightID: one.id) {
-                                // First child: zoom back to the default zoom level — the same
-                                // one used for the normal new-insight entrance — while panning
-                                // to it, as a single combined animation (not two in sequence).
-                                focusInsight(at: pos, in: size, targetScale: index == 0 ? 1 : nil)
-                            }
-                        }
-                        try? await Task.sleep(for: .milliseconds(900))   // camera spring settle
-                        await MainActor.run {
-                            if let pos = worldPosition(forInsightID: one.id) {
-                                rippleTrigger = RippleTrigger(
-                                    worldOrigin: pos,
-                                    startTime: Date().timeIntervalSinceReferenceDate,
-                                    strength: 2.8,
-                                    radiusScale: 0.5
-                                )
-                            }
-                            playGeneratedHaptics()
-                            // Grow the parent's docked card with an Insight link for this child,
-                            // in sync with the haptic taps.
-                            onMakeNodeChildRevealed(one.id)
-                            withAnimation(.easeOut(duration: 0.32)) {
-                                loadingInsightIDs.remove(one.id)
-                                revealedInsightIDs.insert(one.id)
-                            }
-                        }
-                        try? await Task.sleep(for: .milliseconds(700))   // entrance settle before next
-                    }
-                    await MainActor.run { onGeneratingChange(false) }
-                }
+                beginMakeNodeLoading(newOnes, in: newNodes, size: size)
             }
             .onChange(of: loadingInsightIDs.isEmpty) { _, empty in
                 if empty {
@@ -501,6 +457,13 @@ struct InsightTreeCanvasView: View {
                     }
                 }
             }
+            .onChange(of: midpointGeneratedInsightID) { _, generatedID in
+                guard let generatedID else { return }
+                scheduleMidpointReveal(generatedID, in: size)
+            }
+            .onChange(of: generatedMakeNodeChildIDs) { _, _ in
+                scheduleMakeNodeRevealIfReady(in: size)
+            }
             .onChange(of: midpointCenterRequest) { _, newValue in
                 guard newValue > 0, isMidpointMode else { return }
                 withAnimation(.spring(response: 0.42, dampingFraction: 0.78)) {
@@ -519,6 +482,11 @@ struct InsightTreeCanvasView: View {
             }
             .onDisappear {
                 entranceTask?.cancel()
+                midpointRevealTask?.cancel()
+                makeNodeRevealTask?.cancel()
+                if !pendingMakeNodeChildren.isEmpty {
+                    onGeneratingChange(false)
+                }
                 persistLivePositions()
                 stopSim()
             }
@@ -802,10 +770,11 @@ struct InsightTreeCanvasView: View {
         // Placed-midpoint chips sit on the node itself, so they have no orbit connectors.
         let connectorNodes = displayNodes.filter { !placedMidpointNodeIDs.contains($0.id) }
         ForEach(connectorNodes) { node in
-            ForEach(Array(node.insights.prefix(6).enumerated()), id: \.element.id) { index, insight in
+            let visibleInsights = canvasInsights(for: node)
+            ForEach(Array(visibleInsights.enumerated()), id: \.element.id) { index, insight in
                 let start = depthScreenPosition(node.position, nodeID: node.id, camera: camera, size: size)
                 let end = depthScreenPosition(
-                    insightWorldPosition(for: node, index: index, count: min(node.insights.count, 6)),
+                    insightWorldPosition(for: node, index: index, count: visibleInsights.count),
                     nodeID: node.id,
                     camera: camera,
                     size: size
@@ -836,7 +805,7 @@ struct InsightTreeCanvasView: View {
                 graphEdgePulseOverlay(sourceNodeID: sourceNodeID, camera: camera, size: size, progress: pulseProgress)
 
                 ForEach(displayNodes) { node in
-                    let visibleInsights = Array(node.insights.prefix(6))
+                    let visibleInsights = canvasInsights(for: node)
                     let isPulsingNode = pulsingNodeID == node.id
                     let selectedInsightIndex = pulsingInsightID.flatMap { pulsingID in
                         visibleInsights.firstIndex { $0.id == pulsingID }
@@ -845,7 +814,7 @@ struct InsightTreeCanvasView: View {
                     ForEach(Array(visibleInsights.enumerated()), id: \.element.id) { index, insight in
                         let nodePosition = depthScreenPosition(node.position, nodeID: node.id, camera: camera, size: size)
                         let insightPosition = depthScreenPosition(
-                            insightWorldPosition(for: node, index: index, count: min(node.insights.count, 6)),
+                            insightWorldPosition(for: node, index: index, count: visibleInsights.count),
                             nodeID: node.id,
                             camera: camera,
                             size: size
@@ -1136,6 +1105,178 @@ struct InsightTreeCanvasView: View {
 
     static let canvasSpace = "treeCanvas"
 
+    /// Installs the three stable loading children, frames their promoted Node Concept, and splays
+    /// them into place. Their text remains hidden until the model publishes all three as ready.
+    private func beginMakeNodeLoading(
+        _ children: [(id: UUID, orbitIndex: Int)],
+        in newNodes: [NodeModel],
+        size: CGSize
+    ) {
+        guard pendingMakeNodeChildren.isEmpty else { return }
+        let pending = children
+            .sorted { $0.orbitIndex < $1.orbitIndex }
+            .map {
+                PendingMakeNodeChild(id: $0.id, orbitIndex: $0.orbitIndex)
+            }
+        pendingMakeNodeChildren = pending
+        makeNodeLoadingStartedAt = Date().timeIntervalSinceReferenceDate
+
+        for child in pending {
+            loadingInsightIDs.insert(child.id)
+            unsplayedInsightIDs.insert(child.id)
+        }
+        onGeneratingChange(true)
+        markUndiscovered(pending.map(\.id))
+
+        // Frame the promoted Node Concept and all three loading children before touring them.
+        onRequestDismissHover()
+        let generatedNodeIDs = Set(pending.compactMap { child in
+            newNodes.first(where: {
+                $0.insights.contains { $0.id == child.id }
+            })?.id
+        })
+        let generatedNodePositions = generatedNodeIDs.compactMap { simPosition(of: $0) }
+        let framePositions = generatedNodePositions
+            + pending.compactMap { worldPosition(forInsightID: $0.id) }
+        if !framePositions.isEmpty {
+            zoomToFit(
+                worldPositions: framePositions,
+                in: size,
+                padding: 90,
+                fitFactor: 1.0,
+                center: generatedNodePositions.count == 1
+                    ? generatedNodePositions.first
+                    : nil
+            )
+        }
+
+        for child in pending {
+            let delay = Double(child.orbitIndex) * 0.15
+            Task {
+                try? await Task.sleep(for: .seconds(delay))
+                await MainActor.run {
+                    withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) {
+                        _ = unsplayedInsightIDs.remove(child.id)
+                    }
+                }
+            }
+        }
+
+        // Covers the fast-response race where generation and the node rebuild arrive in one
+        // SwiftUI update; the readiness onChange path covers the normal slower response.
+        scheduleMakeNodeRevealIfReady(in: size)
+    }
+
+    /// Starts the existing three-stop camera tour only when all child titles and definitions have
+    /// replaced their loading content. The former 3.5-second simulated dwell remains a minimum.
+    private func scheduleMakeNodeRevealIfReady(in size: CGSize) {
+        guard !pendingMakeNodeChildren.isEmpty, makeNodeRevealTask == nil else { return }
+        let childIDs = Set(pendingMakeNodeChildren.map(\.id))
+        guard childIDs.isSubset(of: generatedMakeNodeChildIDs) else { return }
+
+        let children = pendingMakeNodeChildren
+        let startedAt = makeNodeLoadingStartedAt
+            ?? Date().timeIntervalSinceReferenceDate
+        let elapsed = Date().timeIntervalSinceReferenceDate - startedAt
+        let remainingDelay = max(3.5 - elapsed, 0)
+
+        makeNodeRevealTask = Task {
+            try? await Task.sleep(for: .seconds(remainingDelay))
+            guard !Task.isCancelled else { return }
+            for (index, child) in children.enumerated() {
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    if let position = worldPosition(forInsightID: child.id) {
+                        // The first stop restores the default zoom while panning; later stops
+                        // retain it, matching the existing Make Node choreography.
+                        focusInsight(
+                            at: position,
+                            in: size,
+                            targetScale: index == 0 ? 1 : nil
+                        )
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(900))
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    if let position = worldPosition(forInsightID: child.id) {
+                        rippleTrigger = RippleTrigger(
+                            worldOrigin: position,
+                            startTime: Date().timeIntervalSinceReferenceDate,
+                            strength: 2.8,
+                            radiusScale: 0.5
+                        )
+                    }
+                    playGeneratedHaptics()
+                    onMakeNodeChildRevealed(child.id)
+                    withAnimation(.easeOut(duration: 0.32)) {
+                        loadingInsightIDs.remove(child.id)
+                        revealedInsightIDs.insert(child.id)
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(700))
+            }
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                pendingMakeNodeChildren = []
+                makeNodeLoadingStartedAt = nil
+                makeNodeRevealTask = nil
+                onGeneratingChange(false)
+            }
+        }
+    }
+
+    /// Starts the existing loading presentation as soon as the placed identity enters the tree.
+    /// Generation completion is signaled separately, so a slow model never reveals blank text.
+    private func beginMidpointLoading(_ insightID: UUID, in size: CGSize) {
+        guard midpointLoadingStartedAt[insightID] == nil else { return }
+        midpointLoadingStartedAt[insightID] = Date().timeIntervalSinceReferenceDate
+        loadingInsightIDs.insert(insightID)
+        userMovedSincePlacement = false
+        markUndiscovered([insightID])
+        if let position = worldPosition(forInsightID: insightID) {
+            focusHoveredTarget(at: position, in: size)
+        }
+    }
+
+    /// Preserves the existing 3.5-second minimum loading animation but waits longer when real
+    /// generation takes longer. The generated title and definition are already in `nodes`.
+    private func scheduleMidpointReveal(_ insightID: UUID, in size: CGSize) {
+        beginMidpointLoading(insightID, in: size)
+        let startedAt = midpointLoadingStartedAt[insightID]
+            ?? Date().timeIntervalSinceReferenceDate
+        let elapsed = Date().timeIntervalSinceReferenceDate - startedAt
+        let remainingDelay = max(3.5 - elapsed, 0)
+
+        midpointRevealTask?.cancel()
+        midpointRevealTask = Task {
+            try? await Task.sleep(for: .seconds(remainingDelay))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                if let position = worldPosition(forInsightID: insightID) {
+                    if !userMovedSincePlacement {
+                        focusHoveredTarget(at: position, in: size)
+                    }
+                    rippleTrigger = RippleTrigger(
+                        worldOrigin: position,
+                        startTime: Date().timeIntervalSinceReferenceDate,
+                        strength: 2.8,
+                        radiusScale: 0.5
+                    )
+                    playGeneratedHaptics()
+                }
+                withAnimation(.easeOut(duration: 0.32)) {
+                    loadingInsightIDs.remove(insightID)
+                    revealedInsightIDs.insert(insightID)
+                }
+                midpointLoadingStartedAt[insightID] = nil
+            }
+            try? await Task.sleep(for: .milliseconds(650))
+            guard !Task.isCancelled else { return }
+            await MainActor.run { onMidpointInsightLoaded(insightID) }
+        }
+    }
+
     private func selectedWorldPositions() -> [CGPoint] {
         selectedCanvasTargets.compactMap { worldPosition(for: $0) }
     }
@@ -1206,7 +1347,9 @@ struct InsightTreeCanvasView: View {
     }
 
     /// Blend weights for each selected target given the handle position.
-    /// Two targets: linear along the segment. Three+: normalized inverse-distance.
+    /// Two targets interpolate along their segment. For larger selections, the geometric
+    /// centroid is defined as the exact equal-weight position; moving away from it uses
+    /// normalized inverse-distance weights.
     private func midpointWeights(for handle: CGPoint) -> [Double] {
         let positions = selectedWorldPositions()
         guard positions.count >= 2 else { return positions.map { _ in 1.0 } }
@@ -1217,6 +1360,21 @@ struct InsightTreeCanvasView: View {
             let denom = abx * abx + aby * aby
             let t = denom > 0 ? clamp(((handle.x - a.x) * abx + (handle.y - a.y) * aby) / denom, lower: 0, upper: 1) : 0.5
             return [Double(1 - t), Double(t)]
+        }
+
+        let center = positions.reduce(CGPoint.zero) {
+            CGPoint(x: $0.x + $1.x, y: $0.y + $1.y)
+        }
+        let centroid = CGPoint(
+            x: center.x / CGFloat(positions.count),
+            y: center.y / CGFloat(positions.count)
+        )
+        let selectionScale = positions.reduce(CGFloat.zero) {
+            max($0, hypot($1.x - centroid.x, $1.y - centroid.y))
+        }
+        let centerTolerance = max(selectionScale * 0.000_001, 0.000_1)
+        if hypot(handle.x - centroid.x, handle.y - centroid.y) <= centerTolerance {
+            return positions.map { _ in 1.0 / Double(positions.count) }
         }
 
         let epsilon: CGFloat = 0.0001
@@ -1233,9 +1391,54 @@ struct InsightTreeCanvasView: View {
             return closestPointOnSegment(point, positions[0], positions[1])
         }
         if positions.count >= 3 {
-            return pointInPolygon(point, positions) ? point : closestPointOnPolygon(point, positions)
+            let boundary = convexHull(of: positions)
+            if boundary.count == 2 {
+                return closestPointOnSegment(point, boundary[0], boundary[1])
+            }
+            return pointInPolygon(point, boundary) ? point : closestPointOnPolygon(point, boundary)
         }
         return point
+    }
+
+    /// Returns the selection's convex boundary in winding order. Selection order reflects tap
+    /// order, so using it directly can create a self-intersecting polygon that incorrectly
+    /// pushes the true centroid outside the draggable region.
+    private func convexHull(of points: [CGPoint]) -> [CGPoint] {
+        let sorted = points
+            .sorted { lhs, rhs in
+                lhs.x == rhs.x ? lhs.y < rhs.y : lhs.x < rhs.x
+            }
+            .reduce(into: [CGPoint]()) { unique, point in
+                if unique.last != point { unique.append(point) }
+            }
+        guard sorted.count > 2 else { return sorted }
+
+        func cross(_ origin: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
+            (a.x - origin.x) * (b.y - origin.y)
+                - (a.y - origin.y) * (b.x - origin.x)
+        }
+
+        var lower: [CGPoint] = []
+        for point in sorted {
+            while lower.count >= 2,
+                  cross(lower[lower.count - 2], lower[lower.count - 1], point) <= 0 {
+                lower.removeLast()
+            }
+            lower.append(point)
+        }
+
+        var upper: [CGPoint] = []
+        for point in sorted.reversed() {
+            while upper.count >= 2,
+                  cross(upper[upper.count - 2], upper[upper.count - 1], point) <= 0 {
+                upper.removeLast()
+            }
+            upper.append(point)
+        }
+
+        lower.removeLast()
+        upper.removeLast()
+        return lower + upper
     }
 
     private func closestPointOnSegment(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGPoint {
@@ -1280,7 +1483,8 @@ struct InsightTreeCanvasView: View {
     @ViewBuilder
     private func midpointOverlay(camera: InsightTreeCamera, size: CGSize, labelOpacity: Double) -> some View {
         let positions = selectedWorldPositions()
-        let screenPts = positions.map { camera.worldToScreen($0, in: size) }
+        let boundaryPositions = positions.count >= 3 ? convexHull(of: positions) : positions
+        let screenPts = boundaryPositions.map { camera.worldToScreen($0, in: size) }
 
         ZStack {
             // Connecting region: filled polygon for 3+, single segment for 2.
@@ -1334,13 +1538,13 @@ struct InsightTreeCanvasView: View {
             }
         case .insight(let id):
             if let node = displayNodes.first(where: { $0.insights.contains { $0.id == id } }) {
-                let visible = Array(node.insights.prefix(6))
+                let visible = canvasInsights(for: node)
                 if let index = visible.firstIndex(where: { $0.id == id }) {
                     insightLabel(
                         visible[index],
                         node: node,
                         index: index,
-                        count: min(node.insights.count, 6),
+                        count: visible.count,
                         camera: camera,
                         size: size,
                         labelOpacity: 1
@@ -1428,9 +1632,20 @@ struct InsightTreeCanvasView: View {
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .shadow(color: insightTreeCanvasColor, radius: 36, x: 0, y: 0)
             .frame(width: node.isSuggested ? 220 : 260)
+            .overlay(alignment: .topLeading) {
+                if undiscoveredNodeIDs.contains(node.id) {
+                    Circle()
+                        .fill(Color(red: 0.25, green: 0.55, blue: 1.0))
+                        .frame(width: 9, height: 9)
+                        .overlay(Circle().stroke(insightTreeCanvasColor, lineWidth: 1.5))
+                        .offset(x: 4, y: 4)
+                        .transition(.scale.combined(with: .opacity))
+                }
+            }
             .contentShape(Rectangle())
             .onTapGesture {
                 guard canAcceptTap else { return }
+                markNodeDiscovered(node.id)
                 if selectedCanvasTargets.isEmpty {
                     rippleTrigger = RippleTrigger(
                         worldOrigin: node.position,
@@ -1458,7 +1673,7 @@ struct InsightTreeCanvasView: View {
         .offset(y: hasAppeared ? 0 : 24)
         .opacity(hasAppeared ? 1 : 0)
         .animation(.spring(response: 0.6, dampingFraction: 0.75).delay(0.1), value: hasAppeared)
-        .transition(.scale(scale: 0.88, anchor: .center).combined(with: .opacity))
+        .transition(.glideFadeUp)
         // 2.5D depth: farther nodes render smaller, dimmer, and behind nearer ones.
         .scaleEffect(depthScale(node.id))
         .opacity(depthOpacity(node.id))
@@ -1572,9 +1787,9 @@ struct InsightTreeCanvasView: View {
             if placedMidpointNodeIDs.contains(node.id), node.insights.contains(where: { $0.id == insightID }) {
                 return node.position   // pinned chip sits on the node itself
             }
-            let visibleInsights = Array(node.insights.prefix(6))
+            let visibleInsights = canvasInsights(for: node)
             if let index = visibleInsights.firstIndex(where: { $0.id == insightID }) {
-                return insightWorldPosition(for: node, index: index, count: min(node.insights.count, 6))
+                return insightWorldPosition(for: node, index: index, count: visibleInsights.count)
             }
 
             if node.insights.contains(where: { $0.id == insightID }) {
@@ -1645,6 +1860,70 @@ struct InsightTreeCanvasView: View {
         Double(index) / Double(max(count, 1)) * (.pi * 2) + .pi / 8
     }
 
+    /// Midpoint of the largest unoccupied arc. New Insight bonds use this instead of an
+    /// index-based angle so additions preserve the widest possible bond angles around a node.
+    private func maximizedChipGapAngle(among angles: [Double]) -> Double {
+        guard !angles.isEmpty else { return .pi / 8 }
+        let fullTurn = Double.pi * 2
+        let sorted = angles.map { angle in
+            var normalized = angle.truncatingRemainder(dividingBy: fullTurn)
+            if normalized < 0 { normalized += fullTurn }
+            return normalized
+        }.sorted()
+
+        var largestGap = -Double.infinity
+        var largestGapStart = sorted[0]
+        for index in sorted.indices {
+            let start = sorted[index]
+            let end = index + 1 < sorted.count ? sorted[index + 1] : sorted[0] + fullTurn
+            let gap = end - start
+            if gap > largestGap {
+                largestGap = gap
+                largestGapStart = start
+            }
+        }
+        return (largestGapStart + largestGap / 2).truncatingRemainder(dividingBy: fullTurn)
+    }
+
+    /// Directions of every visible node-to-node line connected to `nodeID`. These fixed bonds
+    /// participate in the same angular domain as the Node Concept's Insight bonds.
+    private func connectedNodeBondAngles(for nodeID: UUID) -> [Double] {
+        displayGraphEdges().compactMap { edge in
+            let neighborID: UUID
+            if edge.fromNodeID == nodeID {
+                neighborID = edge.toNodeID
+            } else if edge.toNodeID == nodeID {
+                neighborID = edge.fromNodeID
+            } else {
+                return nil
+            }
+            guard let parentPosition = bodies[nodeID]?.pos,
+                  let neighborPosition = bodies[neighborID]?.pos else {
+                return nil
+            }
+            return Double(
+                atan2(
+                    neighborPosition.y - parentPosition.y,
+                    neighborPosition.x - parentPosition.x
+                )
+            )
+        }
+    }
+
+    /// Matches the rendered Insight chip's fixed horizontal layout closely enough for the
+    /// cleanup simulation to keep even long titles from overlapping chips in another node.
+    private func insightCollisionSize(for insight: InsightModel) -> CGSize {
+        let titleWidth = ceil(
+            (insight.title as NSString).size(
+                withAttributes: [.font: Self.insightCollisionFont]
+            ).width
+        )
+        return CGSize(
+            width: 20 + 14 + 10 + titleWidth + 20,
+            height: 16 + Self.insightCollisionFont.lineHeight + 16
+        )
+    }
+
     /// Wraps an angle difference to [-π, π].
     private func wrapAngle(_ a: Double) -> Double {
         var x = a.truncatingRemainder(dividingBy: 2 * .pi)
@@ -1654,8 +1933,9 @@ struct InsightTreeCanvasView: View {
     }
 
     private func insightWorldPosition(for node: NodeModel, index: Int, count: Int) -> CGPoint {
-        guard index < node.insights.count else { return node.position }
-        let insightID = node.insights[index].id
+        let visibleInsights = canvasInsights(for: node)
+        guard index < visibleInsights.count else { return node.position }
+        let insightID = visibleInsights[index].id
         // Free VSEPR bond angle (falls back to the even base angle until the sim seeds it).
         let angle = chipAngles[insightID]?.angle ?? baseChipAngle(index: index, count: count)
         let radius = bondLength(forInsightID: insightID)
@@ -1712,6 +1992,15 @@ struct InsightTreeCanvasView: View {
         }
     }
 
+    private func canvasInsights(for node: NodeModel) -> [InsightModel] {
+        let members = canvasInsightMembers(
+            nodeLabel: node.conceptLabel,
+            insights: node.insights,
+            preservesMatchingTitle: placedMidpointNodeIDs.contains(node.id)
+        )
+        return showsAllClusterInsights ? members : Array(members.prefix(6))
+    }
+
     /// Live simulated position for a node id (for by-id lookups).
     private func simPosition(of id: UUID) -> CGPoint? {
         bodies[id]?.pos ?? nodes.first(where: { $0.id == id })?.position
@@ -1720,7 +2009,9 @@ struct InsightTreeCanvasView: View {
     /// Node footprint for the overlap-separation force — its longest bond plus chip extent.
     private func simFootprintRadius(_ node: NodeModel) -> CGFloat {
         if placedMidpointNodeIDs.contains(node.id) { return 70 }
-        let maxBond = node.insights.prefix(6).map { bondLength(forInsightID: $0.id) }.max() ?? 190
+        let maxBond = canvasInsights(for: node)
+            .map { bondLength(forInsightID: $0.id) }
+            .max() ?? 70
         return maxBond + 64
     }
 
@@ -1785,25 +2076,44 @@ struct InsightTreeCanvasView: View {
         }
         bodies = next
 
-        // Seed/drop per-insight bond angle; new chips start at their even base angle, then
-        // VSEPR repulsion spreads them. Existing angles are preserved (no jump).
-        let chipIDs = Set(nodes.flatMap { $0.insights.prefix(6).map(\.id) })
+        // Seed/drop per-insight bond angles. A node without external bonds starts evenly
+        // distributed. Otherwise every new Insight enters the largest open arc among both its
+        // sibling Insight bonds and all node-to-node lines connected to the parent concept.
+        let chipIDs = Set(nodes.flatMap { canvasInsights(for: $0).map(\.id) })
         var nextAngles = chipAngles.filter { chipIDs.contains($0.key) }
         for node in nodes {
-            let count = min(node.insights.count, 6)
-            for (index, insight) in node.insights.prefix(6).enumerated() where nextAngles[insight.id] == nil {
-                nextAngles[insight.id] = ChipAngle(angle: baseChipAngle(index: index, count: count))
+            let visibleInsights = canvasInsights(for: node)
+            var occupiedAngles = connectedNodeBondAngles(for: node.id)
+            if isInitialLayout && occupiedAngles.isEmpty {
+                for (index, insight) in visibleInsights.enumerated() where nextAngles[insight.id] == nil {
+                    nextAngles[insight.id] = ChipAngle(
+                        angle: baseChipAngle(index: index, count: visibleInsights.count)
+                    )
+                }
+                continue
+            }
+
+            occupiedAngles.append(
+                contentsOf: visibleInsights.compactMap { nextAngles[$0.id]?.angle }
+            )
+            for insight in visibleInsights where nextAngles[insight.id] == nil {
+                let seed = maximizedChipGapAngle(among: occupiedAngles)
+                nextAngles[insight.id] = ChipAngle(angle: seed)
+                occupiedAngles.append(seed)
             }
         }
         chipAngles = nextAngles
 
         if isInitialLayout {
-            startSim()
+            // Restored positions are already authoritative. Opening the Canvas should be
+            // perfectly still rather than replaying a global settling pass.
+            freezeSimulation()
         } else {
             startSim(
                 intensity: Self.updateIntensity,
                 alphaDecay: Self.updateAlphaDecay,
-                addsBreeze: true
+                addsBreeze: true,
+                frameBudget: 90
             )
         }
     }
@@ -1831,32 +2141,59 @@ struct InsightTreeCanvasView: View {
         var forces: [UUID: CGVector] = [:]
         var maxChipAngMotion: Double = 0   // keeps the sim awake while chips are still spreading
 
-        // Live world positions of each visible chip (free VSEPR bond angle + relatedness radius),
-        // used for cross-node node-push and the angular spread below.
-        struct ChipInfo { let id: UUID; let nodeID: UUID; let angle: Double; let pos: CGPoint }
+        // Live world footprint of every visible chip. These participate in one global collision
+        // pass, regardless of which Node Concept owns them.
+        struct ChipInfo {
+            let id: UUID
+            let nodeID: UUID
+            let angle: Double
+            let radius: CGFloat
+            let pos: CGPoint
+            let halfWidth: CGFloat
+            let halfHeight: CGFloat
+        }
         var chipInfos: [ChipInfo] = []
-        var chipByNode: [UUID: [CGPoint]] = [:]
-        for (id, body) in bodies {
-            if placedMidpointNodeIDs.contains(id) {
-                chipByNode[id] = [body.pos]   // bare midpoint chip sits on the node
+        for node in nodes {
+            guard let body = bodies[node.id] else { continue }
+            if placedMidpointNodeIDs.contains(node.id) {
+                guard let insight = node.insights.first else { continue }
+                let size = insightCollisionSize(for: insight)
+                chipInfos.append(
+                    ChipInfo(
+                        id: insight.id,
+                        nodeID: node.id,
+                        angle: 0,
+                        radius: 0,
+                        pos: body.pos,
+                        halfWidth: size.width / 2,
+                        halfHeight: size.height / 2
+                    )
+                )
                 continue
             }
-            guard let node = nodeByID[id] else { continue }
-            var pts: [CGPoint] = []
-            for (index, insight) in node.insights.prefix(6).enumerated() {
-                let theta = chipAngles[insight.id]?.angle ?? baseChipAngle(index: index, count: min(node.insights.count, 6))
+            let visibleInsights = canvasInsights(for: node)
+            for (index, insight) in visibleInsights.enumerated() {
+                let theta = chipAngles[insight.id]?.angle ?? baseChipAngle(index: index, count: visibleInsights.count)
                 let radius = bondLength(forInsightID: insight.id)
                 let pos = CGPoint(x: body.pos.x + cos(theta) * radius, y: body.pos.y + sin(theta) * radius)
-                chipInfos.append(ChipInfo(id: insight.id, nodeID: id, angle: theta, pos: pos))
-                pts.append(pos)
+                let size = insightCollisionSize(for: insight)
+                chipInfos.append(
+                    ChipInfo(
+                        id: insight.id,
+                        nodeID: node.id,
+                        angle: theta,
+                        radius: radius,
+                        pos: pos,
+                        halfWidth: size.width / 2,
+                        halfHeight: size.height / 2
+                    )
+                )
             }
-            chipByNode[id] = pts
         }
 
         // Every domain around a node: its insight bonds AND the fixed directions of its
-        // node-to-node lines. All domains repel equally, but only chip angles move — node
-        // positions belong to the MDS targets, so line directions act as read-only repellers
-        // that keep chips from sitting on top of edges.
+        // node-to-node lines. Only chip angles move — node positions belong to the MDS targets,
+        // so line directions act as read-only repellers that keep chips off visible edges.
         enum BondKind { case insight(UUID); case fixedEdge }
         struct Bond { let angle: Double; let kind: BondKind }
         var bondsByNode: [UUID: [Bond]] = [:]
@@ -1871,21 +2208,93 @@ struct InsightTreeCanvasView: View {
             bondsByNode[edge.toNodeID, default: []].append(Bond(angle: Double(atan2(aPos.y - bPos.y, aPos.x - bPos.x)), kind: .fixedEdge))
         }
 
-        // Anchor spring toward the MDS target + overlap separation + per-chip bubble collision.
+        // Cross-node Insight collision. A collision rotates both free bonds away from contact
+        // and gently separates their parent nodes, allowing Insights in unrelated concepts to
+        // affect one another without discarding the semantic layout.
+        var crossNodeForces: [UUID: CGVector] = [:]
+        var chipTorque: [UUID: Double] = [:]
+        func addCrossNodeForce(_ force: CGVector, to nodeID: UUID) {
+            let current = crossNodeForces[nodeID, default: .zero]
+            crossNodeForces[nodeID] = CGVector(
+                dx: current.dx + force.dx,
+                dy: current.dy + force.dy
+            )
+        }
+        for firstIndex in chipInfos.indices {
+            for secondIndex in chipInfos.indices where secondIndex > firstIndex {
+                let first = chipInfos[firstIndex]
+                let second = chipInfos[secondIndex]
+                guard first.nodeID != second.nodeID else { continue }
+
+                let dx = first.pos.x - second.pos.x
+                let dy = first.pos.y - second.pos.y
+                let overlapX = first.halfWidth + second.halfWidth
+                    + Self.insightCollisionPadding - abs(dx)
+                let overlapY = first.halfHeight + second.halfHeight
+                    + Self.insightCollisionPadding - abs(dy)
+                guard overlapX > 0, overlapY > 0 else { continue }
+
+                let firstSortsBeforeSecond = first.id.uuidString < second.id.uuidString
+                let xDirection: CGFloat = abs(dx) > 0.5
+                    ? (dx >= 0 ? 1 : -1)
+                    : (firstSortsBeforeSecond ? -1 : 1)
+                let yDirection: CGFloat = abs(dy) > 0.5
+                    ? (dy >= 0 ? 1 : -1)
+                    : (firstSortsBeforeSecond ? 1 : -1)
+                let separation: CGVector = overlapX < overlapY
+                    ? CGVector(dx: xDirection * overlapX, dy: 0)
+                    : CGVector(dx: 0, dy: yDirection * overlapY)
+                let separationLength = max(hypot(separation.dx, separation.dy), 1)
+                let unitX = separation.dx / separationLength
+                let unitY = separation.dy / separationLength
+                let force = CGVector(
+                    dx: separation.dx * Self.bubblePushK,
+                    dy: separation.dy * Self.bubblePushK
+                )
+                addCrossNodeForce(force, to: first.nodeID)
+                addCrossNodeForce(CGVector(dx: -force.dx, dy: -force.dy), to: second.nodeID)
+
+                let normalizedDepth = Double(min(min(overlapX, overlapY) / 48, 2))
+                if first.radius > 1 {
+                    let tangentX = CGFloat(-sin(first.angle))
+                    let tangentY = CGFloat(cos(first.angle))
+                    let tangentialContact = Double(unitX * tangentX + unitY * tangentY)
+                    chipTorque[first.id, default: 0] +=
+                        tangentialContact * normalizedDepth * Self.crossNodeChipTorqueK
+                }
+                if second.radius > 1 {
+                    let tangentX = CGFloat(-sin(second.angle))
+                    let tangentY = CGFloat(cos(second.angle))
+                    let tangentialContact = Double(-unitX * tangentX - unitY * tangentY)
+                    chipTorque[second.id, default: 0] +=
+                        tangentialContact * normalizedDepth * Self.crossNodeChipTorqueK
+                }
+            }
+        }
+
+        // Anchor spring toward the MDS target + whole-node and global Insight separation.
         for i in entries.indices {
             let (idA, a) = entries[i]
             if pinned.contains(idA) { continue }
-            var fx: CGFloat = 0, fy: CGFloat = 0
+            var fx = crossNodeForces[idA]?.dx ?? 0
+            var fy = crossNodeForces[idA]?.dy ?? 0
             if let target = layoutTargets[idA] {
                 fx += (target.x - a.pos.x) * Self.anchorSpringK
                 fy += (target.y - a.pos.y) * Self.anchorSpringK
             }
             if let breezeStartedAt {
-                let elapsed = now - breezeStartedAt
-                let phaseOffset = Double(idA.uuid.0) / 255 * 0.45
-                let wave = CGFloat(sin(elapsed * 2.4 + phaseOffset))
-                fx += breezeDirection.dx * Self.breezeForce * wave
-                fy += breezeDirection.dy * Self.breezeForce * wave
+                let progress = min(max((now - breezeStartedAt) / Self.breezeDuration, 0), 1)
+                if progress < 1 {
+                    // A single soft gust: the sine-squared envelope reaches zero at both
+                    // ends, avoiding the abrupt force changes that read as jitter.
+                    let envelope = CGFloat(pow(sin(.pi * progress), 2))
+                    let phaseOffset = Double(idA.uuid.0) / 255 * 0.18
+                    let localVariation = CGFloat(
+                        0.88 + 0.12 * sin(progress * .pi + phaseOffset)
+                    )
+                    fx += breezeDirection.dx * Self.breezeForce * envelope * localVariation
+                    fy += breezeDirection.dy * Self.breezeForce * envelope * localVariation
+                }
             }
             for j in entries.indices where j != i {
                 let (idB, b) = entries[j]
@@ -1902,23 +2311,6 @@ struct InsightTreeCanvasView: View {
                         fy += (dy / dist) * push
                     }
                 }
-
-                // Per-chip bubbles: if any of A's chips overlaps any of B's chips, bump A away.
-                if let chipsA = chipByNode[idA], let chipsB = chipByNode[idB] {
-                    let minChip = Self.insightBubbleRadius * 2 + Self.insightBubblePadding
-                    for ca in chipsA {
-                        for cb in chipsB {
-                            var cdx = ca.x - cb.x
-                            var cdy = ca.y - cb.y
-                            var cd = hypot(cdx, cdy)
-                            if cd >= minChip { continue }
-                            if cd < 0.5 { cdx = .random(in: -1...1); cdy = .random(in: -1...1); cd = 1 }
-                            let push = (minChip - cd) * Self.bubblePushK
-                            fx += (cdx / cd) * push
-                            fy += (cdy / cd) * push
-                        }
-                    }
-                }
             }
             // No idle jitter: once the short settling pass ends, nodes stay put.
             fx += CGFloat.random(in: -Self.jitterAmplitude...Self.jitterAmplitude) * CGFloat(alpha)
@@ -1926,10 +2318,8 @@ struct InsightTreeCanvasView: View {
             forces[idA] = CGVector(dx: fx, dy: fy)
         }
 
-        // Chip-angle spread: for every node, all incident domains (insight bonds + fixed edge
-        // directions) repel each other equally toward maximum separation, but only insight
-        // bonds move — each accumulates torque and rotates its chip's free angle directly.
-        var chipTorque: [UUID: Double] = [:]
+        // Chip-angle spread: Insight bonds and fixed Node lines repel with equal domain weight,
+        // maximizing separation across every bond connected to the parent Node Concept.
         for (_, bonds) in bondsByNode where bonds.count > 1 {
             for ii in bonds.indices {
                 guard case .insight(let id) = bonds[ii].kind else { continue }
@@ -1938,7 +2328,8 @@ struct InsightTreeCanvasView: View {
                 for jj in bonds.indices where jj != ii {
                     var dθ = wrapAngle(bi.angle - bonds[jj].angle)
                     if abs(dθ) < 1e-4 { dθ = .random(in: -0.05...0.05) }
-                    torque += Self.domainK * (dθ >= 0 ? 1 : -1) / (abs(dθ) + Self.chipAngleEps)
+                    torque += Self.bondDomainK * (dθ >= 0 ? 1 : -1)
+                        / (abs(dθ) + Self.chipAngleEps)
                 }
                 chipTorque[id, default: 0] += torque
             }
@@ -2015,6 +2406,12 @@ struct InsightTreeCanvasView: View {
 
     // MARK: - New-Insight Entrance Sequence
 
+    private func visibleInsightIDs(in nodes: [NodeModel]) -> Set<UUID> {
+        Set(nodes.flatMap { node in
+            canvasInsights(for: node).map(\.id)
+        })
+    }
+
     private func loadSeenInsightIDs() -> Set<UUID> {
         InsightDiscoveryStore.loadSeenInsightIDs()
     }
@@ -2030,7 +2427,166 @@ struct InsightTreeCanvasView: View {
         let seenIDs = loadSeenInsightIDs()
         guard !seenIDs.isEmpty else { return [] }
         return nodes.flatMap { node in
-            Array(node.insights.prefix(6)).filter { !seenIDs.contains($0.id) }
+            canvasInsights(for: node).filter { !seenIDs.contains($0.id) }
+        }
+    }
+
+    /// Establishes the first backend snapshot as the camera baseline, then tours only content
+    /// introduced by later successful persisted mutations. This prevents the temporary
+    /// in-memory fallback from consuming the update animation while the backend is still working.
+    private func presentPersistedTree(animated: Bool, in size: CGSize) {
+        entranceTask?.cancel()
+
+        let currentInsightIDs = visibleInsightIDs(in: nodes)
+        let currentNodeIDs = Set(nodes.map(\.id))
+        // A live refresh uses the diff from the previously applied snapshot. If the update
+        // completed while Canvas was closed, consume the exact persisted presentation targets
+        // instead of treating the entire first snapshot as new.
+        let pendingInsightIDs = InsightDiscoveryStore.pendingInsightPresentationIDs()
+            .intersection(currentInsightIDs)
+        let pendingNodeIDs = InsightDiscoveryStore.pendingNodePresentationIDs()
+            .intersection(currentNodeIDs)
+        let changedInsightIDs =
+            currentInsightIDs.subtracting(confirmedPersistedInsightIDs)
+        let changedNodeIDs =
+            currentNodeIDs.subtracting(confirmedPersistedNodeIDs)
+        // In-app mutations record their exact presentation targets. Intersecting those with
+        // the snapshot diff prevents a first-load race from touring older content. Keep the
+        // raw diff as a fallback for tree changes made by another client or backend process.
+        let newInsightIDs = animated
+            ? (pendingInsightIDs.isEmpty
+                ? changedInsightIDs
+                : changedInsightIDs.intersection(pendingInsightIDs))
+            : pendingInsightIDs
+        let newNodeIDs = animated
+            ? (pendingNodeIDs.isEmpty
+                ? changedNodeIDs
+                : changedNodeIDs.intersection(pendingNodeIDs))
+            : pendingNodeIDs
+        let newInsights = nodes.flatMap { node in
+            canvasInsights(for: node).filter { newInsightIDs.contains($0.id) }
+        }
+        confirmedPersistedInsightIDs = currentInsightIDs
+        confirmedPersistedNodeIDs = currentNodeIDs
+        undiscoveredInsightIDs.formUnion(loadUndiscoveredInsightIDs())
+        undiscoveredNodeIDs.formUnion(loadUndiscoveredNodeIDs())
+
+        guard !newInsights.isEmpty || !newNodeIDs.isEmpty else {
+            revealedInsightIDs = currentInsightIDs
+            revealedNodeIDs = currentNodeIDs
+            saveAllInsightIDsAsSeen()
+            reportUndiscoveredInsightCount()
+            return
+        }
+
+        markUndiscovered(newInsights.map(\.id))
+        markNodesUndiscovered(Array(newNodeIDs))
+        reportUndiscoveredInsightCount()
+        entranceTask = Task {
+            // Let the node/body reconciliation from this same snapshot reach the canvas first.
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(50))
+            guard !Task.isCancelled else { return }
+            await runPersistedUpdateSequence(
+                newInsights: newInsights,
+                newNodeIDs: newNodeIDs,
+                in: size
+            )
+            guard !Task.isCancelled else { return }
+            saveAllInsightIDsAsSeen()
+            InsightDiscoveryStore.clearPendingTreePresentation(
+                insightIDs: Set(newInsights.map(\.id)),
+                nodeIDs: newNodeIDs
+            )
+        }
+    }
+
+    /// Camera/reveal sequence for one fully loaded persisted mutation. Node Concepts participate
+    /// even when the backend correctly adds no automatic Insights.
+    private func runPersistedUpdateSequence(
+        newInsights: [InsightModel],
+        newNodeIDs: Set<UUID>,
+        in size: CGSize
+    ) async {
+        enum Target {
+            case insight(InsightModel)
+            case node(UUID)
+        }
+
+        let insightIDs = Set(newInsights.map(\.id))
+        let allInsightIDs = visibleInsightIDs(in: nodes)
+        let allNodeIDs = Set(nodes.map(\.id))
+        revealedInsightIDs = allInsightIDs.subtracting(insightIDs)
+        revealedNodeIDs = allNodeIDs.subtracting(newNodeIDs)
+
+        let targets: [Target] =
+            nodes.filter { newNodeIDs.contains($0.id) }.map { Target.node($0.id) }
+            + newInsights.map(Target.insight)
+
+        func position(for target: Target) -> CGPoint? {
+            switch target {
+            case .insight(let insight):
+                return worldPosition(forInsightID: insight.id)
+            case .node(let nodeID):
+                return simPosition(of: nodeID)
+                    ?? nodes.first(where: { $0.id == nodeID })?.position
+            }
+        }
+
+        let positionedTargets = targets.compactMap { target -> (Target, CGPoint)? in
+            guard let position = position(for: target) else { return nil }
+            return (target, position)
+        }
+        guard !positionedTargets.isEmpty else {
+            revealedInsightIDs = allInsightIDs
+            revealedNodeIDs = allNodeIDs
+            return
+        }
+
+        // Give the user one beat to register the newly settled topology before the tour.
+        try? await Task.sleep(for: .milliseconds(200))
+        guard !Task.isCancelled else { return }
+
+        if positionedTargets.count <= 3 {
+            for (target, position) in positionedTargets {
+                guard !Task.isCancelled else { return }
+                focusInsight(at: position, in: size)
+                try? await Task.sleep(for: .milliseconds(950))
+                guard !Task.isCancelled else { return }
+
+                switch target {
+                case .insight(let insight):
+                    _ = withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
+                        revealedInsightIDs.insert(insight.id)
+                    }
+                case .node(let nodeID):
+                    _ = withAnimation(.easeOut(duration: 0.22)) {
+                        revealedNodeIDs.insert(nodeID)
+                    }
+                }
+                rippleTrigger = RippleTrigger(
+                    worldOrigin: position,
+                    startTime: Date().timeIntervalSinceReferenceDate
+                )
+                try? await Task.sleep(for: .milliseconds(700))
+            }
+        } else {
+            let positions = positionedTargets.map(\.1)
+            zoomToFit(worldPositions: positions, in: size)
+            try? await Task.sleep(for: .milliseconds(1_100))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.22)) {
+                revealedNodeIDs.formUnion(newNodeIDs)
+                revealedInsightIDs.formUnion(insightIDs)
+            }
+            let center = CGPoint(
+                x: positions.map(\.x).reduce(0, +) / CGFloat(positions.count),
+                y: positions.map(\.y).reduce(0, +) / CGFloat(positions.count)
+            )
+            rippleTrigger = RippleTrigger(
+                worldOrigin: center,
+                startTime: Date().timeIntervalSinceReferenceDate
+            )
         }
     }
 
@@ -2044,11 +2600,26 @@ struct InsightTreeCanvasView: View {
         InsightDiscoveryStore.saveUndiscoveredInsightIDs(undiscoveredInsightIDs)
     }
 
+    private func loadUndiscoveredNodeIDs() -> Set<UUID> {
+        InsightDiscoveryStore.loadUndiscoveredNodeIDs()
+    }
+
+    private func persistUndiscoveredNodeIDs() {
+        InsightDiscoveryStore.saveUndiscoveredNodeIDs(undiscoveredNodeIDs)
+    }
+
     private func reportUndiscoveredInsightCount() {
         let visibleInsightIDs = Set(nodes.flatMap { node in
-            Array(node.insights.prefix(6)).map(\.id)
+            canvasInsights(for: node).map(\.id)
         })
-        onUndiscoveredInsightCountChange(undiscoveredInsightIDs.intersection(visibleInsightIDs).count)
+        let visibleNodeIDs = Set(
+            nodes.lazy
+                .filter { !placedMidpointNodeIDs.contains($0.id) }
+                .map(\.id)
+        )
+        let insightCount = undiscoveredInsightIDs.intersection(visibleInsightIDs).count
+        let nodeCount = undiscoveredNodeIDs.intersection(visibleNodeIDs).count
+        onUndiscoveredInsightCountChange(insightCount + nodeCount)
     }
 
     /// Flag newly appeared/generated insights as undiscovered (they get a blue dot).
@@ -2074,15 +2645,35 @@ struct InsightTreeCanvasView: View {
         reportUndiscoveredInsightCount()
     }
 
+    /// Flag newly generated Node Concepts so they receive the same blue discovery dot.
+    private func markNodesUndiscovered(_ ids: [UUID]) {
+        let previousCount = undiscoveredNodeIDs.count
+        undiscoveredNodeIDs.formUnion(ids)
+        if undiscoveredNodeIDs.count != previousCount {
+            persistUndiscoveredNodeIDs()
+            reportUndiscoveredInsightCount()
+        }
+    }
+
+    /// Opening a Node Concept clears its discovery dot permanently.
+    private func markNodeDiscovered(_ id: UUID) {
+        guard undiscoveredNodeIDs.contains(id) else { return }
+        withAnimation(.easeOut(duration: 0.25)) {
+            _ = undiscoveredNodeIDs.remove(id)
+        }
+        persistUndiscoveredNodeIDs()
+        reportUndiscoveredInsightCount()
+    }
+
     /// World position of an insight looked up by ID (nil if not visible on tree).
     private func worldPosition(forInsightID id: UUID) -> CGPoint? {
         for node in displayNodes {
             if placedMidpointNodeIDs.contains(node.id), node.insights.contains(where: { $0.id == id }) {
                 return node.position   // pinned chip sits on the node itself
             }
-            let visible = Array(node.insights.prefix(6))
+            let visible = canvasInsights(for: node)
             if let idx = visible.firstIndex(where: { $0.id == id }) {
-                return insightWorldPosition(for: node, index: idx, count: min(node.insights.count, 6))
+                return insightWorldPosition(for: node, index: idx, count: visible.count)
             }
         }
         return nil
@@ -2138,7 +2729,7 @@ struct InsightTreeCanvasView: View {
 
     /// Orchestrates the full entrance sequence based on how many new insights there are.
     private func runEntranceSequence(newInsights: [InsightModel], in size: CGSize) async {
-        let allIDs    = Set(nodes.flatMap { Array($0.insights.prefix(6)).map { $0.id } })
+        let allIDs = Set(nodes.flatMap { canvasInsights(for: $0).map(\.id) })
         let newIDs    = Set(newInsights.map { $0.id })
         let nonNewIDs = allIDs.subtracting(newIDs)
 

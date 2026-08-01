@@ -30,6 +30,8 @@ struct ChatBranch: Identifiable, Codable, Equatable {
     /// Number of `activeChatBlocks` represented by `compactedContext`.
     /// Optional so conversations persisted before compaction support continue to decode.
     var compactedThroughBlockCount: Int? = nil
+    /// Invisible product context attached to special entry points such as Question of the Day.
+    var hiddenPromptContext: String? = nil
 
     init(
         id: UUID = UUID(),
@@ -37,7 +39,8 @@ struct ChatBranch: Identifiable, Codable, Equatable {
         parentBranchID: UUID? = nil,
         parentResponseIndex: Int? = nil,
         duplicatedResponse: String? = nil,
-        yOffset: CGFloat = 0
+        yOffset: CGFloat = 0,
+        hiddenPromptContext: String? = nil
     ) {
         self.id = id
         self.startingConcept = startingConcept
@@ -45,6 +48,7 @@ struct ChatBranch: Identifiable, Codable, Equatable {
         self.parentResponseIndex = parentResponseIndex
         self.duplicatedResponse = duplicatedResponse
         self.yOffset = yOffset
+        self.hiddenPromptContext = hiddenPromptContext
     }
 }
 
@@ -87,6 +91,40 @@ struct InquiryConversation: Identifiable, Codable, Equatable {
         self.branches = branches
         self.promotedInsightIDs = promotedInsightIDs
         self.createdAt = createdAt
+    }
+}
+
+/// Atomic handoff from a Study Topic Insight Tree into one of that topic's conversations.
+/// The origin is retained until the quoted Insight is either submitted or canceled.
+struct StudyTopicInsightQuoteRequest: Identifiable, Equatable {
+    let id: UUID
+    let topicID: UUID
+    let conversationID: UUID
+    let insight: ConceptDefinition
+
+    init(
+        id: UUID = UUID(),
+        topicID: UUID,
+        conversationID: UUID,
+        insight: ConceptDefinition
+    ) {
+        self.id = id
+        self.topicID = topicID
+        self.conversationID = conversationID
+        self.insight = insight
+    }
+}
+
+/// Requests reopening a Study Topic tree with a specific Insight selected.
+struct StudyTopicTreeSelectionRequest: Identifiable, Equatable {
+    let id: UUID
+    let topicID: UUID
+    let insightID: UUID
+
+    init(id: UUID = UUID(), topicID: UUID, insightID: UUID) {
+        self.id = id
+        self.topicID = topicID
+        self.insightID = insightID
     }
 }
 

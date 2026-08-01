@@ -50,7 +50,7 @@ struct InsightModel: Identifiable, Codable, Equatable, Hashable {
     init(concept: ConceptDefinition, conversationID: UUID = UUID()) {
         id = concept.id
         title = concept.word.capitalized
-        definition = concept.meaning
+        definition = concept.semanticDefinition
         self.conversationID = conversationID
         savedAt = Date()
         embedding = nil
@@ -112,6 +112,35 @@ struct EdgeModel: Identifiable, Equatable {
 struct MidpointSource: Equatable {
     let insightID: UUID
     let isNode: Bool
+}
+
+/// A Node already represents an Insight whose normalized title exactly matches the Node label.
+/// Keep that Insight in the model for its definition, persistence, and docked-card access, but do
+/// not draw a second same-named chip beside the Node. Placed Midpoints are exempt because their
+/// Node circle is intentionally hidden and the chip is their only visible representation.
+func canvasInsightMembers(
+    nodeLabel: String,
+    insights: [InsightModel],
+    preservesMatchingTitle: Bool
+) -> [InsightModel] {
+    guard !preservesMatchingTitle else { return insights }
+    let nodeKey = canonicalInsightTreeTitle(nodeLabel)
+    guard !nodeKey.isEmpty else { return insights }
+    return insights.filter {
+        canonicalInsightTreeTitle($0.title) != nodeKey
+    }
+}
+
+private func canonicalInsightTreeTitle(_ title: String) -> String {
+    var words = title
+        .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        .split(whereSeparator: { $0.isWhitespace })
+        .map(String.init)
+    if let first = words.first, ["a", "an", "the"].contains(first) {
+        words.removeFirst()
+    }
+    return words.joined(separator: " ")
 }
 
 // MARK: - Layout Geometry

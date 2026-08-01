@@ -13,6 +13,7 @@ struct DynamicInsightSheetCard: View {
     /// nil while the definition is generating; set once ready.
     let concept: ConceptDefinition?
     let isSaved: Bool
+    var funStatusText: String? = nil
     var onQuote: () -> Void
     var onFork: () -> Void
     var onToggleSaved: () -> Void
@@ -22,30 +23,29 @@ struct DynamicInsightSheetCard: View {
             if let concept {
                 loadedHeader
 
-                Text(concept.meaning)
-                    .font(.figtreeParagraph)
-                    .lineSpacing(12)
-                    .foregroundColor(AquinasTheme.Colors.paragraphText)
-                    .fixedSize(horizontal: false, vertical: true)
+                InsightDefinitionsContent(
+                    definitions: concept.contextualDefinitions
+                )
             } else {
                 HStack(spacing: 10) {
                     ProgressView()
                         .controlSize(.small)
                         .tint(AquinasTheme.Colors.lightGreen)
 
-                    Text("Generating relevant definition...")
+                    Text(funStatusText ?? "Generating relevant definition...")
                         .font(.figtreeParagraph)
                         .foregroundColor(AquinasTheme.Colors.placeholderText)
+                        .accessibilityLabel("Generating relevant definition")
                 }
                 .frame(maxWidth: .infinity, alignment: .center)
             }
         }
-        .padding(32)
+        .padding(24)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(AquinasTheme.Colors.canvasSecondary)
-        .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 36, style: .continuous)
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
         )
         .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 0)
@@ -78,6 +78,50 @@ struct DynamicInsightSheetCard: View {
                 onQuote: onQuote,
                 onFork: onFork
             )
+        }
+    }
+}
+
+struct InsightDefinitionsContent: View {
+    let definitions: [InsightDefinition]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            ForEach(definitions) { definition in
+                InsightDefinitionEntry(
+                    context: definition.context,
+                    meaning: definition.meaning,
+                    showsDistinction: definitions.count > 1
+                )
+            }
+        }
+    }
+}
+
+private struct InsightDefinitionEntry: View {
+    let context: String
+    let meaning: String
+    let showsDistinction: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if showsDistinction && !context.isEmpty {
+                Text(
+                    "In regards to \(context)",
+                    comment: "Label describing the subject that gives an Insight definition its meaning."
+                )
+                .font(.figtreeParagraph)
+                .bold()
+                .italic()
+                .foregroundColor(AquinasTheme.Colors.headingText)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Text(meaning)
+                .font(.figtreeParagraph)
+                .lineSpacing(12)
+                .foregroundColor(AquinasTheme.Colors.paragraphText)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
