@@ -43,7 +43,8 @@ struct CurrentConversationView: View {
     @Binding var newConversationIsStudyTopic:  Bool
     @Binding var deletedConversationID:        UUID?
     @Binding var requestedForkConcept:         ConceptDefinition?
-    @Binding var studyTopicInsightQuoteRequest: StudyTopicInsightQuoteRequest?
+    @Binding var insightConversationQuoteRequest: InsightConversationQuoteRequest?
+    @Binding var newConversationInsightQuoteRequest: NewConversationInsightQuoteRequest?
     let conversationFontSize: ConversationFontSizeOption
     let inputTextAlignment: InputTextAlignmentOption
     let inputFont: ConversationFontOption
@@ -75,7 +76,7 @@ struct CurrentConversationView: View {
 
     // MARK: Quoted insight chip
     @State private var attachedConcept: ConceptDefinition? = nil
-    @State private var pendingStudyTopicQuoteReturn: StudyTopicInsightQuoteRequest? = nil
+    @State private var pendingStudyTopicQuoteReturn: InsightConversationQuoteRequest? = nil
 
     // MARK: Scroll / upload helpers
     @State private var externalSubmitTrigger: Int = 0
@@ -108,6 +109,14 @@ struct CurrentConversationView: View {
     @State private var isProcessingInsightTreeQueue = false
     @State private var insightTreeQueueRetryTask: Task<Void, Never>? = nil
     @State private var insightTreeIdleDebounceTask: Task<Void, Never>? = nil
+    /// Question/response pairs awaiting on-device tree-seed evaluation (local-only fallback,
+    /// backend unreachable). Debounced separately from the backend queue below so a rapid
+    /// follow-up question never collides with this background call mid-flight. Each pair
+    /// carries its own conversationID captured at append time — `activeConversationID` can
+    /// change before this fires (e.g. the user switches conversations mid-debounce).
+    @State private var pendingLocalInsightTreeSeeds:
+        [(conversationID: UUID, question: String, response: String)] = []
+    @State private var localInsightTreeSeedDebounceTask: Task<Void, Never>? = nil
     @State private var manuallySavedConversationInsightIDs: Set<UUID> = []
     /// Number of branch responses currently generating; drives the context wheel spinner.
     @State private var pendingResponseCount: Int = 0
@@ -267,8 +276,23 @@ struct CurrentConversationView: View {
               let branch = activeBranches.first(where: { $0.id == branchID }),
               responseIndex >= 0,
               responseIndex < branch.activeChatBlocks.count,
-              case .text = branch.activeChatBlocks[responseIndex],
-              precedingQuestion(in: branch, before: responseIndex) != nil else {
+              case .text(let responseText) = branch.activeChatBlocks[responseIndex],
+              let question = precedingQuestion(in: branch, before: responseIndex) else {
+            return
+        }
+
+        guard AquinasBackendConfiguration.canRecoverFromCurrentDevice else {
+            // Backend-owned Node topology is unreachable on-device, so seed the tree locally
+            // instead (see `enqueueLocalInsightTreeSeedingTask`). This was temporarily disabled
+            // while queued work was hanging; that turned out to be the `isExecutionSuspended`
+            // deadlock in `ModelTaskQueue.setApplicationActive`, not this feature — it runs as a
+            // debounced `.background` job, so a foreground question always preempts it.
+            pendingLocalInsightTreeSeeds.append((
+                conversationID: conversationID,
+                question: question,
+                response: InlineInsightMarkup.plainText(from: responseText)
+            ))
+            scheduleLocalInsightTreeSeedingAfterIdle()
             return
         }
 
@@ -289,7 +313,112 @@ struct CurrentConversationView: View {
         scheduleInsightTreeUpdateAfterIdle()
     }
 
+    /// Waits for 5s of idle time — same debounce window the backend queue uses — before
+    /// actually starting on-device tree-seed evaluation. A rapid follow-up question reschedules
+    /// this instead of colliding with it: `ModelTaskQueue`'s foreground/background preemption is
+    /// best-effort (a preempted background job's Swift Task keeps cooperatively finishing rather
+    /// than stopping instantly), so avoiding the collision in the first place is far more
+    /// reliable than depending on preemption to resolve cleanly every time.
+    private func scheduleLocalInsightTreeSeedingAfterIdle() {
+        guard !pendingLocalInsightTreeSeeds.isEmpty else { return }
+        localInsightTreeSeedDebounceTask?.cancel()
+        localInsightTreeSeedDebounceTask = Task {
+            do {
+                try await Task.sleep(for: .seconds(5))
+            } catch {
+                return
+            }
+            guard scenePhase == .active else { return }
+            enqueueLocalInsightTreeSeedingTask()
+        }
+    }
+
+    /// The backend-only Node Concept path (`InsightTreeService.analyzeResponse`, MiniLM
+    /// clustering) is unreachable on-device, so a conversation with no backend would otherwise
+    /// never get a tree node at all. This runs as a `.updateInsightTree` background Model Task
+    /// (shows "Mapping...", not "Thinking...", and never blocks the already-displayed answer).
+    ///
+    /// Every pending turn asks the on-device model to extract its main subject (label + summary)
+    /// unconditionally — see `insightTreeSeedCandidate`'s doc comment. Whether that subject
+    /// actually becomes a new Node Concept is then decided here, deterministically, by on-device
+    /// `NLEmbedding` cosine similarity against the Node Concepts already on the tree: below
+    /// `newSubjectThreshold` similarity to every existing Node means genuinely new, so it's
+    /// appended; at or above it means the turn is still within an existing Node's subject, so no
+    /// new Node is added (a related, separately-saved Insight will still cluster under that
+    /// existing Node via `InsightTreeViewModel`'s own clustering — see its `localMembershipThreshold`).
+    ///
+    /// This replaced an earlier design where the model made that new-vs-related judgment itself
+    /// (`new_subject: true/false`) directly in the same call. That judgment turned out to be
+    /// unreliable and order-dependent — asked to compare the same two Bible/theology subjects in
+    /// one order the model correctly saw a pivot, asked in the reverse order it didn't. A binary
+    /// "is this new" call is exactly the kind of judgment an LLM is inconsistent at; embedding
+    /// similarity answers it the same way every time for the same inputs, and it's the same
+    /// lightweight math the tree's own clustering already relies on, so it costs effectively
+    /// nothing extra.
+    private func enqueueLocalInsightTreeSeedingTask() {
+        guard !pendingLocalInsightTreeSeeds.isEmpty,
+              !modelTasks.contains(where: {
+                  $0.kind == .updateInsightTree && $0.phase != .completed
+              }) else {
+            return
+        }
+        let pending = pendingLocalInsightTreeSeeds
+        pendingLocalInsightTreeSeeds.removeAll()
+
+        modelTasks.enqueue(
+            kind: .updateInsightTree,
+            originPage: .conversation,
+            priority: .background
+        ) {
+            // Matches `InsightTreeViewModel.localMembershipThreshold`: below this similarity to
+            // every existing Node, a subject counts as genuinely new rather than a continuation
+            // of one already on the tree.
+            let newSubjectThreshold = 0.60
+            for turn in pending {
+                guard !Task.isCancelled else { return }
+                let existingSeeds = LocalInsightTreeSeedStore.seeds(for: turn.conversationID)
+                guard let candidate = try? await self.aquinasModel.insightTreeSeedCandidate(
+                    question: turn.question,
+                    response: turn.response
+                ) else {
+                    continue
+                }
+
+                let embedding = computeEmbedding(for: "\(candidate.label). \(candidate.summary)")
+                if let embedding {
+                    let similarities = existingSeeds.compactMap { existing -> (String, Double)? in
+                        guard let existingEmbedding = existing.embedding else { return nil }
+                        return (existing.label, cosineSimilarity(embedding, existingEmbedding))
+                    }
+#if DEBUG
+                    print("Aquinas seed new-subject check: '\(candidate.label)' vs existing \(similarities)")
+#endif
+                    let isAlreadyCovered = similarities.contains { $0.1 >= newSubjectThreshold }
+                    guard !isAlreadyCovered else { continue }
+                }
+
+                LocalInsightTreeSeedStore.appendSeed(
+                    LocalInsightTreeSeed(
+                        id: UUID(),
+                        label: candidate.label,
+                        summary: candidate.summary,
+                        embedding: embedding,
+                        createdAt: Date()
+                    ),
+                    for: turn.conversationID
+                )
+                self.finishInsightTreeMutation(for: turn.conversationID)
+            }
+        }
+    }
+
     private func scheduleInsightTreeUpdateAfterIdle() {
+        guard AquinasBackendConfiguration.canRecoverFromCurrentDevice else {
+            for pending in InsightTreeAnalysisQueue.load() {
+                InsightTreeAnalysisQueue.remove(responseID: pending.responseID)
+            }
+            return
+        }
         guard !InsightTreeAnalysisQueue.load().isEmpty else { return }
         insightTreeIdleDebounceTask?.cancel()
         insightTreeIdleDebounceTask = Task {
@@ -621,17 +750,18 @@ struct CurrentConversationView: View {
         }
     }
 
-    private func openStudyTopicInsightQuote(_ request: StudyTopicInsightQuoteRequest) {
+    private func openInsightConversationQuote(_ request: InsightConversationQuoteRequest) {
         guard let conversation = conversations.first(where: {
-            $0.id == request.conversationID && $0.studyTopicID == request.topicID
+            $0.id == request.conversationID
+                && (request.topicID == nil || $0.studyTopicID == request.topicID)
         }) else {
-            studyTopicInsightQuoteRequest = nil
+            insightConversationQuoteRequest = nil
             return
         }
 
         switchToConversation(conversation)
-        pendingStudyTopicQuoteReturn = request
-        studyTopicInsightQuoteRequest = nil
+        pendingStudyTopicQuoteReturn = request.topicID == nil ? nil : request
+        insightConversationQuoteRequest = nil
         quoteConceptIntoCurrentConversation(request.insight)
         Task {
             try? await Task.sleep(for: .milliseconds(180))
@@ -640,12 +770,13 @@ struct CurrentConversationView: View {
     }
 
     private func returnToStudyTopicTreeAfterQuoteCancellation() {
-        guard let request = pendingStudyTopicQuoteReturn else { return }
+        guard let request = pendingStudyTopicQuoteReturn,
+              let topicID = request.topicID else { return }
         pendingStudyTopicQuoteReturn = nil
         attachedConcept = nil
         onReturnToStudyTopicTree(
             StudyTopicTreeSelectionRequest(
-                topicID: request.topicID,
+                topicID: topicID,
                 insightID: request.insight.id
             )
         )
@@ -1057,8 +1188,8 @@ struct CurrentConversationView: View {
                 startNewConversation()
             }
             scheduleInsightTreeUpdateAfterIdle()
-            if let request = studyTopicInsightQuoteRequest {
-                openStudyTopicInsightQuote(request)
+            if let request = insightConversationQuoteRequest {
+                openInsightConversationQuote(request)
             }
         }
         // Save branches back into the active conversation on every change, then persist.
@@ -1083,9 +1214,9 @@ struct CurrentConversationView: View {
             requestedConversationID = nil
             switchToConversation(convo)
         }
-        .onChange(of: studyTopicInsightQuoteRequest) { _, request in
+        .onChange(of: insightConversationQuoteRequest) { _, request in
             guard let request else { return }
-            openStudyTopicInsightQuote(request)
+            openInsightConversationQuote(request)
         }
         // "New Conversation" button in side menu.
         .onChange(of: newConversationRequest) { _, new in
@@ -1098,6 +1229,7 @@ struct CurrentConversationView: View {
             guard let id else { return }
             deletedConversationID = nil
             ConversationInsightMembershipStore.removeConversation(id)
+            LocalInsightTreeSeedStore.removeConversation(id)
             conversations.removeAll { $0.id == id }
             if activeConversationID == id {
                 if let first = conversations.first {
@@ -1129,15 +1261,18 @@ struct CurrentConversationView: View {
             persistenceTask?.cancel()
             insightTreeQueueRetryTask?.cancel()
             insightTreeIdleDebounceTask?.cancel()
+            localInsightTreeSeedDebounceTask?.cancel()
             saveCurrentConversation()
             persistConversations()
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 scheduleInsightTreeUpdateAfterIdle()
+                scheduleLocalInsightTreeSeedingAfterIdle()
             } else {
                 insightTreeQueueRetryTask?.cancel()
                 insightTreeIdleDebounceTask?.cancel()
+                localInsightTreeSeedDebounceTask?.cancel()
             }
         }
         // aq:// insight links
@@ -1255,6 +1390,7 @@ struct CurrentConversationView: View {
 
                 ChatThreadColumn(
                     branchData: branch,
+                    conversationID: activeConversationID,
                     branchAnchor: "branch-top-\(b.id)",
                     targetSpawnY: $targetSpawnY,
                     uploadedFiles: $uploadedFiles,
@@ -1710,6 +1846,7 @@ struct CurrentConversationView: View {
         if let id = activeConversationID,
            let index = conversations.firstIndex(where: { $0.id == id }) {
             ConversationInsightMembershipStore.removeConversation(id)
+            LocalInsightTreeSeedStore.removeConversation(id)
             manuallySavedConversationInsightIDs = []
             conversations[index].title = "New Conversation"
             conversations[index].branches = freshBranches
@@ -1754,6 +1891,19 @@ struct CurrentConversationView: View {
         hasTextToSubmit = false
         canvasMode.promotedCanvasInsightIDs = []
         focusedBranchID = activeBranches.first?.id
+        if let quoteRequest = newConversationInsightQuoteRequest {
+            attachedConcept = quoteRequest.insight
+            if let returnTopicID = quoteRequest.topicID {
+                pendingStudyTopicQuoteReturn = InsightConversationQuoteRequest(
+                    topicID: returnTopicID,
+                    conversationID: fresh.id,
+                    insight: quoteRequest.insight
+                )
+            } else {
+                pendingStudyTopicQuoteReturn = nil
+            }
+            newConversationInsightQuoteRequest = nil
+        }
         publishShellMenuState()
         persistConversations()
         scrollToTopAfterLayout()
@@ -1805,8 +1955,11 @@ struct CurrentConversationView: View {
                 in: context,
                 conversationID: conversationID
             )
-            guard activeConversationID == conversationID else { return }
+            // Always clear the lookup guard, even if the user switched conversations while
+            // this was in flight — otherwise this term's key stays stuck in
+            // `definitionLookupKeys` forever and every future tap on it silently no-ops.
             definitionLookupKeys.remove(insightWord.id)
+            guard activeConversationID == conversationID else { return }
 
             if let cached {
                 generatedDefinitionsByKey[insightWord.id] = stableDefinition(
@@ -1850,6 +2003,7 @@ struct CurrentConversationView: View {
         modelTasks.enqueue(
             kind: .defineInsight(key: word.id, name: word.text),
             originPage: .conversation,
+            conversationID: activeConversationID,
             onStart: {
                 insightSheetContentHeight = 178
                 loadingSheetWord = word
@@ -2008,8 +2162,13 @@ struct CurrentConversationView: View {
         modelTasks.enqueue(
             kind: .refreshInsightTree,
             originPage: .conversation,
+            conversationID: conversationID,
             priority: .background
         ) {
+            // Insight Tree persistence is backend-only; a physical device with only a loopback
+            // backend configured can never reach it, so skip immediately rather than hanging on
+            // the service's 120-second request timeout.
+            guard AquinasBackendConfiguration.canRecoverFromCurrentDevice else { return }
             do {
                 // Keep the global library's merged definitions separate from this conversation's
                 // tree membership. The tree must persist only the contextual definition the user
@@ -2051,8 +2210,10 @@ struct CurrentConversationView: View {
         modelTasks.enqueue(
             kind: .refreshInsightTree,
             originPage: .conversation,
+            conversationID: conversationID,
             priority: .background
         ) {
+            guard AquinasBackendConfiguration.canRecoverFromCurrentDevice else { return }
             do {
                 try await insightTreeService.remove(
                     insightID: concept.id,
@@ -2073,8 +2234,12 @@ struct CurrentConversationView: View {
         modelTasks.enqueue(
             kind: .refreshInsightTree,
             originPage: .conversation,
+            conversationID: conversationID,
             priority: .background
         ) {
+            // The tree-save below is backend-only; skip before spending a local model-generation
+            // slot on labelSubject when it can never reach the backend anyway.
+            guard AquinasBackendConfiguration.canRecoverFromCurrentDevice else { return }
             do {
                 let suggestedNodeLabel = try await aquinasModel.labelSubject(
                     forTitles: ["\(concept.word): \(concept.semanticDefinition)"]

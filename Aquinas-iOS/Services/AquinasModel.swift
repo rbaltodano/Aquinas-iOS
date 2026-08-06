@@ -59,6 +59,18 @@ protocol AquinasModel {
     /// descriptions — used to name a Node Concept.
     func labelSubject(forTitles titles: [String]) async throws -> String
 
+    /// Extracts this turn's main subject (label + summary) for the on-device-only Insight Tree
+    /// fallback, used when the backend-owned persisted tree is unreachable. `nil` means
+    /// extraction genuinely failed. This always returns a candidate for every turn — whether it
+    /// actually becomes a new Node Concept or attaches to an existing one is decided by the
+    /// caller via embedding similarity against the Nodes already on the tree, not by this call;
+    /// see `enqueueLocalInsightTreeSeedingTask`'s doc comment for why that judgment moved out of
+    /// the model.
+    func insightTreeSeedCandidate(
+        question: String,
+        response: String
+    ) async throws -> (label: String, summary: String)?
+
     /// Candidate syntheses for mathematical vector-space selection by the Midpoint tool.
     func blendConceptCandidates(
         _ concepts: [ConceptDefinition],
@@ -83,6 +95,16 @@ enum AquinasModelActionError: Error {
 }
 
 extension AquinasModel {
+    /// Only `LiteRTAquinasModel` implements this real on-device fallback; every other model
+    /// boundary (backend-connected, mock) has no use for it, so this default keeps them at
+    /// zero extra surface area.
+    func insightTreeSeedCandidate(
+        question: String,
+        response: String
+    ) async throws -> (label: String, summary: String)? {
+        nil
+    }
+
     func respond(
         to context: ConversationContext,
         thinkingEnabled: Bool,
@@ -187,6 +209,37 @@ struct ConversationContext {
     }
 }
 
+/// Model-only markup for a user turn. Quoted Insights stay separate from the visible question in
+/// application state, then become explicit context immediately before that question at generation.
+enum ConversationPromptMarkup {
+    static func userPrompt(
+        question: String,
+        quotedInsight: ConceptDefinition?
+    ) -> String {
+        let question = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let quotedInsight else { return question }
+
+        return """
+        <insight_quote>
+        <title>\(xmlEscaped(quotedInsight.word))</title>
+        <definition>\(xmlEscaped(quotedInsight.semanticDefinition))</definition>
+        </insight_quote>
+
+        User question:
+        \(question)
+        """
+    }
+
+    private static func xmlEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&apos;")
+    }
+}
+
 /// A term the model flagged as worth defining, with enough context to place its highlight
 /// precisely. Mirrors the backend's `key_terms` shape (MODEL-INTEGRATION.md §3) — the model
 /// returns plain prose plus this structured list; application code, not the model, turns
@@ -284,11 +337,10 @@ struct ModelResponse {
                 with: replacement.markup
             )
         }
-        var result = mutable as String
-        if let insight {
-            result = "\(InlineInsightMarkup.marker(for: insight))\n\n\(result)"
-        }
-        return result
+        // In-text Insight cards are disabled for now: direct-definition intent detection isn't
+        // reliable enough yet. `insight` is still populated/generated upstream — only the
+        // rendering is turned off, so this is a one-line revert once detection improves.
+        return mutable as String
     }
 
     private static func slugify(_ text: String) -> String {

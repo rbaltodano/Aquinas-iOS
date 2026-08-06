@@ -6,6 +6,51 @@
 import SwiftUI
 import UIKit
 
+// MARK: - Model Response Footer
+
+/// The compact disclaimer and copy control shown beneath every completed model response.
+struct ModelResponseFooter: View {
+    let copyText: String
+
+    @State private var showsCopiedConfirmation = false
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Button(action: copyResponse) {
+                Image(systemName: showsCopiedConfirmation ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(AquinasTheme.Colors.responseButton)
+                    .frame(width: 14, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(showsCopiedConfirmation ? "Response copied" : "Copy response")
+
+            Text("AI can make mistakes, verify important details")
+                .font(.custom("Figtree-SemiBold", size: 10))
+                .foregroundStyle(AquinasTheme.Colors.placeholderText)
+                .frame(height: 20)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func copyResponse() {
+        UIPasteboard.general.string = copyText
+
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+            showsCopiedConfirmation = true
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            withAnimation {
+                showsCopiedConfirmation = false
+            }
+        }
+    }
+}
+
 // MARK: - Shared Response Buttons
 
 /// Shared action row for model responses and insight cards.

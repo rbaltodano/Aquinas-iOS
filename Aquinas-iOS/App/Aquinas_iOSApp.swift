@@ -18,6 +18,7 @@ struct Aquinas_iOSApp: App {
             } else {
                 ContentView(modelTasks: runtime.modelTasks)
                     .environment(\.aquinasModel, runtime.model)
+                    .environment(\.embeddingProvider, runtime.embeddingProvider)
             }
         }
     }

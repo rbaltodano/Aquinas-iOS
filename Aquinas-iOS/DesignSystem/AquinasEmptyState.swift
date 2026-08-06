@@ -14,10 +14,14 @@ struct AquinasEmptyState: View {
 
     var body: some View {
         VStack(spacing: 16) {
+            // No sfSymbolDrawOn() here: that modifier hides the icon and reveals it on its own
+            // independent, delayed timer, so it doesn't move with whatever transition the
+            // container uses to bring the rest of the empty state in — it just pops in afterward
+            // at its resting spot while the text visibly slides. A plain image participates in
+            // the container's transition like every other view here, so it all animates together.
             Image(systemName: systemImage)
                 .font(.system(size: 28, weight: .semibold))
                 .foregroundColor(AquinasTheme.Colors.lightGreen)
-                .sfSymbolDrawOn()
 
             Text(title)
                 .font(.baskervilleHeading1)

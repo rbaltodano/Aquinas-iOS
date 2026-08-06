@@ -32,6 +32,9 @@ struct ChatBranch: Identifiable, Codable, Equatable {
     var compactedThroughBlockCount: Int? = nil
     /// Invisible product context attached to special entry points such as Question of the Day.
     var hiddenPromptContext: String? = nil
+    /// Persisted user-facing approach summaries for completed model responses. Optional so
+    /// conversations saved before this metadata existed continue to decode.
+    var responsePresentations: [ResponsePresentationMetadata]? = nil
 
     init(
         id: UUID = UUID(),
@@ -50,6 +53,32 @@ struct ChatBranch: Identifiable, Codable, Equatable {
         self.yOffset = yOffset
         self.hiddenPromptContext = hiddenPromptContext
     }
+
+    func responsePresentation(at responseIndex: Int) -> ResponsePresentationMetadata? {
+        responsePresentations?.first { $0.responseIndex == responseIndex }
+    }
+
+    mutating func setResponsePresentation(
+        _ presentation: ResponsePresentationMetadata
+    ) {
+        var presentations = responsePresentations ?? []
+        presentations.removeAll { $0.responseIndex == presentation.responseIndex }
+        presentations.append(presentation)
+        responsePresentations = presentations
+    }
+
+    mutating func removeResponsePresentation(at responseIndex: Int) {
+        responsePresentations?.removeAll { $0.responseIndex == responseIndex }
+        if responsePresentations?.isEmpty == true {
+            responsePresentations = nil
+        }
+    }
+}
+
+struct ResponsePresentationMetadata: Codable, Equatable {
+    let responseIndex: Int
+    let showsThinking: Bool
+    let thinkingSummary: [String]
 }
 
 /// A saved top-level conversation canvas. This is in-memory prototype persistence.
@@ -94,17 +123,17 @@ struct InquiryConversation: Identifiable, Codable, Equatable {
     }
 }
 
-/// Atomic handoff from a Study Topic Insight Tree into one of that topic's conversations.
-/// The origin is retained until the quoted Insight is either submitted or canceled.
-struct StudyTopicInsightQuoteRequest: Identifiable, Equatable {
+/// Atomic handoff from an Insight Tree into an existing conversation. A Study Topic origin is
+/// retained when present so canceling the quote can reopen that tree and restore its selection.
+struct InsightConversationQuoteRequest: Identifiable, Equatable {
     let id: UUID
-    let topicID: UUID
+    let topicID: UUID?
     let conversationID: UUID
     let insight: ConceptDefinition
 
     init(
         id: UUID = UUID(),
-        topicID: UUID,
+        topicID: UUID? = nil,
         conversationID: UUID,
         insight: ConceptDefinition
     ) {
@@ -112,6 +141,17 @@ struct StudyTopicInsightQuoteRequest: Identifiable, Equatable {
         self.topicID = topicID
         self.conversationID = conversationID
         self.insight = insight
+    }
+}
+
+/// Starts a fresh conversation with an Insight already attached to its composer.
+struct NewConversationInsightQuoteRequest: Equatable {
+    let insight: ConceptDefinition
+    let topicID: UUID?
+
+    init(insight: ConceptDefinition, topicID: UUID? = nil) {
+        self.insight = insight
+        self.topicID = topicID
     }
 }
 

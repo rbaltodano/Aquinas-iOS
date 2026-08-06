@@ -63,8 +63,7 @@ struct DynamicInsightSheetCard: View {
             Text(word.capitalized)
                 .font(.custom("Figtree-Bold", size: 18))
                 .foregroundColor(AquinasTheme.Colors.lightGreen)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
+                .fixedSize(horizontal: false, vertical: true)
 
             Spacer()
 
@@ -117,11 +116,7 @@ private struct InsightDefinitionEntry: View {
                 .fixedSize(horizontal: false, vertical: true)
             }
 
-            Text(meaning)
-                .font(.figtreeParagraph)
-                .lineSpacing(12)
-                .foregroundColor(AquinasTheme.Colors.paragraphText)
-                .fixedSize(horizontal: false, vertical: true)
+            TruncatableParagraph(text: meaning)
         }
     }
 }

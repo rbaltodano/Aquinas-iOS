@@ -30,6 +30,9 @@ final class InsightTreeScene: SKScene {
     }
 
     func render(nodes: [NodeModel], edges: [EdgeModel], animated: Bool) {
+#if DEBUG
+        print("Aquinas InsightTreeScene.render: \(nodes.count) node(s) \(nodes.map { "\($0.conceptLabel)[\($0.id.uuidString.prefix(4))]" }), \(edges.count) edge(s), animated=\(animated)")
+#endif
         self.nodes = nodes
         self.edges = edges
         removeAllChildren()
@@ -41,6 +44,9 @@ final class InsightTreeScene: SKScene {
         for edge in edges {
             guard let from = nodes.first(where: { $0.id == edge.fromNodeID }),
                   let to = nodes.first(where: { $0.id == edge.toNodeID }) else {
+#if DEBUG
+                print("Aquinas InsightTreeScene.render: edge \(edge.id) skipped — missing endpoint node(s)")
+#endif
                 continue
             }
             let shape = makeEdge(edge, from: from.position, to: to.position)

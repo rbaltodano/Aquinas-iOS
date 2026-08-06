@@ -80,9 +80,12 @@ final class LiteRTDeviceProbeModel {
             ).fileSize.map(Int64.init)
 
             let cacheURL = try Self.cacheDirectory()
+            let usesCPU = ProcessInfo.processInfo.arguments.contains(
+                "--litert-probe-cpu"
+            )
             let config = try EngineConfig(
                 modelPath: modelURL.path,
-                backend: .gpu,
+                backend: usesCPU ? .cpu() : .gpu,
                 maxNumTokens: 2_048,
                 cacheDir: cacheURL.path
             )
@@ -146,7 +149,15 @@ final class LiteRTDeviceProbeModel {
                 forKeys: [.fileSizeKey]
             ).fileSize.map(Int64.init)
 
-            let runtime = LiteRTAquinasRuntime()
+            let modelStore = LiteRTModelStore(
+                manifest: LiteRTModelManifest(
+                    fileName: modelURL.lastPathComponent,
+                    byteCount: modelSizeBytes ?? 0,
+                    sha256: "development-probe"
+                ),
+                developmentModelURL: modelURL
+            )
+            let runtime = LiteRTAquinasRuntime(modelStore: modelStore)
             productionRuntime = runtime
             phase = .loadingModel
             detail = "Initializing the production Aquinas conversation runtime."
@@ -154,7 +165,9 @@ final class LiteRTDeviceProbeModel {
             try await runtime.loadModelWeights()
             loadSeconds = Self.seconds(since: loadClock)
 
-            let question = "How can justice and mercy work together when someone repeatedly does wrong?"
+            let question = Self.launchArgumentValue(
+                after: "--litert-probe-question"
+            ) ?? "How can justice and mercy work together when someone repeatedly does wrong?"
             let context = ConversationContext(
                 transcript: [.user(question, nil, [])]
             )
@@ -193,6 +206,28 @@ final class LiteRTDeviceProbeModel {
 
     private static func locateModel() throws -> URL {
         let fileManager = FileManager.default
+        let arguments = ProcessInfo.processInfo.arguments
+        if let fileName = launchArgumentValue(
+            after: "--litert-model-document"
+        ),
+        let documentsURL = fileManager.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        ).first {
+            let documentURL = documentsURL.appending(path: fileName)
+            guard fileManager.fileExists(atPath: documentURL.path) else {
+                throw LiteRTDeviceProbeError.modelMissing
+            }
+            return documentURL
+        }
+        if let flagIndex = arguments.firstIndex(of: "--litert-model-path"),
+           arguments.indices.contains(flagIndex + 1) {
+            let explicitURL = URL(filePath: arguments[flagIndex + 1])
+            guard fileManager.fileExists(atPath: explicitURL.path) else {
+                throw LiteRTDeviceProbeError.modelMissing
+            }
+            return explicitURL
+        }
         let candidateURLs = [
             Bundle.main.url(
                 forResource: "gemma-4-E2B-it",
@@ -217,6 +252,17 @@ final class LiteRTDeviceProbeModel {
             throw LiteRTDeviceProbeError.modelMissing
         }
         return modelURL
+    }
+
+    private static func launchArgumentValue(after flag: String) -> String? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let flagIndex = arguments.firstIndex(of: flag),
+              arguments.indices.contains(flagIndex + 1) else {
+            return nil
+        }
+        let value = arguments[flagIndex + 1]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
     }
 
     private static func cacheDirectory() throws -> URL {

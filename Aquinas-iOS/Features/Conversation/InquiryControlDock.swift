@@ -5,6 +5,7 @@
 
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 /// Full context capacity of the deployed Gemma 4 E2B checkpoint.
 let aquinasContextWindowLimit = 131_072
@@ -218,6 +219,7 @@ private struct ContextControlsStackCard: View {
 private struct ModelTasksCard: View {
     let modelTasks: ModelTaskQueue
     @Environment(\.openModelTaskPage) private var openModelTaskPage
+    @State private var draggingTaskID: UUID?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -253,6 +255,7 @@ private struct ModelTasksCard: View {
                     ForEach(modelTasks.allTasks) { task in
                         ModelTaskRow(
                             task: task,
+                            isDragging: draggingTaskID == task.id,
                             onOpen: {
                                 openModelTaskPage(task)
                             },
@@ -260,17 +263,18 @@ private struct ModelTasksCard: View {
                             onRemove: {
                                 modelTasks.removeUpcoming(id: task.id)
                             },
-                            onMove: { draggedID, placeAfterTarget in
+                            draggingTaskID: $draggingTaskID,
+                            onReorder: { draggedID in
+                                guard draggedID != task.id else { return }
                                 let didMove = modelTasks.moveUpcoming(
                                     id: draggedID,
                                     relativeTo: task.id,
-                                    placeAfterTarget: placeAfterTarget
+                                    placeAfterTarget: false
                                 )
                                 if didMove {
                                     UIImpactFeedbackGenerator(style: .light)
-                                        .impactOccurred(intensity: 0.65)
+                                        .impactOccurred(intensity: 0.5)
                                 }
-                                return didMove
                             }
                         )
                         .transition(.opacity)
@@ -280,7 +284,7 @@ private struct ModelTasksCard: View {
             }
         }
         .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
-        .animation(.easeInOut(duration: 0.24), value: modelTasks.allTasks)
+        .animation(.spring(response: 0.32, dampingFraction: 0.78), value: modelTasks.allTasks)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(32)
         .frame(width: 355)
@@ -295,24 +299,34 @@ private struct ModelTasksCard: View {
 
 private struct ModelTaskRow: View {
     let task: ModelTaskSnapshot
+    let isDragging: Bool
     let onOpen: () -> Void
     let onStop: () -> Void
     let onRemove: () -> Void
-    let onMove: (_ draggedID: UUID, _ placeAfterTarget: Bool) -> Bool
+    @Binding var draggingTaskID: UUID?
+    /// Called continuously as a dragged row is carried over this row, so upcoming tasks
+    /// visibly reflow into their landing order before the drag is released — the same
+    /// live-preview feel as rearranging objects in an auto-layout frame.
+    let onReorder: (_ draggedID: UUID) -> Void
 
     @ViewBuilder
     var body: some View {
         if task.phase == .upcoming {
             rowContent
-                .draggable(task.id.uuidString)
-                .dropDestination(for: String.self) { values, location in
-                    guard let rawID = values.first,
-                          let draggedID = UUID(uuidString: rawID),
-                          draggedID != task.id else {
-                        return false
-                    }
-                    return onMove(draggedID, location.y > 14)
+                .opacity(isDragging ? 0.35 : 1)
+                .scaleEffect(isDragging ? 0.97 : 1, anchor: .leading)
+                .onDrag {
+                    draggingTaskID = task.id
+                    return NSItemProvider(object: task.id.uuidString as NSString)
                 }
+                .onDrop(
+                    of: [.text],
+                    delegate: ModelTaskDropDelegate(
+                        targetID: task.id,
+                        draggingTaskID: $draggingTaskID,
+                        onReorder: onReorder
+                    )
+                )
         } else {
             rowContent
         }
@@ -399,6 +413,30 @@ private struct ModelTaskRow: View {
         .frame(width: 14, height: 14)
         .animation(.easeInOut(duration: 0.2), value: task.phase)
     }
+}
+
+/// Reorders upcoming model tasks live as a dragged row passes over another row, mirroring
+/// how objects slide into place while dragging inside an auto-layout frame.
+private struct ModelTaskDropDelegate: DropDelegate {
+    let targetID: UUID
+    @Binding var draggingTaskID: UUID?
+    let onReorder: (_ draggedID: UUID) -> Void
+
+    func dropEntered(info: DropInfo) {
+        guard let draggingTaskID, draggingTaskID != targetID else { return }
+        onReorder(draggingTaskID)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingTaskID = nil
+        return true
+    }
+
+    func dropExited(info: DropInfo) {}
 }
 
 /// Bottom-anchored vertical composition shared by every model-control surface.
@@ -605,8 +643,7 @@ private struct ModelCompletionNotificationPill: View {
                         .truncationMode(.tail)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, minHeight: 50, alignment: .leading)
-                .padding(.leading, 20)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -616,14 +653,15 @@ private struct ModelCompletionNotificationPill: View {
                 Image(systemName: "xmark")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundStyle(AquinasTheme.Colors.paragraphText)
-                    .frame(width: 32, height: 50)
+                    .frame(width: 24, height: 24)
                     .contentShape(Rectangle())
             }
-            .padding(.trailing, 10)
             .buttonStyle(.plain)
             .accessibilityLabel("Dismiss notification")
         }
-        .frame(width: width, height: 50)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 16)
+        .frame(width: width)
         .background(AquinasTheme.Colors.canvasSecondary)
         .clipShape(Capsule())
         .accessibilityElement(children: .contain)
@@ -953,6 +991,12 @@ struct InquiryControlDock: View {
     var onCreateCanvasConcept: () -> Void = {}
     var onInquireConnection: () -> Void = {}
     var onQuoteCanvasItem: () -> Void = {}
+    /// Global and Study Topic trees use a two-step Ask flow instead of quoting immediately.
+    var usesCanvasAskFlow: Bool = false
+    var isCanvasAskMode: Bool = false
+    var onAskInNewConversation: () -> Void = {}
+    var onAskInExistingConversation: () -> Void = {}
+    var onCancelCanvasAsk: () -> Void = {}
     var onMidpointConcepts: () -> Void = {}
     var isMidpointMode: Bool = false
     /// While a placed midpoint insight is generating, the dock hides its canvas actions.
@@ -1016,7 +1060,7 @@ struct InquiryControlDock: View {
     }
 
     private var showsAttachmentControl: Bool {
-        !isCanvasMode || showsModelControlsInCanvasMode
+        (!isCanvasMode || showsModelControlsInCanvasMode) && !isCanvasAskMode
     }
 
     private var showsModelStatusControl: Bool {
@@ -1026,6 +1070,7 @@ struct InquiryControlDock: View {
                 hasCanvasInsightHover
                     || hasSelectedCanvasItems
                     || isMidpointMode
+                    || isCanvasAskMode
             ))
     }
 
@@ -1041,14 +1086,23 @@ struct InquiryControlDock: View {
             && !hasSelectedCanvasItems
             && !isMidpointMode
             && !isCanvasInsightLoading
+            && !isCanvasAskMode
+    }
+
+    private var showsContextControl: Bool {
+        !isCanvasMode || (!hasSelectedCanvasItems && !isCanvasAskMode)
     }
 
     private var controlCount: Int {
+        if isCanvasMode && isCanvasAskMode {
+            return 3
+        }
         if isLoadingCollapsed {
-            return (showsModelStatusControl ? 1 : 0) + 1
+            return (showsModelStatusControl ? 1 : 0) + (showsContextControl ? 1 : 0)
         }
         if isCanvasMode && isMidpointMode {
-            return (showsModelStatusControl ? 1 : 0) + 2 + 1 + 1
+            return (showsModelStatusControl ? 1 : 0) + 2
+                + (showsContextControl ? 1 : 0) + 1
         }
         let attachmentCount = showsAttachmentControl ? 1 : 0
         let modelStatusCount = showsModelStatusControl ? 1 : 0
@@ -1075,7 +1129,7 @@ struct InquiryControlDock: View {
         }
         let selectionCancelCount = isCanvasMode && hasSelectedCanvasItems ? 1 : 0
         return attachmentCount + searchCount + modelStatusCount + canvasActionCount
-            + selectionCancelCount + 1
+            + selectionCancelCount + (showsContextControl ? 1 : 0)
             + (showsSendButton ? 1 : 0)
     }
 
@@ -1083,7 +1137,7 @@ struct InquiryControlDock: View {
     /// keep the same control count but change content width (e.g. the "Add" button ↔ the
     /// "Tap another Insight" hint) — so the capsule resizes with the same spring + scale bump.
     private var controlLayoutKey: String {
-        "\(controlCount)|\(modelTaskCounterKey)|\(isMidpointMode ? 1 : 0)|\(isCanvasInsightLoading ? 1 : 0)|\(hasCanvasHover ? 1 : 0)|\(hasCanvasInsightHover ? 1 : 0)|\(selectedCanvasItemCount)|\(showsSendButton ? 1 : 0)|\(canvasSearchIsActive ? 1 : 0)"
+        "\(controlCount)|\(modelTaskCounterKey)|\(isMidpointMode ? 1 : 0)|\(isCanvasInsightLoading ? 1 : 0)|\(hasCanvasHover ? 1 : 0)|\(hasCanvasInsightHover ? 1 : 0)|\(selectedCanvasItemCount)|\(showsSendButton ? 1 : 0)|\(canvasSearchIsActive ? 1 : 0)|\(isCanvasAskMode ? 1 : 0)"
     }
 
     /// Explicitly keys the pill's resize and 5% pulse to the fraction shown by Model Status.
@@ -1107,7 +1161,7 @@ struct InquiryControlDock: View {
             onDecline: onDecline
         ) {
             ZStack(alignment: .top) {
-                HStack(alignment: .center, spacing: 24) {
+                HStack(alignment: .center, spacing: isCanvasAskMode ? 12 : 24) {
                 if showsAttachmentControl {
                     attachmentButton
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
@@ -1126,7 +1180,22 @@ struct InquiryControlDock: View {
                     .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
 
-                if isLoadingCollapsed {
+                if isCanvasMode && isCanvasAskMode {
+                    canvasActionButton(
+                        title: "New Conversation",
+                        icon: "plus.bubble",
+                        action: onAskInNewConversation
+                    )
+                    .transition(.scale(scale: 0.4).combined(with: .opacity))
+                    canvasActionButton(
+                        title: "Existing Conversation",
+                        icon: "bubble.left.and.bubble.right",
+                        action: onAskInExistingConversation
+                    )
+                    .transition(.scale(scale: 0.4).combined(with: .opacity))
+                    cancelCanvasAskButton
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                } else if isLoadingCollapsed {
                     // Generating a placed midpoint, nothing hovered — keep only status + context.
                     EmptyView()
                 } else if isCanvasMode && isMidpointMode {
@@ -1168,30 +1237,33 @@ struct InquiryControlDock: View {
                         // No selection yet — entry point while hovering an insight/node.
                         selectCanvasActionButton
                         if hasCanvasInsightHover {
-                            canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
+                            canvasActionButton(title: usesCanvasAskFlow ? "Ask" : "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
                                 .transition(.scale(scale: 0.4).combined(with: .opacity))
                             canvasActionButton(title: "Make Node", icon: "move.3d", action: onCreateCanvasConcept)
                                 .transition(.scale(scale: 0.4).combined(with: .opacity))
                         } else if hasCanvasHover {
-                            canvasActionButton(title: "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
+                            canvasActionButton(title: usesCanvasAskFlow ? "Ask" : "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
                                 .transition(.scale(scale: 0.4).combined(with: .opacity))
                         }
                     }
                 }
 
-                if isCanvasMode && hasSelectedCanvasItems {
+                if isCanvasMode && hasSelectedCanvasItems && !isCanvasAskMode {
                     clearCanvasSelectionButton
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
 
-                contextButton
+                if showsContextControl {
+                    contextButton
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                }
 
                 if showsSendButton {
                     sendButton
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
                 }
-                .padding(.horizontal, 32)
+                .padding(.horizontal, isCanvasAskMode ? 16 : 32)
                 .padding(.vertical, 24)
                 .fixedSize(horizontal: true, vertical: true)
                 .background(AquinasTheme.Colors.canvasSecondary)
@@ -1244,6 +1316,15 @@ struct InquiryControlDock: View {
         }
         .onChange(of: hasCanvasInsightHover) { _, isHoveringInsight in
             if isHoveringInsight { dismissContextPopup() }
+        }
+        .onChange(of: hasSelectedCanvasItems) { _, isSelecting in
+            if isSelecting { dismissContextPopup() }
+        }
+        .onChange(of: isCanvasAskMode) { _, isAsking in
+            guard isAsking else { return }
+            dismissContextPopup()
+            modelTasksPopupState?.reset()
+            isCanvasSearchActive?.wrappedValue = false
         }
         .onChange(of: canvasSearchIsActive) { _, isActive in
             if isActive {
@@ -1476,6 +1557,17 @@ struct InquiryControlDock: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Cancel current selection")
+    }
+
+    private var cancelCanvasAskButton: some View {
+        Button(action: onCancelCanvasAsk) {
+            Image(systemName: "xmark")
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 16, height: 16)
+                .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Cancel Ask")
     }
 
     @ViewBuilder

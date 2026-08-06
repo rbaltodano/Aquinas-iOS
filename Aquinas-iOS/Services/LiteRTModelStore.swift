@@ -6,10 +6,14 @@
 import Foundation
 
 nonisolated struct LiteRTModelManifest: Sendable, Equatable {
+    // dynamic_wi8_emb4_afp32 candidate: 8-bit decoder weights, 4-bit embeddings.
+    // Fixes the 4-bit checkpoint's repetition/looping without the memory failure the
+    // straight-8-bit export hit. Vision is intentionally disabled for this package
+    // (see LiteRTAquinasRuntime) pending a fix for its STABLEHLO_COMPOSITE load failure.
     static let aquinas = LiteRTModelManifest(
         fileName: "gemma-4-E2B-it.litertlm",
-        byteCount: 2_722_385_120,
-        sha256: "5cb26c8e29d52ecf3e2b651e590761fe593dddcab0cbcdac7dc0692605ee5569"
+        byteCount: 3_862_121_696,
+        sha256: "9a6345f1a6cd39283f957977c84d31cc63b8dd56f2b8fffeb784940f63365282"
     )
 
     let fileName: String
@@ -45,13 +49,22 @@ nonisolated enum LiteRTModelStoreError: LocalizedError, Sendable {
 /// usable while that downloader and hosting endpoint are brought online.
 nonisolated struct LiteRTModelStore: Sendable {
     let manifest: LiteRTModelManifest
+    private let developmentModelURL: URL?
 
-    init(manifest: LiteRTModelManifest = .aquinas) {
+    init(
+        manifest: LiteRTModelManifest = .aquinas,
+        developmentModelURL: URL? = nil
+    ) {
         self.manifest = manifest
+        self.developmentModelURL = developmentModelURL
     }
 
     func installedModelURL() throws -> URL {
         let fileManager = FileManager.default
+        if let developmentModelURL {
+            try validateModel(at: developmentModelURL)
+            return developmentModelURL
+        }
         if let downloaded = applicationSupportModelURL(
             fileManager: fileManager
         ), fileManager.fileExists(atPath: downloaded.path) {

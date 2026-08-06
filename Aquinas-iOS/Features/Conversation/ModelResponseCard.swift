@@ -48,14 +48,25 @@ struct ModelResponseCard: View {
     @State private var isThinkingCollapsing: Bool = false
     @State private var hasStartedFinishThinking: Bool = false
     @State private var thinkingStartedAt: Date
+    @State private var revealedResponseWordCount: Int = 0
+    @State private var isResponseFullyRevealed: Bool = false
 
     let brandBrown = AquinasTheme.Colors.primaryReadable
     private var thinkingSummaryLines: [String] {
         thinkingSummary
     }
+    private var presentsThinkingUI: Bool {
+        showsThinkingIntro || !thinkingSummary.isEmpty
+    }
+    /// Continues the thinking phase's word-based token estimate (see `LiveThinkingProgressView`)
+    /// into the actual response streaming, so the count keeps climbing as words are revealed
+    /// instead of freezing once the initial thinking/chain-of-thought phase ends.
+    private var totalEstimatedTokenCount: Int {
+        let thinkingWordCount = thinkingSummary.joined(separator: " ").split(separator: " ").count
+        return Int(Double(thinkingWordCount + revealedResponseWordCount) * 1.3)
+    }
     private var canShowThinkingSummaryButton: Bool {
-        showsThinkingIntro
-            && !thinkingSummary.isEmpty
+        !thinkingSummary.isEmpty
             && !isThinking
             && !isAwaitingResponse
             && showResponseContent
@@ -129,7 +140,7 @@ struct ModelResponseCard: View {
             // centred pill position to left-aligned above the title, never disappearing.
             VStack(alignment: .center, spacing: 16) {
 
-                if showsThinkingIntro {
+                if presentsThinkingUI {
                     // ── "Thinking…" / expandable thinking summary ─────────────
                     if isThinking {
                         LiveThinkingProgressView(
@@ -138,7 +149,8 @@ struct ModelResponseCard: View {
                             isQueuedForModel: isQueuedForModel,
                             funStatusText: funStatusText,
                             font: responseFont.textFont(size: conversationFontSize),
-                            color: brandBrown
+                            color: brandBrown,
+                            startedAt: thinkingStartedAt
                         )
                             .transition(.opacity.combined(with: .scale(scale: 0.96)))
                     } else if canShowThinkingSummaryButton {
@@ -177,7 +189,7 @@ struct ModelResponseCard: View {
                     }
                 }
 
-                if showsThinkingIntro && !isThinking && isThinkingExpanded {
+                if presentsThinkingUI && !isThinking && isThinkingExpanded {
                     VStack(alignment: .leading, spacing: 16) {
                         VStack(alignment: .leading, spacing: 8) {
                             ForEach(Array(thinkingSummaryLines.enumerated()), id: \.offset) { index, line in
@@ -269,9 +281,27 @@ struct ModelResponseCard: View {
                         onInlineInsightFork: onInlineInsightFork,
                         onInlineInsightToggleSaved: onInlineInsightToggleSaved,
                         onRevealStart: onRevealStart,
-                        onFinish: onFinish
+                        onFinish: {
+                            withAnimation(.easeOut(duration: 0.25)) {
+                                isResponseFullyRevealed = true
+                            }
+                            onFinish?()
+                        },
+                        onRevealedWordCountChange: { count in
+                            revealedResponseWordCount = count
+                        }
                     )
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
+
+                    if !isResponseFullyRevealed {
+                        ThinkingMetricsFooter(
+                            startedAt: thinkingStartedAt,
+                            estimatedTokenCount: totalEstimatedTokenCount,
+                            color: brandBrown
+                        )
+                        .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
+                        .transition(.opacity)
+                    }
                 }
             }
             .frame(
@@ -296,12 +326,7 @@ struct ModelResponseCard: View {
             guard shouldAnimateOnAppear else { return }
             guard !isAwaitingResponse else { return }
             guard showsThinkingIntro else {
-                try? await Task.sleep(for: .milliseconds(80))
-                guard !Task.isCancelled else { return }
-                withAnimation(.easeOut(duration: 0.22)) {
-                    showTitle = true
-                    showResponseContent = true
-                }
+                await revealContentWithoutThinking()
                 return
             }
             await finishThinking()
@@ -316,12 +341,7 @@ struct ModelResponseCard: View {
                 if showsThinkingIntro {
                     await finishThinking()
                 } else {
-                    try? await Task.sleep(for: .milliseconds(80))
-                    guard !Task.isCancelled else { return }
-                    withAnimation(.easeOut(duration: 0.22)) {
-                        showTitle = true
-                        showResponseContent = true
-                    }
+                    await revealContentWithoutThinking()
                 }
             }
         }
@@ -354,12 +374,33 @@ struct ModelResponseCard: View {
         visibleThinkingLineCount = 0
         isThinkingRuleVisible = false
         isThinkingCollapsing = false
+        revealedResponseWordCount = 0
+        isResponseFullyRevealed = false
         withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
             isThinking = true
             isThinkingDocked = false
             isShowingWritingStatus = isReceivingStream
             showTitle = false
             showResponseContent = false
+        }
+    }
+
+    /// Used when `showsThinkingIntro` is false (e.g. a cancelled response, which swaps in plain
+    /// text and suppresses the thinking UI) — reveals content directly. Must still reset
+    /// `isThinking`/`hasStartedFinishThinking`/the elapsed-time clock, or a thinking state left
+    /// over from before the cancellation keeps `LiveThinkingProgressView` (and its live timer)
+    /// mounted and ticking indefinitely, even though nothing is actually being generated anymore.
+    @MainActor
+    private func revealContentWithoutThinking() async {
+        try? await Task.sleep(for: .milliseconds(80))
+        guard !Task.isCancelled else { return }
+        hasStartedFinishThinking = true
+        withAnimation(.easeOut(duration: 0.22)) {
+            isThinking = false
+            isThinkingDocked = true
+            isShowingWritingStatus = false
+            showTitle = true
+            showResponseContent = true
         }
     }
 
@@ -416,67 +457,134 @@ private struct LiveThinkingProgressView: View {
     let funStatusText: String?
     let font: Font
     let color: Color
+    let startedAt: Date
 
     private var showsDetailedProgress: Bool {
         !summaryLines.isEmpty || isWritingResponse
     }
 
-    var body: some View {
-        Group {
-            if showsDetailedProgress {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(summaryLines.enumerated()), id: \.offset) { index, line in
-                        Text(line)
-                            .font(font)
-                            .lineSpacing(8)
-                            .multilineTextAlignment(.leading)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .modifier(
-                                ThinkingShimmer(
-                                    isActive: !isWritingResponse && index == summaryLines.count - 1,
-                                    color: color
-                                )
-                            )
-                            .transition(.glideFadeUp)
-                    }
+    /// Rough word-count-based proxy for tokens spent so far — this build has no live model API
+    /// wired in (responses are simulated), so there's no real token count to report. This gives
+    /// the user a live-feeling number without claiming it's an authoritative usage count.
+    private var estimatedTokenCount: Int {
+        var text = summaryLines.joined(separator: " ")
+        if isWritingResponse { text += " " + (funStatusText ?? "Writing response...") }
+        let wordCount = text.split(separator: " ").count
+        return Int(Double(wordCount) * 1.3)
+    }
 
-                    if isWritingResponse {
-                        Text(funStatusText ?? "Writing response...")
+    var body: some View {
+        VStack(alignment: showsDetailedProgress ? .leading : .center, spacing: 8) {
+            Group {
+                if showsDetailedProgress {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(summaryLines.enumerated()), id: \.offset) { index, line in
+                            Text(line)
+                                .font(font)
+                                .lineSpacing(8)
+                                .multilineTextAlignment(.leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .modifier(
+                                    ThinkingShimmer(
+                                        isActive: !isWritingResponse && index == summaryLines.count - 1,
+                                        color: color
+                                    )
+                                )
+                                .transition(.glideFadeUp)
+                        }
+
+                        if isWritingResponse {
+                            Text(funStatusText ?? "Writing response...")
+                                .font(font)
+                                .fontWeight(.bold)
+                                .lineSpacing(8)
+                                .multilineTextAlignment(.leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .modifier(ThinkingShimmer(isActive: true, color: color))
+                                .transition(.glideFadeUp)
+                                .accessibilityLabel("Writing response")
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
+                } else {
+                    if isQueuedForModel {
+                        Text(funStatusText ?? "Question queued")
                             .font(font)
                             .fontWeight(.bold)
-                            .lineSpacing(8)
-                            .multilineTextAlignment(.leading)
-                            .fixedSize(horizontal: false, vertical: true)
+                            .modifier(QueuedWorkBreatheModifier(isQueued: true))
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                            .accessibilityLabel("Question queued")
+                    } else {
+                        Text(funStatusText ?? "Thinking...")
+                            .font(font)
+                            .fontWeight(.bold)
                             .modifier(ThinkingShimmer(isActive: true, color: color))
-                            .transition(.glideFadeUp)
-                            .accessibilityLabel("Writing response")
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                            .accessibilityLabel("Thinking")
                     }
                 }
+            }
+
+            // Waits for the initial "Thinking..." line to give way to the actual chain-of-thought
+            // (or "Writing response...") before showing — not present during the plain intro line.
+            if showsDetailedProgress {
+                ThinkingMetricsFooter(
+                    startedAt: startedAt,
+                    estimatedTokenCount: estimatedTokenCount,
+                    color: color
+                )
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
-            } else {
-                if isQueuedForModel {
-                    Text(funStatusText ?? "Question queued")
-                        .font(font)
-                        .fontWeight(.bold)
-                        .modifier(QueuedWorkBreatheModifier(isQueued: true))
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
-                        .accessibilityLabel("Question queued")
-                } else {
-                    Text(funStatusText ?? "Thinking...")
-                        .font(font)
-                        .fontWeight(.bold)
-                        .modifier(ThinkingShimmer(isActive: true, color: color))
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
-                        .accessibilityLabel("Thinking")
-                }
+                .transition(.opacity)
             }
         }
         .animation(.easeOut(duration: 0.3), value: summaryLines.count)
         .animation(.easeOut(duration: 0.3), value: isWritingResponse)
         .animation(.easeInOut(duration: 0.25), value: isQueuedForModel)
+    }
+}
+
+/// Persistent readout pinned below the thinking/writing text — elapsed time always reflects
+/// reality (driven by wall-clock time via `TimelineView`), while the token count is a rough
+/// word-based estimate since responses in this build are simulated, not fetched from a live
+/// model API that would report real usage.
+private struct ThinkingMetricsFooter: View {
+    let startedAt: Date
+    let estimatedTokenCount: Int
+    let color: Color
+
+    var body: some View {
+        TimelineView(.periodic(from: startedAt, by: 1)) { context in
+            let elapsedSeconds = max(0, Int(context.date.timeIntervalSince(startedAt)))
+            HStack(spacing: 4) {
+                Text(formattedDuration(elapsedSeconds))
+                    .fontWeight(.bold)
+                    .monospacedDigit()
+                    .contentTransition(.numericText(value: Double(elapsedSeconds)))
+                    // Fixed width (not just monospacedDigit) so the footer doesn't reflow
+                    // every second as the digit count changes, e.g. "9s" → "10s" → "1:00".
+                    .frame(width: 28, alignment: .leading)
+
+                Text("·")
+                    .font(.custom("Figtree-Regular", size: 18))
+
+                Text("~\(estimatedTokenCount) tokens")
+                    .monospacedDigit()
+                    .contentTransition(.numericText(value: Double(estimatedTokenCount)))
+            }
+            .font(.custom("Figtree-Regular", size: 12))
+            .foregroundColor(color.opacity(0.4))
+            .animation(.easeOut(duration: 0.35), value: elapsedSeconds)
+            .animation(.easeOut(duration: 0.35), value: estimatedTokenCount)
+        }
+    }
+
+    private func formattedDuration(_ totalSeconds: Int) -> String {
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        return minutes > 0 ? String(format: "%d:%02d", minutes, seconds) : "\(seconds)s"
     }
 }
 
@@ -496,12 +604,17 @@ struct ThinkingShimmer: ViewModifier {
                 // Total cycle: 1.0 s sweep + 1.0 s pause = 2.0 s.
                 // `phase` only reaches 1.0 at the sweep midpoint; after that it
                 // clamps at 1.0 so the band sits off the right edge (invisible)
-                // for the pause portion before the next sweep begins.
+                // for the pause portion before the next sweep begins. The sweep
+                // range clears the band (half-width 0.4) fully past x = 1.0 by
+                // the time phase reaches 1.0, so the fade-out happens gradually
+                // as part of the sweep itself instead of leaving a bright tail
+                // resting on the last character that then snaps away when the
+                // next cycle starts.
                 let cycle: Double  = 2.0
                 let sweepSpan: Double = 1.0
                 let tMod  = t.truncatingRemainder(dividingBy: cycle)
                 let phase = CGFloat(min(tMod / sweepSpan, 1.0))
-                let sweep = phase * 1.6 - 0.3
+                let sweep = phase * 1.9 - 0.4
                 content
                     .foregroundStyle(
                         LinearGradient(

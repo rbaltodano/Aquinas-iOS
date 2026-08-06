@@ -45,17 +45,12 @@ struct InsightTreeInsightCard: View {
                 Text(insight.title)
                     .font(.custom("Figtree-Bold", size: 18))
                     .foregroundColor(AquinasTheme.Colors.primaryReadable)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 Spacer()
             }
 
-            Text(insight.definition)
-                .font(.figtreeParagraph)
-                .lineSpacing(12)
-                .foregroundColor(AquinasTheme.Colors.paragraphText)
-                .fixedSize(horizontal: false, vertical: true)
+            TruncatableParagraph(text: insight.definition)
 
             if showsStartConversation {
                 Button(action: { onStartConversation?() }) {

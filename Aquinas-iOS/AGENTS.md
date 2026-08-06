@@ -109,3 +109,9 @@ Do not commit secrets. Keep local configuration in `Config.xcconfig` or user-spe
 settings. Conversation persistence currently uses `UserDefaults`, so avoid storing sensitive user
 content without an explicit product decision. The local backend's SQLite tree store is a separate
 development-time persistence boundary and must not be mistaken for production cloud storage.
+
+Source control and Xcode builds do not back up the app's `UserDefaults`. Before physical-device
+model probes, export and verify the app data, record Home counts before and after installation, and
+use a disposable probe bundle/container. Never run `xcrun devicectl device copy to` with
+`--domain-type appDataContainer --remove-existing-content true` against the production bundle,
+even when a nested destination is provided.

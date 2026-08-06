@@ -2,6 +2,11 @@
 
 SwiftUI iOS app for Aquinas, a Thomistic study/conversation app. Full repository guidelines (structure, style, commit conventions) live in [Aquinas-iOS/AGENTS.md](Aquinas-iOS/AGENTS.md) — read that before making changes.
 
+Code safety checkpoint `35819d9` (`Integrate local Aquinas runtime and conversation workflows`)
+is preserved in Git history. The working tree intentionally contains later uncommitted grounding,
+topic-isolation, response-presentation, and Insight Tree fixes; inspect and preserve those changes
+rather than resetting to the checkpoint merely because the tree is dirty.
+
 ## Model integration is live
 
 Before changing any model-facing code, read
@@ -12,11 +17,16 @@ remaining implementation order.
 The live app is local-first when a verified LiteRT-LM package is available.
 `AquinasApplicationRuntime` owns one process-scoped `LiteRTAquinasRuntime`, injects the same
 runtime into `LiteRTAquinasModel` and `ModelTaskQueue`, and preserves serialized lifecycle,
-streaming, and cancellation semantics. Ordinary conversation emits a concise public approach
-summary as generation begins, then streams local prose whose length is proportional to the
-question. Ordinary conversation stays deterministic because sampled decoding corrupts this 4-bit
+streaming, and cancellation semantics. Ordinary local conversation generates visible prose only.
+A separate short structured pass selects `key_terms`; the adapter validates exact term/excerpt
+matches before adding tappable links, and metadata failure cannot replace or leak into the answer.
+While generation is incomplete, the UI reports progress without
+presenting canned text as model reasoning. The completed public approach summary is persisted in
+the branch and remains available through **Show Thinking** after view recreation or relaunch.
+Ordinary conversation stays deterministic because sampled decoding corrupts this 4-bit
 checkpoint; structured application operations are also deterministic. Foundational and
-interesting key terms are extracted from the completed response, while
+interesting key terms come from the validated payload, with heuristic extraction used only when
+the checkpoint fails the JSON contract, while
 direct definition requests return Insight metadata. Special actions remain neutral and use
 validated structured outputs. A non-cancellation local failure gets one local recovery attempt;
 substantial separated phrase repetition and mixed-script token corruption are rejected.
@@ -25,16 +35,31 @@ the entire draft. Do not restore prompt-forced word targets or automatic short-a
 exact package entered slow rejected loops under that experiment.
 LiteRT-LM currently emits the generated text only after native decoding finishes, so generation
 has no automatic time cutoff; the Model Task Stop action remains available to the user.
-The Thinking summary is app-generated public approach text, never private model reasoning. Keep
-specialized rules narrow and keep the fallback tied to a shortened focus from the user's question.
+The Thinking summary is an app-generated public approach description, never private model
+reasoning or chain-of-thought. It must describe the relevant concepts or checks without pretending
+to expose hidden scratch work.
+`AquinasGroundingProviding` is the factual-retrieval boundary. The current offline lexical
+bootstrap includes trusted Nicaea (325), Constantinople (381), Nicaea II (787), and Didache notes.
+It fixes those known regressions but is not broad RAG coverage; production ranking still needs the
+MiniLM query encoder and a versioned trusted corpus.
 The local conversation adapter protects explicit authorship corrections: prompts preserve named
 entities/negation, internally conflicting attribution/unknown-author drafts are rejected, and one
 corrective retry is allowed without assuming the user is automatically right. The Insight Tree
 canvas collapses a same-named Insight chip into its owning Node while retaining the Insight in
 storage and the Node card.
+Clear changes of subject start with fresh model history, and a response that exactly repeats an
+earlier assistant answer triggers one bounded engine reload and fresh-context retry. Direct Insight
+cards use explicit/standalone definition intent; the literal words `what is` do not by themselves
+turn a broad question into a definition card.
 `BackendAquinasModel` remains a development recovery path, but a physical iPhone never attempts a
 loopback (`127.0.0.1`/`localhost`) backend. Ordinary on-device use does not require `uvicorn`.
 `MockAquinasModel` remains previews/tests only.
+
+Conversation Insight Tree analysis and `all-MiniLM-L6-v2` topology are still backend-only. With a
+physical-device loopback URL, iOS skips and clears unreachable tree-analysis jobs, releases the
+persisted-tree entrance gate, and displays the limited local fallback instead of staying on
+`Mapping…`. This fallback is not MiniLM parity; use a reachable Mac LAN URL during development or
+port MiniLM plus assignment/persistence on-device for full offline behavior.
 
 The fine-tuned Aquinas package is 2,722,385,120 bytes with SHA-256
 `5cb26c8e29d52ecf3e2b651e590761fe593dddcab0cbcdac7dc0692605ee5569`. The production
@@ -45,9 +70,40 @@ size-check, hash-check, and atomically install the package into Application Supp
 delivery still needs a hosted model URL, resumable/background transfer, storage/settings UI, and
 removal of the 2.72 GB bundled development seed.
 
+An experimental higher-precision `8fc4emb` package exists in the backend workspace, but its first
+simulator probe failed LiteRT GPU engine creation (`Failed to initialize kernel`) before generation.
+The app therefore still intentionally uses the verified 4-bit manifest. Debug probes may pass
+`--litert-model-path /absolute/path/to/model.litertlm` to test another exact package without
+replacing the bundled seed. Never promote a candidate before simulator and base-iPhone load,
+latency, memory, stability, and blind answer-quality gates pass.
+
+The 2,659,057,664-byte `litert-community/Qwen3-4B` mixed-INT4 candidate (SHA-256
+`f0794bc77efeaaf4f7af815f04c483b19b8f2ae4a102cef1b7b760a25848a18e`) is also rejected. It
+failed simulator Metal initialization because a 388,956,160-byte tensor exceeded the 256 MB
+per-allocation limit; the base iPhone 17 was terminated with signal 9 during initialization. It
+never generated a token and must not replace Gemma. `LiteRTDeviceProbe` supports external Mac paths
+and diagnostic files in the app Documents directory, but future physical tests must use a separate
+probe bundle/container.
+
+Never run `xcrun devicectl device copy to` with `--domain-type appDataContainer
+--remove-existing-content true` against `com.ryanbaltodano.Aquinas-iOS`. A source commit/build does
+not preserve `UserDefaults`. Export a verified app-data backup, record Home counts before and after
+installation, and use a disposable bundle identifier for multi-gigabyte candidate tests.
+
+Factual reliability is retrieval-first. A replacement raw model may improve reasoning, but
+production still needs an automatically ingested licensed/versioned corpus, MiniLM passage
+retrieval, evidence-bound answers, citations, claim validation, and explicit uncertainty or an
+approved online lookup when local evidence is insufficient. Fine-tuning is for Aquinas behavior
+and voice, not for storing facts.
+
 Uploaded images are normalized to bounded JPEG payloads and included with their user transcript
 message. The backend validates them and passes up to the eight most recent images to Gemma 4's
 vision tower; non-image file attachments remain display-only.
+
+A quoted Insight remains structured alongside its submitted `ChatBlock.user`. Both the local and
+backend model boundaries render it as an escaped `<insight_quote>` block containing its title and
+definition immediately before `User question:`; the visible transcript continues to show only the
+Insight chip and the user's original question.
 
 Conversation-scoped definitions first use
 `POST /conversation/{conversation_id}/concept/lookup`, then the corresponding `/define` route
@@ -129,6 +185,8 @@ uses `BackendAquinasModel` at `127.0.0.1`; release builds ignore the flag.
   gauge/card.
 - `Services/AquinasModel.swift` / `LiteRTAquinasModel.swift` — generative boundary and local-first
   implementation; `BackendAquinasModel.swift` is the recovery/API client.
+- `Services/AquinasGrounding.swift` — replaceable factual-retrieval boundary and current offline
+  bootstrap reference catalog.
 - `Services/AquinasApplicationRuntime.swift` / `LiteRTAquinasRuntime.swift` — process-scoped model
   and queue ownership plus the long-lived LiteRT engine/session driver.
 - `Services/LiteRTModelStore.swift` / `LiteRTModelInstaller.swift` — verified model resolution and

@@ -186,7 +186,12 @@ actor ModelRuntimeLifecycleManager {
         guard canUnload else { return }
         cancelIdleUnload()
 
+        // Checked before each wait, and `waitForTransition` is itself cancellation-aware, so a
+        // generation whose lease never releases can no longer pin this call forever. That
+        // previously left `ModelTaskQueue.lifecycleTransitionTask` permanently in flight, which
+        // kept the whole queue suspended (see `setApplicationActive`).
         while !activeLeaseIDs.isEmpty {
+            guard !Task.isCancelled else { return }
             await waitForTransition()
         }
         guard !Task.isCancelled else { return }
@@ -389,9 +394,21 @@ actor ModelRuntimeLifecycleManager {
         notifyTransitionWaiters()
     }
 
+    /// Cancellation-aware: a plain continuation here only ever resumed via
+    /// `notifyTransitionWaiters()`, so if no further state transition or lease release ever
+    /// happened (a hung generation), the awaiting task was stuck forever even after being
+    /// cancelled. Cancelling now broadcasts to the waiters so the caller's loop can re-check.
     private func waitForTransition() async {
-        await withCheckedContinuation { continuation in
-            transitionWaiters.append(continuation)
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume()
+                    return
+                }
+                transitionWaiters.append(continuation)
+            }
+        } onCancel: {
+            Task { await self.notifyTransitionWaiters() }
         }
     }
 

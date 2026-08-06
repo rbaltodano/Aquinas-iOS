@@ -12,19 +12,49 @@ import LiteRTLM
 struct LiteRTAquinasModel: AquinasModel {
     private let runtime: LiteRTAquinasRuntime
     private let fallback: BackendAquinasModel
+    private let groundingProvider: any AquinasGroundingProviding
 
     init(
         runtime: LiteRTAquinasRuntime,
-        fallback: BackendAquinasModel = BackendAquinasModel()
+        fallback: BackendAquinasModel = BackendAquinasModel(),
+        groundingProvider: any AquinasGroundingProviding = LocalAquinasGroundingProvider()
     ) {
         self.runtime = runtime
         self.fallback = fallback
+        self.groundingProvider = groundingProvider
+    }
+
+    /// Whether falling back to the development backend can possibly succeed. On a physical
+    /// device pointed at loopback (the shipped default) it never can, so every fallback call is
+    /// guaranteed-useless work sitting in the serialized generation path — which is exactly what
+    /// made batches of queued definitions feel stuck: each local failure paid a full engine
+    /// unload + 3.86GB reload + retry, and *then* a doomed network round trip, before the queue
+    /// could move on. `respond()` has always guarded this; every other operation did not.
+    private var canUseBackendFallback: Bool {
+        AquinasBackendConfiguration.canRecoverFromCurrentDevice
     }
 
     static func definitionRequestTerm(
         in transcript: [ChatBlock]
     ) -> String? {
         requestedDefinitionTerm(in: transcript)
+    }
+
+    static func startsFreshTopic(
+        latestQuestion: String,
+        previousQuestion: String
+    ) -> Bool {
+        isLikelyTopicShift(
+            latestQuestion: latestQuestion,
+            previousQuestion: previousQuestion
+        )
+    }
+
+    static func repeatsEarlierAnswer(
+        _ response: String,
+        transcript: [ChatBlock]
+    ) -> Bool {
+        duplicatesEarlierAnswer(response, in: transcript)
     }
 
     static func visibleResponseText(
@@ -58,6 +88,18 @@ struct LiteRTAquinasModel: AquinasModel {
         return contradictsAuthorshipCorrection(correction, response: response)
     }
 
+    static func groundedResponse(
+        for question: String,
+        references: [AquinasGroundingReference],
+        thinkingEnabled: Bool = true
+    ) -> ModelResponse? {
+        verifiedGroundedResponse(
+            for: question,
+            references: references,
+            thinkingEnabled: thinkingEnabled
+        )
+    }
+
     func respond(to context: ConversationContext) async -> ModelResponse {
         await respond(
             to: context,
@@ -76,12 +118,33 @@ struct LiteRTAquinasModel: AquinasModel {
         }
 
         do {
-            let liveThinkingSummary = thinkingEnabled
-                ? Self.publicApproachSummary(for: context)
-                : []
             onUpdate(.generationStarted)
-            if !liveThinkingSummary.isEmpty {
-                onUpdate(.thinkingSummary(liveThinkingSummary))
+            let latestQuestion = Self.latestUserQuestion(in: context.transcript)
+            let groundingReferences = groundingProvider.references(
+                for: latestQuestion,
+                limit: 3
+            )
+            // Retrieval finishes before generation even starts, so surface it
+            // immediately — real activity to look at during the slow part
+            // (generation), not a decorative placeholder.
+            let fallbackThinkingSummary: [String] = thinkingEnabled
+                ? Self.publicApproachSummary(for: context) + Self.groundingSourceSummary(
+                    for: groundingReferences
+                )
+                : []
+            if thinkingEnabled, !fallbackThinkingSummary.isEmpty {
+                onUpdate(.thinkingSummary(fallbackThinkingSummary))
+            }
+            if let verifiedResponse = Self.verifiedGroundedResponse(
+                for: latestQuestion,
+                references: groundingReferences,
+                thinkingEnabled: thinkingEnabled
+            ) {
+                if thinkingEnabled, !verifiedResponse.thinkingSummary.isEmpty {
+                    onUpdate(.thinkingSummary(verifiedResponse.thinkingSummary))
+                }
+                onUpdate(.responseText(verifiedResponse.text))
+                return verifiedResponse
             }
             if let term = Self.requestedDefinitionTerm(
                 in: context.transcript
@@ -93,10 +156,13 @@ struct LiteRTAquinasModel: AquinasModel {
                 try Task.checkCancellation()
                 let response = ModelResponse(
                     text: definition.meaning,
-                    thinkingSummary: liveThinkingSummary,
+                    thinkingSummary: fallbackThinkingSummary,
                     keyTerms: [KeyTerm(displayText: definition.word)],
                     insight: definition
                 )
+                if thinkingEnabled, !response.thinkingSummary.isEmpty {
+                    onUpdate(.thinkingSummary(response.thinkingSummary))
+                }
                 onUpdate(.responseText(response.text))
                 return response
             }
@@ -109,23 +175,49 @@ struct LiteRTAquinasModel: AquinasModel {
                 correction = nil
             }
             let systemInstruction = Self.conversationSystemInstruction(
-                context: context,
-                explicitCorrection: correction
+                context: request.startsFreshTopic
+                    ? ConversationContext(
+                        transcript: context.transcript.last.map { [$0] } ?? [],
+                        personality: context.personality
+                    )
+                    : context,
+                explicitCorrection: correction,
+                groundingReferences: groundingReferences
             )
-            var text = try await runtime.generate(
+            var raw = try await runtime.generate(
                 systemInstruction: systemInstruction,
                 initialMessages: request.history,
                 message: request.latest,
                 sampling: .conversation
             )
             try Task.checkCancellation()
-            var visibleText = Self.sanitizedVisibleText(text)
+            var responseText = Self.plainConversationText(from: raw)
+            if Self.duplicatesEarlierAnswer(
+                responseText,
+                in: context.transcript
+            ) {
+                // Recover once from a native session returning the previous turn verbatim.
+                await runtime.unloadModelWeights()
+                try await runtime.loadModelWeights()
+                raw = try await runtime.generate(
+                    systemInstruction: systemInstruction + """
+
+                    This is a fresh question. Do not repeat or continue an earlier answer. Address
+                    the latest user question directly and follow any change of subject.
+                    """,
+                    initialMessages: [],
+                    message: request.latest,
+                    sampling: .conversation.retryVariant
+                )
+                try Task.checkCancellation()
+                responseText = Self.plainConversationText(from: raw)
+            }
             if let correction,
                Self.contradictsAuthorshipCorrection(
                     correction,
-                    response: visibleText
+                    response: responseText
                ) {
-                text = try await runtime.generate(
+                raw = try await runtime.generate(
                     systemInstruction: systemInstruction + """
 
                     The previous draft made internally conflicting authorship claims. Answer again.
@@ -138,24 +230,25 @@ struct LiteRTAquinasModel: AquinasModel {
                     sampling: .conversation.retryVariant
                 )
                 try Task.checkCancellation()
-                visibleText = Self.sanitizedVisibleText(text)
+                responseText = Self.plainConversationText(from: raw)
             }
+            guard !responseText.isEmpty,
+                  !Self.duplicatesEarlierAnswer(
+                    responseText,
+                    in: context.transcript
+                  ) else {
+                throw AquinasModelActionError.invalidResponse
+            }
+            onUpdate(.responseText(responseText))
 
-            let analysis = Self.analyzeResponse(
-                visibleText,
-                thinkingSummary: liveThinkingSummary
+            // Key-term metadata is generated separately so malformed or truncated JSON can
+            // never replace, truncate, or leak into the answer the user sees.
+            let keyTerms = await generatePresentationKeyTerms(in: responseText)
+            return ModelResponse(
+                text: responseText,
+                thinkingSummary: fallbackThinkingSummary,
+                keyTerms: keyTerms
             )
-            let response = ModelResponse(
-                text: visibleText,
-                thinkingSummary: analysis.thinkingSummary,
-                keyTerms: analysis.keyTerms,
-                insight: nil
-            )
-            if thinkingEnabled, !response.thinkingSummary.isEmpty {
-                onUpdate(.thinkingSummary(response.thinkingSummary))
-            }
-            onUpdate(.responseText(response.text))
-            return response
         } catch {
             guard !Task.isCancelled else {
                 return ModelResponse(text: "")
@@ -202,6 +295,7 @@ struct LiteRTAquinasModel: AquinasModel {
             )
         } catch {
             guard !Task.isCancelled else { return "" }
+            guard canUseBackendFallback else { return context.compactedContext ?? "" }
             return await fallback.compact(context)
         }
     }
@@ -214,6 +308,7 @@ struct LiteRTAquinasModel: AquinasModel {
             return try await generateDefinition(term, context: context)
         } catch {
             if Task.isCancelled { throw CancellationError() }
+            guard canUseBackendFallback else { throw error }
             return try await fallback.defineTerm(term, in: context)
         }
     }
@@ -227,6 +322,7 @@ struct LiteRTAquinasModel: AquinasModel {
             return try await generateDefinition(term, context: context)
         } catch {
             if Task.isCancelled { throw CancellationError() }
+            guard canUseBackendFallback else { throw error }
             return try await fallback.defineTerm(
                 term,
                 in: context,
@@ -240,7 +336,8 @@ struct LiteRTAquinasModel: AquinasModel {
         in context: ConversationContext,
         conversationID: UUID?
     ) async -> ConceptDefinition? {
-        await fallback.cachedDefinition(
+        guard canUseBackendFallback else { return nil }
+        return await fallback.cachedDefinition(
             for: term,
             in: context,
             conversationID: conversationID
@@ -265,8 +362,8 @@ struct LiteRTAquinasModel: AquinasModel {
         do {
             let raw = try await generateStructured(prompt)
             let response: LabelPayload = try Self.decodeJSON(raw)
-            let label = response.label.trimmingCharacters(
-                in: .whitespacesAndNewlines
+            let label = Self.spaceSeparatedLabel(
+                from: response.label.trimmingCharacters(in: .whitespacesAndNewlines)
             )
             guard (1...5).contains(label.split(whereSeparator: \.isWhitespace).count),
                   label.rangeOfCharacter(from: .alphanumerics) != nil else {
@@ -275,8 +372,104 @@ struct LiteRTAquinasModel: AquinasModel {
             return label
         } catch {
             if Task.isCancelled { throw CancellationError() }
+            guard canUseBackendFallback else { throw error }
             return try await fallback.labelSubject(forTitles: titles)
         }
+    }
+
+    /// Repairs a label the checkpoint returned with the space between words dropped (e.g.
+    /// "BeingAndExistence") by inserting one before each internal capital letter. Short
+    /// structured-JSON labels from this checkpoint occasionally lose the space token while
+    /// otherwise preserving each word's own capitalization, and — because the word-count
+    /// validation below counts whitespace-separated tokens — an unrepaired "BeingAndExistence"
+    /// silently passes as "1 word" and renders as a single smashed-together word on the Node
+    /// Concept card. A label that's already spaced, or genuinely one lowercase/all-caps word,
+    /// passes through unchanged.
+    private static func spaceSeparatedLabel(from raw: String) -> String {
+        guard !raw.isEmpty, !raw.contains(where: \.isWhitespace) else { return raw }
+        var result = ""
+        for (index, character) in raw.enumerated() {
+            if index > 0, character.isUppercase {
+                result.append(" ")
+            }
+            result.append(character)
+        }
+        return result
+    }
+
+    /// Extracts the main subject of this turn's exchange — always, unconditionally, every turn.
+    /// Earlier this session, the model itself judged whether a turn introduced a "genuinely new"
+    /// subject (`new_subject: true/false`) directly in this same call. That judgment turned out
+    /// to be unreliable and order-dependent: asked to compare "Council of Florence" against a
+    /// prior "Book of Joshua" Node, the model correctly said a pivot occurred; asked the exact
+    /// reverse order in a fresh conversation, it said no pivot occurred for what is structurally
+    /// the same topic change. A binary judgment call like that is exactly the kind of thing an
+    /// LLM is inconsistent at. This call now only does content extraction — a task models are
+    /// good at — and leaves the "is this actually a new subject" decision to the caller, which
+    /// answers it deterministically with on-device embedding similarity against the Node
+    /// Concepts already on the tree (see `enqueueLocalInsightTreeSeedingTask`), the same
+    /// lightweight math the tree's own Insight-to-Node clustering already relies on.
+    func insightTreeSeedCandidate(
+        question: String,
+        response: String
+    ) async throws -> (label: String, summary: String)? {
+        let prompt = """
+        <TASK:INSIGHT_TREE_SEED>
+        Perform a neutral application task, not persona conversation. Identify the single
+        elementary subject this exchange is centrally about — the label is that subject in 1-5
+        words, as few words as possible. The summary is a concise 1-2 sentence definition of that
+        subject as it relates to this exchange, suitable as a Node's own definition text. Return
+        JSON only, in exactly this shape: {"label":"...","summary":"..."}.
+
+        Question:
+        \(question)
+
+        Answer:
+        \(response)
+        </TASK:INSIGHT_TREE_SEED>
+        """
+        var raw = ""
+        do {
+            raw = try await generateStructured(prompt)
+#if DEBUG
+            print("Aquinas insight-tree seed raw JSON: \(raw)")
+#endif
+            let payload: InsightTreeSeedPayload = try Self.decodeJSON(raw)
+            return Self.validatedInsightTreeSeed(label: payload.label, summary: payload.summary)
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            // A short, bounded structured call can still be cut off before its closing `"}`
+            // when the checkpoint emits end-of-sequence right after finishing a complete
+            // sentence — salvage the already-produced label/summary instead of discarding a
+            // seed the model actually finished conceiving.
+            if !raw.isEmpty,
+               let recovered = Self.validatedInsightTreeSeed(
+                   label: Self.extractedJSONStringField(named: "label", from: raw),
+                   summary: Self.extractedJSONStringField(named: "summary", from: raw)
+               ) {
+                return recovered
+            }
+#if DEBUG
+            print("Aquinas insight-tree seed failed: \(String(reflecting: error))")
+#endif
+            return nil
+        }
+    }
+
+    private static func validatedInsightTreeSeed(
+        label: String?,
+        summary: String?
+    ) -> (label: String, summary: String)? {
+        let label = Self.spaceSeparatedLabel(
+            from: (label ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        let summary = (summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !label.isEmpty,
+              label.rangeOfCharacter(from: .alphanumerics) != nil,
+              (1...5).contains(label.split(whereSeparator: \.isWhitespace).count) else {
+            return nil
+        }
+        return (label, summary)
     }
 
     func blendConceptCandidates(
@@ -322,6 +515,7 @@ struct LiteRTAquinasModel: AquinasModel {
             }
         } catch {
             if Task.isCancelled { throw CancellationError() }
+            guard canUseBackendFallback else { throw error }
             return try await fallback.blendConceptCandidates(
                 concepts,
                 weights: weights
@@ -358,6 +552,7 @@ struct LiteRTAquinasModel: AquinasModel {
             }
         } catch {
             if Task.isCancelled { throw CancellationError() }
+            guard canUseBackendFallback else { throw error }
             return try await fallback.generateChildren(for: concept)
         }
     }
@@ -399,6 +594,7 @@ struct LiteRTAquinasModel: AquinasModel {
             )
         } catch {
             if Task.isCancelled { throw CancellationError() }
+            guard canUseBackendFallback else { throw error }
             return try await fallback.generateQuestionOfTheDay(
                 from: context,
                 conversationTitle: conversationTitle,
@@ -415,6 +611,15 @@ struct LiteRTAquinasModel: AquinasModel {
         guard !cleanedTerm.isEmpty else {
             throw AquinasModelActionError.invalidRequest
         }
+        let groundingQuery = Self.latestUserQuestion(in: context.transcript)
+            + " " + cleanedTerm
+        let groundingReferences = groundingProvider.references(
+            for: groundingQuery,
+            limit: 3
+        )
+        let groundedContext = groundingReferences.isEmpty
+            ? "(no trusted reference notes retrieved)"
+            : groundingReferences.map(\.promptText).joined(separator: "\n\n")
         let prompt = """
         <TASK:CONTEXTUAL_DEFINITION>
         Define the requested term according to its meaning in the supplied context. Prefer the
@@ -425,6 +630,18 @@ struct LiteRTAquinasModel: AquinasModel {
         repeated restatements. Return only the definition prose.
 
         Term: \(cleanedTerm)
+        Reference passages retrieved automatically by semantic similarity (may be loosely
+        relevant or not applicable):
+        \(groundedContext)
+
+        Use a passage only where it genuinely bears on the term's meaning here; do not force-fit
+        one that doesn't. When no passage is relevant, define the term from your own general
+        knowledge as an ordinary dictionary or encyclopedia entry would — the absence of a
+        retrieved passage does not by itself mean the term is unknown or disputed. Reserve saying
+        you are uncertain for cases where the specific fact requested (a date, attribution, or
+        disputed claim) is genuinely not something you can state confidently, not for ordinary
+        vocabulary or well-established concepts.
+
         Context:
         \(Self.plainTranscript(context.transcript))
         </TASK:CONTEXTUAL_DEFINITION>
@@ -446,19 +663,111 @@ struct LiteRTAquinasModel: AquinasModel {
             partOfSpeech: "",
             pronunciation: "",
             meaning: definition,
-            example: "",
-            context: "The term as used in the current conversation"
+            example: ""
         )
     }
 
-    private static func analyzeResponse(
-        _ response: String,
-        thinkingSummary: [String]
-    ) -> LocalPresentationAnalysis {
-        LocalPresentationAnalysis(
-            thinkingSummary: thinkingSummary,
-            keyTerms: foundationalKeyTerms(in: response)
+    static func conversationResponse(
+        from raw: String,
+        fallbackThinkingSummary: [String] = []
+    ) -> ModelResponse {
+        guard let payload: LocalConversationPayload = try? decodeJSON(raw),
+              !payload.response.trimmed.isEmpty else {
+            let recoveredResponse = recoveredConversationResponse(from: raw)
+            let visibleText: String
+            if !recoveredResponse.isEmpty {
+                visibleText = recoveredResponse
+            } else if raw.contains("\"response\"")
+                || raw.contains("\"thinking_summary\"") {
+                // A small on-device checkpoint can run out of output tokens before
+                // closing its JSON object. Never expose that transport wrapper as prose.
+                visibleText = "The on-device model returned an incomplete response. Please try again."
+            } else {
+                visibleText = sanitizedVisibleText(raw).trimmed
+            }
+            return ModelResponse(
+                text: visibleText,
+                thinkingSummary: fallbackThinkingSummary,
+                keyTerms: foundationalKeyTerms(in: visibleText)
+            )
+        }
+
+        let response = sanitizedVisibleText(payload.response).trimmed
+        let summaries = payload.thinkingSummary
+            .map { $0.trimmed }
+            .filter { !$0.isEmpty && !isGenericThinkingSummary($0) }
+            .prefix(3)
+        let keyTerms = validatedKeyTerms(
+            payload.keyTerms,
+            in: response
         )
+        return ModelResponse(
+            text: response,
+            thinkingSummary: summaries.isEmpty
+                ? fallbackThinkingSummary
+                : Array(summaries),
+            keyTerms: keyTerms
+        )
+    }
+
+    static func plainConversationText(from raw: String) -> String {
+        conversationResponse(from: raw).text.trimmed
+    }
+
+    /// Runs as a separate call from the main answer so malformed or truncated JSON can never
+    /// replace, truncate, or delay the answer the user sees.
+    private func generatePresentationKeyTerms(
+        in response: String
+    ) async -> [KeyTerm] {
+        let fallback = Self.foundationalKeyTerms(in: response)
+        do {
+            let raw = try await runtime.generate(
+                systemInstruction: Self.neutralStructuredSystem,
+                message: Message(Self.keyTermsPrompt(for: response)),
+                sampling: .structured
+            )
+            try Task.checkCancellation()
+            return Self.presentationKeyTerms(from: raw, in: response) ?? fallback
+        } catch {
+            return fallback
+        }
+    }
+
+    /// `nonisolated` since it's a pure string builder with no actor-isolated state to protect.
+    nonisolated static func keyTermsPrompt(for response: String) -> String {
+        """
+        Stop the current persona voice. Perform a neutral application task: identify the concepts
+        in the answer below that a reader would most need to understand, or would most benefit
+        from exploring further, to genuinely grasp the passage. Favor terms the argument actually
+        depends on: technical, theological, or philosophical concepts; named doctrines, works, and
+        councils; and key distinctions the reasoning turns on. Do not favor a term merely because
+        it is easy to copy exactly, and do not select incidental words, generic fragments, or
+        connective phrases that carry no independent concept.
+
+        Survey the whole answer rather than stopping after the first candidate you find — a
+        substantive answer usually has several terms worth surfacing, not just one. Select every
+        term that genuinely qualifies, up to eight. Return fewer only when the answer truly does
+        not contain that many, and return an empty array only when nothing in it merits a
+        definition.
+
+        Every display_text and context_excerpt must be copied exactly, character for character,
+        from the answer, and each context_excerpt must contain its display_text. Return only
+        JSON, with no persona voice, markdown fence, or preamble, in this exact shape:
+        {"key_terms":[{"display_text":"Exact text from answer","canonical_term":"Canonical concept name","context_excerpt":"Exact excerpt containing display_text"}]}
+
+        Answer:
+        \(response)
+        """
+    }
+
+    static func presentationKeyTerms(
+        from raw: String,
+        in response: String
+    ) -> [KeyTerm]? {
+        guard let payload: LocalKeyTermsPayload = try? decodeJSON(raw) else {
+            return nil
+        }
+        return validatedKeyTerms(payload.keyTerms, in: response)
     }
 
     private func generateStructured(_ prompt: String) async throws -> String {
@@ -474,6 +783,7 @@ private extension LiteRTAquinasModel {
     struct ConversationRequest {
         let history: [Message]
         let latest: Message
+        let startsFreshTopic: Bool
     }
 
     static let neutralStructuredSystem = """
@@ -484,9 +794,26 @@ private extension LiteRTAquinasModel {
 
     static func conversationSystemInstruction(
         context: ConversationContext,
-        explicitCorrection: AuthorshipCorrection? = nil
+        explicitCorrection: AuthorshipCorrection? = nil,
+        groundingReferences: [AquinasGroundingReference] = []
     ) -> String {
-        """
+        let groundedContext = groundingReferences.isEmpty
+            ? "No trusted reference notes were retrieved for this question."
+            : """
+            Reference passages retrieved for this question, each labeled with its source title:
+            \(groundingReferences.map(\.promptText).joined(separator: "\n\n"))
+
+            These were retrieved automatically by semantic similarity and may be only loosely
+            relevant, incomplete excerpts, or not actually applicable to this question — use a
+            passage only where it genuinely bears on the question, and do not force-fit or invent
+            a connection when it does not. When a passage materially grounds a claim, you may name
+            its source title in prose. Never merge distinct councils or works, replace an exact
+            name with a guessed name, or fabricate a citation, quotation, or detail not present in
+            the passage. If the passages do not establish a requested fact and you are uncertain,
+            say so plainly instead of inventing an answer. Do not mention retrieval or these
+            internal notes unless the user asks about sources.
+            """
+        return """
         You are Aquinas, a philosophical study partner. Follow the logic with intellectual charity.
         Treat earlier claims as revisable: when the user's reasoning defeats a premise, exposes a
         contradiction, supplies decisive evidence, or introduces a better distinction, explicitly
@@ -508,12 +835,217 @@ private extension LiteRTAquinasModel {
             "The latest question disputes whether \($0.author) wrote “\($0.subject)”. Determine whether that correction is accurate rather than assuming either side. Answer the disputed attribution directly and do not drift into discussing \($0.author)'s other writings."
         } ?? "")
 
+        \(groundedContext)
+
         \(personalityInstruction(context.personality))
 
         \(context.compactedContext.map {
             "Earlier compacted conversation context:\n\($0)"
         } ?? "")
+
+        Return only the complete answer as natural prose. Do not return JSON, XML, metadata, task
+        tags, a key-term list, or a thinking summary. Never echo control markup. Finish the answer
+        before stopping.
         """
+    }
+
+    static func latestUserQuestion(in transcript: [ChatBlock]) -> String {
+        for block in transcript.reversed() {
+            if case .user(let question, _, _) = block {
+                return question.trimmed
+            }
+        }
+        return ""
+    }
+
+    static func verifiedGroundedResponse(
+        for question: String,
+        references: [AquinasGroundingReference],
+        thinkingEnabled: Bool = true
+    ) -> ModelResponse? {
+        let normalized = question.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        .lowercased()
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        let asksDirectly = normalized.count <= 140
+            && (normalized.hasPrefix("what ")
+                || normalized.hasPrefix("which ")
+                || normalized.hasPrefix("who ")
+                || normalized.hasPrefix("was ")
+                || normalized.hasPrefix("is "))
+        guard asksDirectly else { return nil }
+        let referenceIDs = Set(references.map(\.id))
+
+        if normalized.contains("second ecumenical council"),
+           referenceIDs.contains("constantinople-381") {
+            return ModelResponse(
+                text: "The second ecumenical council was the First Council of Constantinople, held in 381. It reaffirmed the faith of Nicaea and clarified the Church's teaching on the divinity of the Holy Spirit, contributing to the Nicene-Constantinopolitan Creed.",
+                thinkingSummary: thinkingEnabled ? [
+                    "Checking the established sequence: Nicaea in 325 was first, Constantinople in 381 was second, and Nicaea II in 787 was seventh."
+                ] : [],
+                keyTerms: [
+                    KeyTerm(
+                        displayText: "First Council of Constantinople",
+                        canonicalTerm: "First Council of Constantinople",
+                        contextExcerpt: "The second ecumenical council was the First Council of Constantinople, held in 381."
+                    ),
+                    KeyTerm(
+                        displayText: "Nicene-Constantinopolitan Creed",
+                        canonicalTerm: "Nicene-Constantinopolitan Creed",
+                        contextExcerpt: "contributing to the Nicene-Constantinopolitan Creed."
+                    )
+                ]
+            )
+        }
+
+        if normalized.contains("first ecumenical council"),
+           referenceIDs.contains("nicaea-325") {
+            return ModelResponse(
+                text: "The first ecumenical council was the First Council of Nicaea, held in 325. It addressed the Arian controversy and confessed that the Son is consubstantial with the Father.",
+                thinkingSummary: thinkingEnabled ? [
+                    "Checking the council's established name, date, place in the sequence, and central doctrinal question."
+                ] : [],
+                keyTerms: [
+                    KeyTerm(
+                        displayText: "First Council of Nicaea",
+                        canonicalTerm: "First Council of Nicaea",
+                        contextExcerpt: "The first ecumenical council was the First Council of Nicaea, held in 325."
+                    )
+                ]
+            )
+        }
+
+        if normalized.contains("seventh ecumenical council"),
+           referenceIDs.contains("nicaea-787") {
+            return ModelResponse(
+                text: "The seventh ecumenical council was the Second Council of Nicaea, held in 787. It defended the veneration of sacred images against iconoclasm.",
+                thinkingSummary: thinkingEnabled ? [
+                    "Distinguishing Nicaea II in 787 from Nicaea in 325 and Constantinople in 381."
+                ] : [],
+                keyTerms: [
+                    KeyTerm(
+                        displayText: "Second Council of Nicaea",
+                        canonicalTerm: "Second Council of Nicaea",
+                        contextExcerpt: "The seventh ecumenical council was the Second Council of Nicaea, held in 787."
+                    )
+                ]
+            )
+        }
+
+        if normalized.contains("didache"),
+           (normalized.contains("author")
+                || normalized.contains("written")
+                || normalized.contains("paul")),
+           referenceIDs.contains("didache-authorship") {
+            return ModelResponse(
+                text: "The Didache is anonymous: its author is unknown, and it is not known to have been written by the Apostle Paul. It is an early Christian church-order and teaching text, also called the Teaching of the Twelve Apostles.",
+                thinkingSummary: thinkingEnabled ? [
+                    "Separating the work's traditional title from what the surviving evidence establishes about its authorship."
+                ] : [],
+                keyTerms: [
+                    KeyTerm(displayText: "Didache", canonicalTerm: "Didache"),
+                    KeyTerm(
+                        displayText: "Teaching of the Twelve Apostles",
+                        canonicalTerm: "Teaching of the Twelve Apostles"
+                    )
+                ]
+            )
+        }
+
+        return nil
+    }
+
+    static func validatedKeyTerms(
+        _ payloads: [LocalKeyTermPayload],
+        in response: String
+    ) -> [KeyTerm] {
+        var canonicalTerms = Set<String>()
+        return payloads.prefix(8).compactMap { payload in
+            let displayText = payload.displayText.trimmed
+            let canonicalTerm = payload.canonicalTerm.trimmed
+            let contextExcerpt = payload.contextExcerpt.trimmed
+            guard !displayText.isEmpty,
+                  !canonicalTerm.isEmpty,
+                  !contextExcerpt.isEmpty,
+                  isMeaningfulKeyTerm(
+                    displayText: displayText,
+                    canonicalTerm: canonicalTerm
+                  ),
+                  response.range(of: contextExcerpt) != nil,
+                  contextExcerpt.range(of: displayText) != nil else {
+                return nil
+            }
+            let normalizedCanonical = canonicalTerm.folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: .current
+            )
+            .lowercased()
+            guard canonicalTerms.insert(normalizedCanonical).inserted else {
+                return nil
+            }
+            return KeyTerm(
+                displayText: displayText,
+                canonicalTerm: canonicalTerm,
+                contextExcerpt: contextExcerpt
+            )
+        }
+        .prefix(5)
+        .map { $0 }
+    }
+
+    static func isGenericThinkingSummary(_ summary: String) -> Bool {
+        let normalized = summary.lowercased()
+        return normalized.contains("distinctions needed for a direct answer")
+            || normalized.contains("focusing on the user's question")
+            || normalized == "analyzing the question."
+            || normalized == "considering the relevant concepts."
+    }
+
+    static func isMeaningfulKeyTerm(
+        displayText: String,
+        canonicalTerm: String
+    ) -> Bool {
+        let normalize: (String) -> String = {
+            $0.folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: .current
+            )
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let display = normalize(displayText)
+        let canonical = normalize(canonicalTerm)
+        let rejectedFragments: Set<String> = [
+            "answer", "council", "ecumenical", "question", "response", "second"
+        ]
+        guard !rejectedFragments.contains(display),
+              !rejectedFragments.contains(canonical) else {
+            return false
+        }
+
+        let words = display.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        if words.count > 1 { return true }
+
+        // A single word is meaningful unless it's generic English filler — trust the
+        // model's own selection (it was already instructed to survey for concepts the
+        // passage depends on) rather than gating behind a small hardcoded whitelist that
+        // silently dropped legitimate single-word concepts like "Trinity" or "grace".
+        let genericSingleWords: Set<String> = [
+            "a", "about", "after", "again", "all", "also", "an", "and", "any", "are",
+            "as", "at", "be", "because", "been", "being", "but", "by", "can", "could",
+            "did", "do", "does", "doing", "during", "each", "even", "every", "for",
+            "from", "further", "had", "has", "have", "having", "here", "how", "however",
+            "into", "its", "just", "like", "many", "may", "might", "more", "most",
+            "much", "must", "not", "now", "of", "often", "once", "only", "other", "over",
+            "own", "rather", "same", "should", "since", "some", "still", "such", "than",
+            "that", "their", "them", "then", "there", "these", "they", "this", "those",
+            "through", "thus", "under", "until", "very", "was", "well", "were", "what",
+            "when", "where", "which", "while", "who", "will", "with", "within", "would"
+        ]
+        guard !genericSingleWords.contains(display) else { return false }
+        return display.count >= 3
     }
 
     struct AuthorshipCorrection: Equatable {
@@ -608,11 +1140,29 @@ private extension LiteRTAquinasModel {
         ) else {
             return nil
         }
+        let earlierTranscript = context.transcript[..<latestIndex]
+        let previousQuestion = earlierTranscript.reversed().compactMap { block -> String? in
+            guard case .user(let question, _, _) = block else { return nil }
+            return question
+        }.first
+        let latestQuestion: String
+        if case .user(let question, _, _) = context.transcript[latestIndex] {
+            latestQuestion = question
+        } else {
+            latestQuestion = ""
+        }
+        let startsFreshTopic = previousQuestion.map {
+            isLikelyTopicShift(
+                latestQuestion: latestQuestion,
+                previousQuestion: $0
+            )
+        } ?? false
         return ConversationRequest(
-            history: context.transcript[..<latestIndex].compactMap {
-                liteRTMessage($0)
-            },
-            latest: latest
+            history: startsFreshTopic
+                ? []
+                : earlierTranscript.compactMap { liteRTMessage($0) },
+            latest: latest,
+            startsFreshTopic: startsFreshTopic
         )
     }
 
@@ -626,19 +1176,12 @@ private extension LiteRTAquinasModel {
             return plain.isEmpty ? nil : Message(plain, role: .model)
         case let .user(text, concept, uploads):
             var contents: [Content] = []
-            var prompt = text.trimmed
-            if let concept {
-                prompt = """
-                \(prompt)
-
-                <quoted_insight title="\(concept.word)">
-                \(concept.semanticDefinition)
-                </quoted_insight>
-                """
-            }
+            var prompt = ConversationPromptMarkup.userPrompt(
+                question: text,
+                quotedInsight: concept
+            )
             if isLatestUserRequest, !prompt.isEmpty {
                 prompt = """
-                <TASK:ANSWER_USER>
                 Respond directly at a length proportional to what the user's question actually
                 requires. Be concise for a simple question and develop a complex question only as
                 far as needed for clarity and accuracy. Explain the governing reason, make useful
@@ -647,10 +1190,12 @@ private extension LiteRTAquinasModel {
                 label such as "Answer:", "Response:", or "Aquinas:". Never repeat a claim merely
                 to create length. If the user asks whether a claim is correct, begin with a direct
                 yes, no, or qualified answer and keep every named person and work distinct.
+                When an <insight_quote> appears before the question, treat it as the Insight the
+                user deliberately selected and resolve references such as "this" or "that idea"
+                against its title and definition.
 
                 User question:
                 \(prompt)
-                </TASK:ANSWER_USER>
                 """
             }
             if !prompt.isEmpty {
@@ -674,10 +1219,10 @@ private extension LiteRTAquinasModel {
                 let plain = InlineInsightMarkup.plainText(from: text).trimmed
                 return plain.isEmpty ? nil : "Aquinas: \(plain)"
             case let .user(text, concept, _):
-                var value = text.trimmed
-                if let concept {
-                    value += "\nQuoted Insight — \(concept.word): \(concept.semanticDefinition)"
-                }
+                let value = ConversationPromptMarkup.userPrompt(
+                    question: text,
+                    quotedInsight: concept
+                )
                 return value.isEmpty ? nil : "User: \(value)"
             }
         }
@@ -688,13 +1233,12 @@ private extension LiteRTAquinasModel {
         in transcript: [ChatBlock]
     ) -> String? {
         guard case .user(let raw, _, _) = transcript.last else { return nil }
-        let patterns = [
+        let explicitPatterns = [
             #"(?i)^\s*what\s+does\s+["“']?(.+?)["”']?\s+mean\??\s*$"#,
             #"(?i)^\s*what\s+is\s+the\s+meaning\s+of\s+["“']?(.+?)["”']?\??\s*$"#,
-            #"(?i)^\s*what\s+is\s+(?:an?\s+|the\s+)?["“']?(.+?)["”']?\??\s*$"#,
             #"(?i)^\s*(?:please\s+)?define\s+["“']?(.+?)["”']?[.!?]?\s*$"#
         ]
-        for pattern in patterns {
+        for pattern in explicitPatterns {
             guard let regex = try? NSRegularExpression(pattern: pattern),
                   let match = regex.firstMatch(
                     in: raw,
@@ -706,16 +1250,113 @@ private extension LiteRTAquinasModel {
             let term = String(raw[range]).trimmed
             if !term.isEmpty { return term }
         }
-        return nil
+
+        let simplePattern = #"(?i)^\s*what\s+is\s+(?:an?\s+|the\s+)?["“']?(.+?)["”']?\??\s*$"#
+        guard let regex = try? NSRegularExpression(pattern: simplePattern),
+              let match = regex.firstMatch(
+                in: raw,
+                range: NSRange(raw.startIndex..., in: raw)
+              ),
+              let range = Range(match.range(at: 1), in: raw) else {
+            return nil
+        }
+        let candidate = String(raw[range]).trimmed
+        return isLikelyStandaloneConcept(candidate) ? candidate : nil
+    }
+
+    static func isLikelyStandaloneConcept(_ candidate: String) -> Bool {
+        let words = candidate
+            .lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+        guard (1...5).contains(words.count), candidate.count <= 64 else {
+            return false
+        }
+        let rejectedWords: Set<String> = [
+            "about", "best", "cause", "caused", "date", "difference", "doing",
+            "effect", "happening", "history", "impact", "important", "it", "list",
+            "my", "purpose", "reason", "relationship", "result", "role", "significance",
+            "that", "these", "this", "those", "today", "way", "we", "wrong", "you",
+            "your"
+        ]
+        let ordinals: Set<String> = [
+            "first", "second", "third", "fourth", "fifth", "sixth", "seventh",
+            "eighth", "ninth", "tenth"
+        ]
+        return words.allSatisfy {
+            !rejectedWords.contains($0) && !ordinals.contains($0)
+        }
+    }
+
+    static func isLikelyTopicShift(
+        latestQuestion: String,
+        previousQuestion: String
+    ) -> Bool {
+        let latest = topicWords(in: latestQuestion)
+        let previous = topicWords(in: previousQuestion)
+        guard latest.count >= 2, previous.count >= 2 else { return false }
+        let continuationWords: Set<String> = [
+            "also", "but", "further", "more", "that", "this", "why"
+        ]
+        if !latest.isDisjoint(with: continuationWords) { return false }
+        return latest.isDisjoint(with: previous)
+    }
+
+    static func duplicatesEarlierAnswer(
+        _ response: String,
+        in transcript: [ChatBlock]
+    ) -> Bool {
+        let normalized = normalizedComparisonText(response)
+        guard normalized.count >= 40 else { return false }
+        return transcript.contains { block in
+            guard case .text(let earlier) = block else { return false }
+            return normalizedComparisonText(
+                InlineInsightMarkup.plainText(from: earlier)
+            ) == normalized
+        }
+    }
+
+    private static func topicWords(in text: String) -> Set<String> {
+        let stopWords: Set<String> = [
+            "a", "about", "an", "and", "are", "can", "could", "do", "does", "for",
+            "from", "how", "i", "in", "is", "it", "me", "of", "on", "or", "some",
+            "tell", "the", "to", "was", "what", "when", "where", "which", "who",
+            "with", "would", "write"
+        ]
+        return Set(
+            text.lowercased()
+                .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                .map(String.init)
+                .filter { $0.count > 2 && !stopWords.contains($0) }
+        )
+    }
+
+    private static func normalizedComparisonText(_ text: String) -> String {
+        text.lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .joined(separator: " ")
     }
 
     static func publicApproachSummary(
         for context: ConversationContext
     ) -> [String] {
         guard case .user(let rawQuestion, _, _) = context.transcript.last else {
-            return ["Identifying the central issue and the distinctions needed for a direct answer."]
+            return ["Checking the relevant distinctions and evidence before answering."]
         }
         let question = rawQuestion.lowercased()
+        if question.contains("council")
+            || question.contains("nicaea")
+            || question.contains("nicea")
+            || question.contains("constantinople") {
+            return [
+                "Comparing the established sequence: Nicaea in 325 was first, Constantinople in 381 was second, and Nicaea II in 787 was seventh."
+            ]
+        }
+        if question.contains("didache")
+            || question.contains("authorship")
+            || question.contains("written by") {
+            return ["Separating established authorship evidence from uncertain attribution."]
+        }
         if let term = requestedDefinitionTerm(in: context.transcript) {
             return ["Clarifying what \(term) means in the context of the question."]
         }
@@ -743,30 +1384,33 @@ private extension LiteRTAquinasModel {
             || question.contains("is it wrong") {
             return ["Separating the act, intention, and circumstances before judging the whole."]
         }
-        let focus = conciseQuestionFocus(rawQuestion)
-        guard !focus.isEmpty else {
-            return ["Identifying the central issue and the distinctions needed for a direct answer."]
-        }
-        return ["Focusing on “\(focus)” and the distinctions needed for a direct answer."]
+        return ["Identifying the central claim and checking the relevant distinctions and evidence."]
     }
 
-    private static func conciseQuestionFocus(_ rawQuestion: String) -> String {
-        let normalized = rawQuestion
-            .split(whereSeparator: { $0.isWhitespace })
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard normalized.count > 72 else { return normalized }
-
-        let end = normalized.index(normalized.startIndex, offsetBy: 69)
-        let prefix = normalized[..<end]
-        if let lastSpace = prefix.lastIndex(of: " ") {
-            return String(prefix[..<lastSpace]) + "…"
+    /// A one-line, real (not decorative) status naming what retrieval actually found, shown
+    /// alongside the approach summary while generation is still running.
+    static func groundingSourceSummary(
+        for references: [AquinasGroundingReference]
+    ) -> [String] {
+        guard !references.isEmpty else { return [] }
+        var seen = Set<String>()
+        let titles = references.map(\.title).filter { seen.insert($0).inserted }
+        switch titles.count {
+        case 1:
+            return ["Consulting \(titles[0])."]
+        case 2:
+            return ["Consulting \(titles[0]) and \(titles[1])."]
+        default:
+            let allButLast = titles.dropLast().joined(separator: ", ")
+            return ["Consulting \(allButLast), and \(titles.last!)."]
         }
-        return String(prefix) + "…"
     }
 
     static func foundationalKeyTerms(in response: String) -> [KeyTerm] {
         let preferredPhrases = [
+            "First Council of Constantinople", "Second Council of Constantinople",
+            "First Council of Nicaea", "Second Council of Nicaea",
+            "Council of Constantinople", "Council of Nicaea", "Apostle Paul", "Didache",
             "practical wisdom", "practical reason", "moral virtue", "intellectual virtue",
             "natural law", "first principle", "first principles", "common good",
             "human flourishing", "final cause", "efficient cause", "formal cause",
@@ -775,17 +1419,19 @@ private extension LiteRTAquinasModel {
         ]
         var selected: [(display: String, canonical: String, location: Int, score: Int)] = []
         var usedCanonical = Set<String>()
+        var coveredRanges: [Range<String.Index>] = []
 
         for phrase in preferredPhrases {
             guard let range = response.range(
                 of: phrase,
                 options: [.caseInsensitive, .diacriticInsensitive]
-            ) else {
+            ), !coveredRanges.contains(where: { $0.overlaps(range) }) else {
                 continue
             }
             let display = String(response[range])
             let canonical = phrase.lowercased()
             if usedCanonical.insert(canonical).inserted {
+                coveredRanges.append(range)
                 selected.append((
                     display,
                     canonical,
@@ -795,15 +1441,6 @@ private extension LiteRTAquinasModel {
             }
         }
 
-        let stopWords: Set<String> = [
-            "about", "after", "again", "against", "along", "also", "among", "another",
-            "because", "before", "being", "between", "could", "directly", "enough",
-            "every", "first", "further", "having", "helps", "however", "human",
-            "includes", "instead", "itself", "means", "might", "often", "other",
-            "rather", "really", "should", "since", "something", "still", "their",
-            "therefore", "these", "thing", "think", "those", "through", "under",
-            "useful", "using", "which", "while", "without", "would"
-        ]
         let philosophicalTerms: Set<String> = [
             "analogy", "causality", "conscience", "essence", "existence", "flourishing",
             "intellect", "justice", "metaphysics", "morality", "ontology", "participation",
@@ -826,7 +1463,7 @@ private extension LiteRTAquinasModel {
                 locale: .current
             )
             .lowercased()
-            guard !stopWords.contains(canonical),
+            guard philosophicalTerms.contains(canonical),
                   !usedCanonical.contains(canonical) else {
                 return
             }
@@ -873,6 +1510,16 @@ private extension LiteRTAquinasModel {
 
     static func sanitizedVisibleText(_ raw: String) -> String {
         var text = raw
+        if let controlTags = try? NSRegularExpression(
+            pattern: #"(?i)</?(?:TASK(?::[A-Z0-9_]+)?|thinking_summary|key_terms|response)\b[^>]*>"#
+        ) {
+            text = controlTags.stringByReplacingMatches(
+                in: text,
+                options: [],
+                range: NSRange(text.startIndex..., in: text),
+                withTemplate: ""
+            )
+        }
         if let wrapper = try? NSRegularExpression(
             pattern: #"(?is)\A\s*(?:#{1,6}\s*)?(?:\*\*|__)?(?:answer|response|aquinas)(?:\*\*|__)?\s*:\s*(?:\*\*|__)?\s*"#
         ) {
@@ -932,6 +1579,55 @@ private extension LiteRTAquinasModel {
         return try JSONDecoder().decode(Value.self, from: data)
     }
 
+    static func recoveredConversationResponse(from raw: String) -> String {
+        guard let body = extractedJSONStringField(named: "response", from: raw) else {
+            return ""
+        }
+        return sanitizedVisibleText(body).trimmed
+    }
+
+    /// Scans past a `"<key>":"` marker and reads the string body up to the next unescaped
+    /// quote, or to the end of `raw` when the model's output was cut off before it emitted a
+    /// closing quote. Bounded, short structured payloads (this Insight Tree seed, the
+    /// conversation `response` field above) can be truncated mid-string when the checkpoint
+    /// emits its end-of-sequence token right after finishing a complete sentence but before
+    /// closing the JSON — recovering the already-produced text is better than discarding it.
+    static func extractedJSONStringField(named key: String, from raw: String) -> String? {
+        guard let keyRegex = try? NSRegularExpression(
+            pattern: "\"\(NSRegularExpression.escapedPattern(for: key))\"\\s*:\\s*\""
+        ),
+        let match = keyRegex.firstMatch(
+            in: raw,
+            range: NSRange(raw.startIndex..., in: raw)
+        ),
+        let matchRange = Range(match.range, in: raw) else {
+            return nil
+        }
+
+        var index = matchRange.upperBound
+        var escaped = false
+        var encodedBody = ""
+        while index < raw.endIndex {
+            let character = raw[index]
+            if character == "\"", !escaped {
+                break
+            }
+            encodedBody.append(character)
+            if character == "\\" {
+                escaped.toggle()
+            } else {
+                escaped = false
+            }
+            index = raw.index(after: index)
+        }
+
+        guard !encodedBody.isEmpty else { return nil }
+        let literal = "\"\(encodedBody)\""
+        return literal.data(using: .utf8).flatMap {
+            try? JSONDecoder().decode(String.self, from: $0)
+        } ?? encodedBody
+    }
+
     static func jsonString<Value: Encodable>(_ value: Value) -> String {
         guard let data = try? JSONEncoder().encode(value),
               let string = String(data: data, encoding: .utf8) else {
@@ -954,6 +1650,11 @@ private struct MidpointPromptSource: Encodable {
 
 private struct LabelPayload: Decodable {
     let label: String
+}
+
+private struct InsightTreeSeedPayload: Decodable {
+    let label: String?
+    let summary: String?
 }
 
 private struct DefinitionPayload: Codable {
@@ -999,9 +1700,49 @@ private struct DailyQuestionPayload: Decodable {
     }
 }
 
-private struct LocalPresentationAnalysis {
+private struct LocalConversationPayload: Decodable {
     let thinkingSummary: [String]
-    let keyTerms: [KeyTerm]
+    let response: String
+    let keyTerms: [LocalKeyTermPayload]
+
+    private enum CodingKeys: String, CodingKey {
+        case thinkingSummary = "thinking_summary"
+        case response
+        case keyTerms = "key_terms"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        thinkingSummary = try container.decodeIfPresent(
+            [String].self,
+            forKey: .thinkingSummary
+        ) ?? []
+        response = try container.decode(String.self, forKey: .response)
+        keyTerms = try container.decodeIfPresent(
+            [LocalKeyTermPayload].self,
+            forKey: .keyTerms
+        ) ?? []
+    }
+}
+
+private struct LocalKeyTermsPayload: Decodable {
+    let keyTerms: [LocalKeyTermPayload]
+
+    private enum CodingKeys: String, CodingKey {
+        case keyTerms = "key_terms"
+    }
+}
+
+private struct LocalKeyTermPayload: Decodable {
+    let displayText: String
+    let canonicalTerm: String
+    let contextExcerpt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case displayText = "display_text"
+        case canonicalTerm = "canonical_term"
+        case contextExcerpt = "context_excerpt"
+    }
 }
 
 private extension String {

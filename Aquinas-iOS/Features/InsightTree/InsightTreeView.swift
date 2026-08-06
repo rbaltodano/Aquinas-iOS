@@ -204,12 +204,18 @@ struct InsightTreeView: View {
         self.showQuestionBar       = showQuestionBar
         self.modelTasks            = modelTasks
         self.modelTaskOriginPage   = modelTaskOriginPage
+        // A synchronous UserDefaults read, not something that needs to wait for the async
+        // `.task`-driven load — passing it in at construction avoids a guaranteed blank-then-
+        // populated flash on every tree open (the view model otherwise builds its first tree
+        // with zero anchors, then rebuilds moments later once `setLocalSeedAnchors` runs).
+        let initialLocalSeedAnchors = conversationID.map(LocalInsightTreeSeedStore.seeds(for:)) ?? []
         _viewModel = StateObject(wrappedValue: InsightTreeViewModel(
             insights: insights,
             promotedInsightIDs: promotedInsightIDs,
             showsAllClusterInsights: conversationID == nil,
             model: model,
-            embeddingProvider: embeddingProvider
+            embeddingProvider: embeddingProvider,
+            localSeedAnchors: initialLocalSeedAnchors
         ))
     }
 
@@ -398,7 +404,16 @@ struct InsightTreeView: View {
                             animateIn: animateMidpointCardText,
                             linkedInsights: makeNodeLinkInsights,
                             onToggleSaved: {
+                                let wasSaved = savedConceptIDs.contains(selectedInsight.id)
                                 onToggleSavedConcept?(concept(for: selectedInsight))
+                                // Midpoint blends are synthesized on the fly and auto-bookmarked
+                                // (see placeMidpointInsight) — unlike a term saved from real
+                                // conversation content, nothing else anchors it to the tree, so
+                                // un-saving it IS "get rid of it": also remove the placed node.
+                                if wasSaved, viewModel.placedMidpointNodeIDs.contains(selectedInsight.id) {
+                                    viewModel.removePlacedMidpoint(id: selectedInsight.id)
+                                    dismissDockedInsight()
+                                }
                             },
                             onRemove: { pendingRemoveInsight = selectedInsight },
                             onFork:   { performForkInsight(selectedInsight) },
@@ -1206,6 +1221,24 @@ struct InsightTreeView: View {
                 guard !Task.isCancelled, midpointPlacedInsightID == placedID else { return }
                 viewModel.replacePlacedMidpoint(id: placedID, with: generated)
                 midpointGeneratedInsightID = placedID
+                // Midpoint blends aren't the user's own saved research — they're synthesized on
+                // the spot from sources the user already selected, so save it automatically
+                // rather than making them separately hunt down and bookmark their own creation.
+                // `onToggleSavedConcept` only adds (this id can't already be saved — it's fresh),
+                // so this is the easy "unbookmark to get rid of it" the user asked for: the normal
+                // save toggle already removes it from the tree like any other bookmark.
+                if !savedConceptIDs.contains(placedID) {
+                    onToggleSavedConcept?(
+                        ConceptDefinition(
+                            id: placedID,
+                            word: generated.word,
+                            partOfSpeech: generated.partOfSpeech,
+                            pronunciation: generated.pronunciation,
+                            meaning: generated.meaning,
+                            example: generated.example
+                        )
+                    )
+                }
             } catch {
                 guard !Task.isCancelled, midpointPlacedInsightID == placedID else { return }
                 viewModel.removePlacedMidpoint(id: placedID)
@@ -1403,6 +1436,22 @@ struct InsightTreeView: View {
         guard let conversationID else { return }
         persistedTreeLoadGeneration += 1
         let loadGeneration = persistedTreeLoadGeneration
+
+        // No point spending a 120s-timeout-capable network request on a URL that's loopback
+        // from the phone's own perspective — go straight to the local-seed path every other
+        // failure of this call already falls back to. Every duplicate `.refreshInsightTree` job
+        // that piled up from repeatedly opening the tree (see `enqueuePersistedTreeLoad`, now
+        // deduplicated) used to each pay that doomed request serially, which is what made the
+        // tree look permanently stuck rather than just briefly loading.
+        guard AquinasBackendConfiguration.canRecoverFromCurrentDevice else {
+            applyLocalSeedTreeIfAvailable(conversationID: conversationID)
+            persistedTreePresentationRevision += 1
+            if animateChanges {
+                onPersistedTreeRefreshCompleted?()
+            }
+            return
+        }
+
         do {
             var tree = try await insightTreeService.tree(for: conversationID)
             guard !Task.isCancelled,
@@ -1488,18 +1537,52 @@ struct InsightTreeView: View {
                 onPersistedTreeRefreshCompleted?()
             }
         } catch {
-            // The local backend is optional during previews/offline use. Keep the existing
-            // in-memory canvas instead of blanking a usable tree.
+            // The backend is optional during local-only use. Release the entrance gate so the
+            // already-built in-memory tree is visible instead of leaving a blank star field.
+            guard loadGeneration == persistedTreeLoadGeneration else { return }
+            applyLocalSeedTreeIfAvailable(conversationID: conversationID)
+            persistedTreePresentationRevision += 1
+            if animateChanges {
+                onPersistedTreeRefreshCompleted?()
+            }
         }
+    }
+
+    /// Not MiniLM parity — on-device-labeled Nodes, one per turn the model judged as seeding or
+    /// materially extending the subject (see `insightTreeSeedCandidate`), fed into the view
+    /// model's own on-device clustering pass as pre-existing anchor clusters (see
+    /// `InsightTreeViewModel.setLocalSeedAnchors`) rather than a separate `applyPersistedTree`
+    /// snapshot. That earlier approach put the seed and the clustering fallback in two mutually
+    /// exclusive rendering modes — whichever last wrote to the view model won, so saving an
+    /// Insight would make the seeded Node disappear rather than the two coexisting. Feeding both
+    /// into the same clustering pass lets a saved Insight attach under the seeded subject when
+    /// related, exactly like a real backend Node would.
+    private func applyLocalSeedTreeIfAvailable(conversationID: UUID) {
+        let localSeeds = LocalInsightTreeSeedStore.seeds(for: conversationID)
+#if DEBUG
+        print("Aquinas InsightTreeView: applyLocalSeedTreeIfAvailable found \(localSeeds.count) seed(s) for \(conversationID)")
+#endif
+        viewModel.setLocalSeedAnchors(localSeeds)
     }
 
     /// Persisted-tree fetches may also repair labels or reconcile saved Insights, so they are
     /// model work rather than an untracked view refresh. Keeping them in the shared queue prevents
     /// the status control from returning to Idle before the fully reconciled snapshot is applied.
+    ///
+    /// Deduplicated: without this guard, every appearance of the tree canvas (and every
+    /// `persistedTreeRefreshRequest` bump) queued a brand-new `.refreshInsightTree` job with no
+    /// check for one already pending — repeatedly opening the tree piled up duplicate jobs, each
+    /// serially paying the same (120s-timeout-capable, on-device always-unreachable) network
+    /// request, which is what made the tree look permanently stuck rather than briefly loading.
     private func enqueuePersistedTreeLoad(animateChanges: Bool) {
         guard conversationID != nil else { return }
         guard let modelTasks else {
             Task { await loadPersistedTree(animateChanges: animateChanges) }
+            return
+        }
+        guard !modelTasks.contains(where: {
+            $0.kind == .refreshInsightTree && $0.phase != .completed
+        }) else {
             return
         }
         modelTasks.enqueue(
@@ -1614,8 +1697,7 @@ struct DockedInsightTreeCard: View {
                 Text(insight.title)
                     .font(.custom("Figtree-Bold", size: 18))
                     .foregroundColor(AquinasTheme.Colors.primaryReadable)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 Spacer()
 
@@ -1716,8 +1798,7 @@ private struct DockedNodeTreeCard: View {
                 Text(node.conceptLabel)
                     .font(.custom("Figtree-Bold", size: 18))
                     .foregroundColor(AquinasTheme.Colors.primaryReadable)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 Spacer()
 

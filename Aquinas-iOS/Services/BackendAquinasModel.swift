@@ -560,13 +560,20 @@ private extension ConversationContext {
                 return BackendConversationMessage(
                     role: "assistant",
                     text: InlineInsightMarkup.plainText(from: text),
-                    images: []
+                    images: [],
+                    insightQuote: nil
                 )
-            case .user(let text, _, let uploads):
+            case .user(let text, let concept, let uploads):
                 return BackendConversationMessage(
                     role: "user",
                     text: text,
-                    images: uploads.compactMap(\.backendImagePayload)
+                    images: uploads.compactMap(\.backendImagePayload),
+                    insightQuote: concept.map {
+                        BackendConversationInsightQuote(
+                            title: $0.word,
+                            definition: $0.semanticDefinition
+                        )
+                    }
                 )
             }
         }
@@ -582,7 +589,8 @@ private extension ConversationContext {
             return BackendConversationMessage(
                 role: message.role,
                 text: message.text,
-                images: images
+                images: images,
+                insightQuote: message.insightQuote
             )
         }
         .reversed()
@@ -623,6 +631,19 @@ private struct BackendConversationMessage: Codable {
     let role: String
     let text: String
     let images: [BackendConversationImage]
+    let insightQuote: BackendConversationInsightQuote?
+
+    enum CodingKeys: String, CodingKey {
+        case role
+        case text
+        case images
+        case insightQuote = "insight_quote"
+    }
+}
+
+private struct BackendConversationInsightQuote: Codable {
+    let title: String
+    let definition: String
 }
 
 private struct BackendConversationImage: Codable {

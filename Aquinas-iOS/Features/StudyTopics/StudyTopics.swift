@@ -131,6 +131,8 @@ struct StudyTopicsView: View {
     var onNewChat: () -> Void
     /// Called when the user taps "New Conversation" inside a topic's detail view.
     var onNewChatInTopic: (UUID) -> Void = { _ in }
+    var onQuoteInsightIntoNewConversation:
+        (ConceptDefinition, UUID) -> Void = { _, _ in }
     var onQuoteInsightIntoConversation:
         (InquiryConversation, ConceptDefinition, UUID) -> Void = { _, _, _ in }
     var onAttachConversationToTopic: (InquiryConversation, UUID) -> Void
@@ -214,6 +216,10 @@ struct StudyTopicsView: View {
                     onNewChat: {
                         markTopicAsTouched(topic.id)
                         onNewChatInTopic(topic.id)
+                    },
+                    onQuoteInsightIntoNewConversation: { insight in
+                        markTopicAsTouched(topic.id)
+                        onQuoteInsightIntoNewConversation(insight, topic.id)
                     },
                     onQuoteInsightIntoConversation: { conversation, insight in
                         onQuoteInsightIntoConversation(conversation, insight, topic.id)
@@ -757,6 +763,7 @@ struct StudyTopicDetailView: View {
     var onTopicTouched: () -> Void
     var onSelectConversation: (InquiryConversation) -> Void
     var onNewChat: () -> Void
+    var onQuoteInsightIntoNewConversation: (ConceptDefinition) -> Void
     var onQuoteInsightIntoConversation: (InquiryConversation, ConceptDefinition) -> Void
     var onAttachConversation: (InquiryConversation) -> Void
     var onRenameConversation: (InquiryConversation, String) -> Void
@@ -775,6 +782,7 @@ struct StudyTopicDetailView: View {
     @State private var activeInsight: ConceptDefinition? = nil
     @State private var pickerActiveInsight: ConceptDefinition? = nil
     @State private var quotePickerInsight: ConceptDefinition? = nil
+    @State private var isInsightAskMode: Bool = false
     @State private var conversationBeingRenamed: InquiryConversation? = nil
     @State private var deletingConversationIDs: Set<UUID> = []
     @State private var renameDraft = ""
@@ -808,6 +816,8 @@ struct StudyTopicDetailView: View {
         onTopicTouched: @escaping () -> Void = {},
         onSelectConversation: @escaping (InquiryConversation) -> Void,
         onNewChat: @escaping () -> Void,
+        onQuoteInsightIntoNewConversation:
+            @escaping (ConceptDefinition) -> Void,
         onQuoteInsightIntoConversation:
             @escaping (InquiryConversation, ConceptDefinition) -> Void,
         onAttachConversation: @escaping (InquiryConversation) -> Void,
@@ -836,6 +846,7 @@ struct StudyTopicDetailView: View {
         self.onTopicTouched = onTopicTouched
         self.onSelectConversation = onSelectConversation
         self.onNewChat = onNewChat
+        self.onQuoteInsightIntoNewConversation = onQuoteInsightIntoNewConversation
         self.onQuoteInsightIntoConversation = onQuoteInsightIntoConversation
         self.onAttachConversation = onAttachConversation
         self.onRenameConversation = onRenameConversation
@@ -1076,8 +1087,10 @@ struct StudyTopicDetailView: View {
                 .presentationBackground(AquinasTheme.Colors.canvas)
         }
         .sheet(item: $quotePickerInsight) { insight in
-            StudyTopicQuoteConversationPickerSheet(
-                topicTitle: displayTopicTitle,
+            InsightConversationPickerSheet(
+                title: "Existing Conversations",
+                searchPrompt: "Search in \(displayTopicTitle)",
+                emptyMessage: "This Study Topic does not have a matching conversation.",
                 conversations: topicConversationsForQuote,
                 activeConversationID: activeConversationID,
                 savedInsights: savedInsights,
@@ -1381,7 +1394,10 @@ struct StudyTopicDetailView: View {
             onRemoveInsight: toggleSavedInsight,
             onRestoreInsight: toggleSavedInsight,
             onForkInsight: forkTopicInsight,
-            onQuoteInsight: { canvasMode.canvasQuoteTarget = $0 },
+            onQuoteInsight: { insight in
+                canvasMode.canvasQuoteTarget = insight
+                if insight == nil { isInsightAskMode = false }
+            },
             onSelectionStateChange: { canvasMode.hasCanvasHover = $0 },
             onInsightSelectionStateChange: { canvasMode.hasHoveredCanvasInsight = $0 },
             onSelectedCanvasItemCountChange: { canvasMode.canvasSelectedItemCount = $0 },
@@ -1427,8 +1443,26 @@ struct StudyTopicDetailView: View {
             onCreateCanvasConcept: { canvasMode.canvasCreateConceptRequest += 1 },
             onInquireConnection: { canvasMode.canvasInquireConnectionRequest += 1 },
             onQuoteCanvasItem: {
+                guard canvasMode.canvasQuoteTarget != nil else { return }
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
+                    isInsightAskMode = true
+                }
+            },
+            usesCanvasAskFlow: true,
+            isCanvasAskMode: isInsightAskMode,
+            onAskInNewConversation: {
+                guard let insight = canvasMode.canvasQuoteTarget else { return }
+                isInsightAskMode = false
+                onQuoteInsightIntoNewConversation(insight)
+            },
+            onAskInExistingConversation: {
                 guard let insight = canvasMode.canvasQuoteTarget else { return }
                 quotePickerInsight = insight
+            },
+            onCancelCanvasAsk: {
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
+                    isInsightAskMode = false
+                }
             },
             onMidpointConcepts: { canvasMode.canvasMidpointEnterRequest += 1 },
             isMidpointMode: canvasMode.isCanvasMidpointMode,
@@ -1460,8 +1494,10 @@ struct StudyTopicDetailView: View {
 
 // MARK: - Existing Conversation Picker
 
-private struct StudyTopicQuoteConversationPickerSheet: View {
-    let topicTitle: String
+struct InsightConversationPickerSheet: View {
+    let title: String
+    let searchPrompt: String
+    let emptyMessage: String
     let conversations: [InquiryConversation]
     let activeConversationID: UUID?
     let savedInsights: [ConceptDefinition]
@@ -1494,7 +1530,7 @@ private struct StudyTopicQuoteConversationPickerSheet: View {
                 HStack {
                     Spacer(minLength: 32)
 
-                    Text("Quote into Conversation")
+                    Text(title)
                         .font(.custom("LibreBaskerville-Regular", size: 24))
                         .foregroundColor(AquinasTheme.Colors.primaryReadable)
                         .lineLimit(1)
@@ -1510,20 +1546,20 @@ private struct StudyTopicQuoteConversationPickerSheet: View {
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Cancel quoting Insight")
+                    .accessibilityLabel("Cancel choosing a Conversation")
                 }
                 .padding(.top, 32)
 
                 StudyTopicsSearchField(
                     searchText: $searchText,
-                    prompt: Text("Search in \(Text(topicTitle).italic())")
+                    prompt: Text(searchPrompt)
                 )
 
                 if filteredConversations.isEmpty {
                     AquinasEmptyState(
                         systemImage: "bubble.left.and.bubble.right",
                         title: "No Conversations",
-                        message: "This Study Topic does not have a matching conversation."
+                        message: emptyMessage
                     )
                     .padding(.top, 24)
                 } else {

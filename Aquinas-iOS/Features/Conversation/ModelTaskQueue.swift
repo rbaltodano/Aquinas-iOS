@@ -162,6 +162,10 @@ struct ModelTaskSnapshot: Identifiable, Equatable {
     let id: UUID
     let kind: ModelTaskKind
     let originPage: ModelTaskOriginPage
+    /// The specific conversation this task belongs to, when its origin page is `.conversation`.
+    /// Lets task navigation reopen the exact conversation instead of whichever one happens to
+    /// be active.
+    let conversationID: UUID?
     let phase: ModelTaskPhase
     let funStatusText: String?
     let funLoadingStatusText: String?
@@ -178,6 +182,7 @@ final class ModelTaskQueue {
         let id: UUID
         let kind: ModelTaskKind
         let originPage: ModelTaskOriginPage
+        let conversationID: UUID?
         let priority: ModelTaskPriority
         let funStatusText: String?
         let funLoadingStatusText: String?
@@ -203,6 +208,9 @@ final class ModelTaskQueue {
     @ObservationIgnored private var completedTasksClearTask: Task<Void, Never>?
     @ObservationIgnored private let runtimeLifecycle: ModelRuntimeLifecycleManager
     @ObservationIgnored private var lifecycleTransitionTask: Task<Void, Never>?
+    /// Invalidates a superseded unload transition so its tail can't clear state that a newer
+    /// foreground return (or newer unload) now owns. See `setApplicationActive`.
+    @ObservationIgnored private var lifecycleTransitionGeneration = 0
     @ObservationIgnored private var isExecutionSuspended = false
     @ObservationIgnored private var applicationIsActive = true
 
@@ -237,6 +245,7 @@ final class ModelTaskQueue {
     func enqueue(
         kind: ModelTaskKind,
         originPage: ModelTaskOriginPage? = nil,
+        conversationID: UUID? = nil,
         priority: ModelTaskPriority = .foreground,
         onStart: @escaping () -> Void = {},
         onCancel: @escaping () -> Void = {},
@@ -256,6 +265,7 @@ final class ModelTaskQueue {
             id: UUID(),
             kind: kind,
             originPage: originPage ?? kind.defaultOriginPage,
+            conversationID: conversationID,
             priority: priority,
             funStatusText: personality == .fun
                 ? FunModelStatusCopy.randomStatus(for: kind)
@@ -368,7 +378,19 @@ final class ModelTaskQueue {
     func setApplicationActive(_ isActive: Bool) {
         applicationIsActive = isActive
         if isActive {
-            guard lifecycleTransitionTask == nil else { return }
+            // Returning to the foreground must ALWAYS resume execution. This previously bailed
+            // out whenever an unload transition was still in flight
+            // (`guard lifecycleTransitionTask == nil else { return }`), deferring entirely to
+            // that task to clear `isExecutionSuspended` on its way out. But that task waits for
+            // every generation lease to be released, so a generation that never finishes pinned
+            // it forever: `isExecutionSuspended` stayed true, `startNextIfNeeded()` never ran
+            // again, and the queue sat permanently dead — Model Status reading "Idle" while the
+            // user's question waited in `upcomingTasks` — until the app was relaunched. Coming
+            // back to the foreground is exactly when we want the pending unload abandoned, so
+            // cancel it and resume unconditionally.
+            lifecycleTransitionGeneration &+= 1
+            lifecycleTransitionTask?.cancel()
+            lifecycleTransitionTask = nil
             isExecutionSuspended = false
             startNextIfNeeded()
         } else {
@@ -406,7 +428,7 @@ final class ModelTaskQueue {
         publishUpcomingTasks()
         job.onStart()
 
-        runningTask = Task { [weak self] in
+        runningTask = Task { @MainActor [weak self] in
             guard let self else { return }
             let requiresLoading = await runtimeLifecycle.requiresLoadingForNextLease()
             setRuntimeLoading(requiresLoading, for: job.id)
@@ -463,9 +485,15 @@ final class ModelTaskQueue {
         preemptCurrentBackgroundPreservingJob()
         guard lifecycleTransitionTask == nil else { return }
 
+        lifecycleTransitionGeneration &+= 1
+        let generation = lifecycleTransitionGeneration
         lifecycleTransitionTask = Task { [weak self] in
             guard let self else { return }
             await runtimeLifecycle.unloadAsSoonAsIdle(reason: reason)
+            // A foreground return (or a newer unload) bumps the generation and takes ownership
+            // of this state — never let a superseded transition clear a live task or unsuspend
+            // execution behind it.
+            guard generation == lifecycleTransitionGeneration else { return }
             lifecycleTransitionTask = nil
             guard applicationIsActive else { return }
             isExecutionSuspended = false
@@ -526,6 +554,7 @@ final class ModelTaskQueue {
             id: job.id,
             kind: job.kind,
             originPage: job.originPage,
+            conversationID: job.conversationID,
             phase: phase,
             funStatusText: job.funStatusText,
             funLoadingStatusText: job.funLoadingStatusText

@@ -259,7 +259,7 @@ private struct ResponseSegment: Identifiable {
 // MARK: - Streaming Message View
 
 /// Renders the model response body, animated word-by-word, with heading/list formatting and
-/// bookmark/copy/fork actions.
+/// the shared disclaimer/copy footer.
 struct StreamingMessageView: View {
     let fullText: String
     let shouldStream: Bool
@@ -280,6 +280,9 @@ struct StreamingMessageView: View {
     var onInlineInsightToggleSaved: ((ConceptDefinition) -> Void)? = nil
     var onRevealStart: (() -> Void)? = nil
     var onFinish: (() -> Void)? = nil
+    /// Reports how many words have been revealed so far — lets a parent keep a live word/token
+    /// estimate counting up throughout the actual streaming, not just during the thinking phase.
+    var onRevealedWordCountChange: ((Int) -> Void)? = nil
 
     private let segments: [ResponseSegment]
     private let responseWords: [String]
@@ -324,7 +327,8 @@ struct StreamingMessageView: View {
         onInlineInsightFork: ((ConceptDefinition) -> Void)? = nil,
         onInlineInsightToggleSaved: ((ConceptDefinition) -> Void)? = nil,
         onRevealStart: (() -> Void)? = nil,
-        onFinish: (() -> Void)? = nil
+        onFinish: (() -> Void)? = nil,
+        onRevealedWordCountChange: ((Int) -> Void)? = nil
     ) {
         self.fullText = fullText
         self.shouldStream = shouldStream
@@ -345,6 +349,7 @@ struct StreamingMessageView: View {
         self.onInlineInsightToggleSaved = onInlineInsightToggleSaved
         self.onRevealStart = onRevealStart
         self.onFinish = onFinish
+        self.onRevealedWordCountChange = onRevealedWordCountChange
 
         let cached: (
             segments: [ResponseSegment],
@@ -403,6 +408,9 @@ struct StreamingMessageView: View {
             guard wasReceiving, !isReceiving else { return }
             finishNetworkResponse()
         }
+        .onChange(of: displayedWords.count) { _, count in
+            onRevealedWordCountChange?(count)
+        }
     }
 
     private var networkResponse: some View {
@@ -418,7 +426,7 @@ struct StreamingMessageView: View {
             )
 
             if isFinished && showsResponseActions {
-                responseButtons
+                responseFooter
             }
         }
     }
@@ -445,23 +453,15 @@ struct StreamingMessageView: View {
             )
 
             if isFinished && showsResponseActions {
-                responseButtons
+                responseFooter
             }
         }
     }
 
-    private var responseButtons: some View {
-        ResponseButtons(
-            canCopy: true,
-            canFork: onBranch != nil,
-            copyText: InlineInsightMarkup.plainText(from: fullText),
-            onSave: { print("Saved to bookmarks!") },
-            onQuote: onQuote.map { q in {
-                q(InlineInsightMarkup.plainText(from: fullText))
-            } },
-            onFork: onBranch
+    private var responseFooter: some View {
+        ModelResponseFooter(
+            copyText: InlineInsightMarkup.plainText(from: fullText)
         )
-        .padding(.top, 8)
         .transition(
             .move(edge: .top)
             .combined(with: .opacity)

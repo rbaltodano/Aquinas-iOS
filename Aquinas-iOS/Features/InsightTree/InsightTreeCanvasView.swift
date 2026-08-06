@@ -180,6 +180,15 @@ struct InsightTreeCanvasView: View {
     private static let chipAngGain: Double = 0.45        // viscous angular response speed
     private static let chipMaxAngStep: Double = 0.07     // max radians a bond rotates per frame
     private static let chipAngleEps: Double = 0.12       // softens the 1/Δθ repulsion
+    // The uniform VSEPR spread above maximizes angular separation equally across every bond, but
+    // has no notion of how WIDE any one chip's label actually is — a long title next to a short
+    // one can still settle at an angular gap that's fine on average yet too tight for their real
+    // footprints, especially at a small orbit radius (arc length = radius × angle, so the same
+    // angular gap is a smaller physical gap closer in). This adds an extra, targeted push whenever
+    // two same-node Insight chips' angular gap is below what their combined half-widths need at
+    // their shared orbit radius — same-node counterpart to the cross-node bounding-box collision.
+    private static let chipWidthAngularPadding: CGFloat = 20   // desired gap between chip edges
+    private static let chipWidthRepulsionK: Double = 2.2
     private static let insightCollisionFont =
         UIFont(name: "Figtree-Bold", size: 14) ?? .boldSystemFont(ofSize: 14)
     // 2.5D depth cues from the third MDS component. One switch: false → pure 2D rendering.
@@ -1612,9 +1621,15 @@ struct InsightTreeCanvasView: View {
 
         ZStack(alignment: .topTrailing) {
             VStack(spacing: 18) {
+                // Shares the label's own blur+animation treatment (instead of relying only on
+                // the outer ZStack's transition) so the icon and label always move together —
+                // previously the icon had no entrance treatment of its own and stayed static
+                // while the label blurred/faded in.
                 Image(systemName: node.isSuggested ? "sparkles" : "brain.head.profile")
                     .font(.system(size: node.isSuggested ? 20 : 24, weight: .semibold))
                     .foregroundStyle(AquinasTheme.Colors.lightGreen)
+                    .blur(radius: hasAppeared ? 0 : 8)
+                    .animation(.spring(response: 0.6, dampingFraction: 0.75).delay(0.1), value: hasAppeared)
 
                 Text(node.conceptLabel)
                     .font(.custom("Figtree-Bold", size: 18))
@@ -2197,8 +2212,10 @@ struct InsightTreeCanvasView: View {
         enum BondKind { case insight(UUID); case fixedEdge }
         struct Bond { let angle: Double; let kind: BondKind }
         var bondsByNode: [UUID: [Bond]] = [:]
+        var chipInfoByID: [UUID: ChipInfo] = [:]
         for ci in chipInfos {
             bondsByNode[ci.nodeID, default: []].append(Bond(angle: ci.angle, kind: .insight(ci.id)))
+            chipInfoByID[ci.id] = ci
         }
         // Use the SAME edges that are rendered (displayGraphEdges fabricates a line for the
         // 2-node / ring fallback), so every visible node-to-node line repels chips too.
@@ -2330,6 +2347,23 @@ struct InsightTreeCanvasView: View {
                     if abs(dθ) < 1e-4 { dθ = .random(in: -0.05...0.05) }
                     torque += Self.bondDomainK * (dθ >= 0 ? 1 : -1)
                         / (abs(dθ) + Self.chipAngleEps)
+
+                    // Extra push once two Insight labels' angular gap is tighter than their real
+                    // widths need at this orbit radius — the uniform spread above doesn't know
+                    // either chip's width, so a long title can still settle too close to its
+                    // neighbor even at "maximized" angular separation.
+                    if case .insight(let otherID) = bonds[jj].kind,
+                       let chipA = chipInfoByID[id], let chipB = chipInfoByID[otherID],
+                       chipA.radius > 1 {
+                        let requiredGap = atan2(
+                            chipA.halfWidth + chipB.halfWidth + Self.chipWidthAngularPadding,
+                            chipA.radius
+                        )
+                        let deficit = requiredGap - abs(dθ)
+                        if deficit > 0 {
+                            torque += Self.chipWidthRepulsionK * (dθ >= 0 ? 1 : -1) * Double(deficit)
+                        }
+                    }
                 }
                 chipTorque[id, default: 0] += torque
             }

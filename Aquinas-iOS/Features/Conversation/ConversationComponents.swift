@@ -53,6 +53,9 @@ private final class ResponseRevealGate {
 /// The actual vertical conversation: branch title, locked questions, model responses, and next input.
 struct ChatThreadColumn: View {
     @Binding var branchData: ChatBranch
+    /// The conversation this branch belongs to, so enqueued model tasks can be routed back
+    /// to the exact conversation rather than whichever one happens to be active later.
+    var conversationID: UUID? = nil
     let branchAnchor: String
     @Binding var targetSpawnY: CGFloat
     @Binding var uploadedFiles: [UploadedFile]
@@ -356,6 +359,7 @@ struct ChatThreadColumn: View {
                 responseIndex: responseIndex
             ),
             originPage: .conversation,
+            conversationID: conversationID,
             onStart: {
                 _ = withAnimation(.easeInOut(duration: 0.25)) {
                     modelQueuedResponseIndices.remove(responseIndex)
@@ -395,12 +399,31 @@ struct ChatThreadColumn: View {
             }
             guard !Task.isCancelled,
                   branchData.activeChatBlocks.indices.contains(responseIndex) else {
+                // The queue can cancel or preempt this job (Stop, backgrounding, thermal
+                // unload) or the branch's chat blocks can change shape underneath it (the
+                // conversation was switched, cleared, or reset) without this Task itself
+                // ever being cancelled. Either way, the Model Task Queue has already moved
+                // on — clear this index's local tracking too, or the response bubble keeps
+                // rendering its "awaiting"/"streaming" spinner forever even though Model
+                // Status has gone idle.
+                modelQueuedResponseIndices.remove(responseIndex)
+                pendingResponseIndices.remove(responseIndex)
+                streamingResponseIndices.remove(responseIndex)
+                responseRevealGatesByIndex.removeValue(forKey: responseIndex)
                 return
             }
             modelQueuedResponseIndices.remove(responseIndex)
-            responseThinkingSummaryByIndex[responseIndex] = thinkingEnabled
+            let persistedThinkingSummary = thinkingEnabled
                 ? response.thinkingSummary
                 : []
+            responseThinkingSummaryByIndex[responseIndex] = persistedThinkingSummary
+            branchData.setResponsePresentation(
+                ResponsePresentationMetadata(
+                    responseIndex: responseIndex,
+                    showsThinking: thinkingEnabled && !persistedThinkingSummary.isEmpty,
+                    thinkingSummary: persistedThinkingSummary
+                )
+            )
             withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
                 branchData.activeChatBlocks[responseIndex] = .text(response.annotatedText)
                 pendingResponseIndices.remove(responseIndex)
@@ -432,6 +455,7 @@ struct ChatThreadColumn: View {
         streamingResponseIndices.remove(responseIndex)
         responseThinkingIntroByIndex.removeValue(forKey: responseIndex)
         responseThinkingSummaryByIndex.removeValue(forKey: responseIndex)
+        branchData.removeResponsePresentation(at: responseIndex)
 
         guard branchData.activeChatBlocks.indices.contains(responseIndex) else {
             if wasStillQueued {
@@ -606,11 +630,15 @@ struct ChatThreadColumn: View {
 
     private func responseShowsThinkingIntro(at index: Int, text: String) -> Bool {
         guard text != questionCanceledResponseText else { return false }
-        return responseThinkingIntroByIndex[index] ?? true
+        return responseThinkingIntroByIndex[index]
+            ?? branchData.responsePresentation(at: index)?.showsThinking
+            ?? true
     }
 
     private func responseThinkingSummary(at index: Int) -> [String] {
-        responseThinkingSummaryByIndex[index] ?? []
+        responseThinkingSummaryByIndex[index]
+            ?? branchData.responsePresentation(at: index)?.thinkingSummary
+            ?? []
     }
 
     private func quotedConceptMatchID(
@@ -825,9 +853,6 @@ struct ChatThreadColumn: View {
                     topFieldIsEmpty = text.isEmpty
                     onActiveInputTextChange(text)
                 },
-                onSubmit: {
-                    submitTopQuestionIfNeeded()
-                },
                 onTapToFocus: {
                     guard !branchData.topQuestionSubmitted else { return }
                     bottomFieldIsActive = false
@@ -968,9 +993,6 @@ struct ChatThreadColumn: View {
                                 onTextChange: { text in
                                     topFieldIsEmpty = text.isEmpty
                                     onActiveInputTextChange(text)
-                                },
-                                onSubmit: {
-                                    submitTopQuestionIfNeeded()
                                 },
                                 onTapToFocus: {
                                     guard !branchData.topQuestionSubmitted else { return }
@@ -1187,9 +1209,6 @@ struct ChatThreadColumn: View {
                                     bottomFieldIsEmpty = text.isEmpty
                                     onActiveInputTextChange(text)
                                 },
-                                onSubmit: {
-                                    submitBottomQuestionIfNeeded()
-                                },
                                 onTapToFocus: { bottomFieldRelay.focus() }
                             )
                             .overlay(alignment: .top) {
@@ -1219,6 +1238,17 @@ struct ChatThreadColumn: View {
         .onAppear {
             if let concept = branchData.startingConcept {
                 branchData.branchContextConcept = concept
+            }
+            // A brand-new branch (e.g. from the "Ask" flow) can mount with `quotedConcept`
+            // already populated at construction time, rather than it changing later while this
+            // view is on screen — `.onChange` below never fires for that case (there's no
+            // old→new transition to observe on a first render), so the chip would silently never
+            // appear. Handle that arrives-already-set case here; `.onChange` still covers quoting
+            // into an already-mounted branch (e.g. an insight tapped mid-conversation).
+            if let concept = quotedConcept {
+                branchData.attachedConcept = concept
+                branchData.showBottomInput = true
+                onQuoteHandled()
             }
             // Sync placeholder visibility with any pre-filled text (e.g. restored branch)
             topFieldIsEmpty    = branchData.topQuestionText.isEmpty

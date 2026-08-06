@@ -223,7 +223,8 @@ struct ContentView: View {
     @State private var sideMenuCurrentTitle: String = "New Conversation"
     @State private var requestedConversationID: UUID? = nil
     @State private var requestedTopicID: UUID? = nil
-    @State private var studyTopicInsightQuoteRequest: StudyTopicInsightQuoteRequest? = nil
+    @State private var insightConversationQuoteRequest: InsightConversationQuoteRequest? = nil
+    @State private var newConversationInsightQuoteRequest: NewConversationInsightQuoteRequest? = nil
     @State private var studyTopicTreeSelectionRequest: StudyTopicTreeSelectionRequest? = nil
     @State private var newConversationRequest: Int = 0
     @State private var pendingNewConversationQuestion: String = ""
@@ -249,6 +250,8 @@ struct ContentView: View {
     @State private var globalInsightHasInsightHover: Bool = false
     @State private var globalInsightSelectedItemCount: Int = 0
     @State private var globalInsightQuoteTarget: ConceptDefinition? = nil
+    @State private var isGlobalInsightAskMode: Bool = false
+    @State private var globalInsightExistingConversationTarget: ConceptDefinition? = nil
     @State private var globalInsightIsMidpointMode: Bool = false
     @State private var globalInsightIsGenerating: Bool = false
     @State private var globalInsightSelectedPersonality: String = "Balanced"
@@ -328,6 +331,9 @@ struct ContentView: View {
         }
 
         modelTasksPopupState.reset()
+        if page == .conversation, let conversationID = task.conversationID {
+            requestedConversationID = conversationID
+        }
         guard activePage != page else { return }
         activePage = page
     }
@@ -364,7 +370,10 @@ struct ContentView: View {
                     activePage = .conversation
                 }
             },
-            onQuoteInsight: { globalInsightQuoteTarget = $0 },
+            onQuoteInsight: { insight in
+                globalInsightQuoteTarget = insight
+                if insight == nil { isGlobalInsightAskMode = false }
+            },
             onSelectionStateChange: { globalInsightHasCanvasHover = $0 },
             onInsightSelectionStateChange: { globalInsightHasInsightHover = $0 },
             onSelectedCanvasItemCountChange: { globalInsightSelectedItemCount = $0 },
@@ -374,6 +383,13 @@ struct ContentView: View {
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
                     if collectedDefinitions.contains(where: { $0.id == concept.id }) {
                         collectedDefinitions.removeAll { $0.id == concept.id }
+                        // Un-saving must disappear from the global tree's own persisted
+                        // snapshot too, not just the bookmark list — otherwise relaunching
+                        // reloads the stale snapshot and the "removed" insight comes back.
+                        // Mirrors onRemoveInsight's immediate removal+persist above; only the
+                        // add direction is deliberately gated behind the "Update Tree" prompt.
+                        globalTreeInsights.removeAll { $0.id == concept.id }
+                        GlobalInsightTreeStore.save(globalTreeInsights)
                     } else {
                         collectedDefinitions.append(concept)
                     }
@@ -433,10 +449,21 @@ struct ContentView: View {
                 onCreateCanvasConcept: { globalInsightCreateConceptRequest += 1 },
                 onInquireConnection: { globalInsightInquireConnectionRequest += 1 },
                 onQuoteCanvasItem: {
+                    guard globalInsightQuoteTarget != nil else { return }
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
+                        isGlobalInsightAskMode = true
+                    }
+                },
+                usesCanvasAskFlow: true,
+                isCanvasAskMode: isGlobalInsightAskMode,
+                onAskInNewConversation: askGlobalInsightInNewConversation,
+                onAskInExistingConversation: {
                     guard let target = globalInsightQuoteTarget else { return }
-                    requestedForkConcept = target
-                    withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
-                        activePage = .conversation
+                    globalInsightExistingConversationTarget = target
+                },
+                onCancelCanvasAsk: {
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
+                        isGlobalInsightAskMode = false
                     }
                 },
                 onMidpointConcepts: { globalInsightMidpointEnterRequest += 1 },
@@ -461,6 +488,31 @@ struct ContentView: View {
         }
         .background(canvasColor)
         .ignoresSafeArea(.container)  // edges/notch only — keyboard safe area is respected
+        .sheet(item: $globalInsightExistingConversationTarget) { insight in
+            InsightConversationPickerSheet(
+                title: "Existing Conversations",
+                searchPrompt: "Search Conversations",
+                emptyMessage: "There are no matching conversations yet.",
+                conversations: sideMenuConversations,
+                activeConversationID: sideMenuActiveConversationID,
+                savedInsights: collectedDefinitions,
+                onSelect: { conversation in
+                    globalInsightExistingConversationTarget = nil
+                    isGlobalInsightAskMode = false
+                    insightConversationQuoteRequest = InsightConversationQuoteRequest(
+                        conversationID: conversation.id,
+                        insight: insight
+                    )
+                    activePage = .conversation
+                },
+                onCancel: {
+                    globalInsightExistingConversationTarget = nil
+                }
+            )
+            .presentationDetents([.height(520), .large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(AquinasTheme.Colors.canvas)
+        }
     }
 
     /// Extracted so the compiler doesn't time out type-checking a single large expression.
@@ -495,7 +547,8 @@ struct ContentView: View {
             newConversationIsStudyTopic: $newConversationIsStudyTopic,
             deletedConversationID: $deletedConversationID,
             requestedForkConcept: $requestedForkConcept,
-            studyTopicInsightQuoteRequest: $studyTopicInsightQuoteRequest,
+            insightConversationQuoteRequest: $insightConversationQuoteRequest,
+            newConversationInsightQuoteRequest: $newConversationInsightQuoteRequest,
             conversationFontSize: conversationFontSize,
             inputTextAlignment: inputTextAlignment,
             inputFont: inputFont,
@@ -688,8 +741,18 @@ struct ContentView: View {
                                         newConversationRequest += 1
                                         activePage = .conversation
                                     },
+                                    onQuoteInsightIntoNewConversation: { insight, topicID in
+                                        newConversationTopicID = topicID
+                                        newConversationInsightQuoteRequest =
+                                            NewConversationInsightQuoteRequest(
+                                                insight: insight,
+                                                topicID: topicID
+                                            )
+                                        newConversationRequest += 1
+                                        activePage = .conversation
+                                    },
                                     onQuoteInsightIntoConversation: { conversation, insight, topicID in
-                                        studyTopicInsightQuoteRequest = StudyTopicInsightQuoteRequest(
+                                        insightConversationQuoteRequest = InsightConversationQuoteRequest(
                                             topicID: topicID,
                                             conversationID: conversation.id,
                                             insight: insight
@@ -1295,6 +1358,14 @@ struct ContentView: View {
         collectedDefinitions = InsightLibraryStore.load()
     }
 
+    private func askGlobalInsightInNewConversation() {
+        guard let insight = globalInsightQuoteTarget else { return }
+        isGlobalInsightAskMode = false
+        newConversationInsightQuoteRequest = NewConversationInsightQuoteRequest(insight: insight)
+        newConversationRequest += 1
+        activePage = .conversation
+    }
+
     private var globalTreeNeedsUpdate: Bool {
         Set(globalTreeInsights.uniquedByWord())
             != Set(collectedDefinitions.uniquedByWord())
@@ -1457,6 +1528,11 @@ private struct GlobalInsightsModelControls: View {
     var onCreateCanvasConcept: () -> Void
     var onInquireConnection: () -> Void
     var onQuoteCanvasItem: () -> Void
+    let usesCanvasAskFlow: Bool
+    let isCanvasAskMode: Bool
+    var onAskInNewConversation: () -> Void
+    var onAskInExistingConversation: () -> Void
+    var onCancelCanvasAsk: () -> Void
     var onMidpointConcepts: () -> Void
     var onMidpointCenter: () -> Void
     var onMidpointPlace: () -> Void
@@ -1490,6 +1566,11 @@ private struct GlobalInsightsModelControls: View {
             onCreateCanvasConcept: onCreateCanvasConcept,
             onInquireConnection: onInquireConnection,
             onQuoteCanvasItem: onQuoteCanvasItem,
+            usesCanvasAskFlow: usesCanvasAskFlow,
+            isCanvasAskMode: isCanvasAskMode,
+            onAskInNewConversation: onAskInNewConversation,
+            onAskInExistingConversation: onAskInExistingConversation,
+            onCancelCanvasAsk: onCancelCanvasAsk,
             onMidpointConcepts: onMidpointConcepts,
             isMidpointMode: isMidpointMode,
             isCanvasInsightLoading: isCanvasInsightLoading,

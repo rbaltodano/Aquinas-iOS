@@ -20,6 +20,8 @@ DerivedData/
 .build/
 LocalModels/
 Aquinas-iOS/LocalModels/
+LocalGrounding/
+Aquinas-iOS/LocalGrounding/
 
 # Swift Package Manager
 .swiftpm/
