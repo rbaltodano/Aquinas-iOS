@@ -191,9 +191,16 @@ struct LiteRTAquinasModel: AquinasModel {
                 sampling: .conversation
             )
             try Task.checkCancellation()
-            var responseText = Self.plainConversationText(from: raw)
+            // The answer and its key terms come back from one generation call as JSON;
+            // `conversationResponse` salvages the "response" field on its own even when the
+            // model is cut off mid-`key_terms`, so metadata still cannot corrupt or truncate
+            // the visible answer.
+            var parsed = Self.conversationResponse(
+                from: raw,
+                fallbackThinkingSummary: fallbackThinkingSummary
+            )
             if Self.duplicatesEarlierAnswer(
-                responseText,
+                parsed.text,
                 in: context.transcript
             ) {
                 // Recover once from a native session returning the previous turn verbatim.
@@ -210,12 +217,15 @@ struct LiteRTAquinasModel: AquinasModel {
                     sampling: .conversation.retryVariant
                 )
                 try Task.checkCancellation()
-                responseText = Self.plainConversationText(from: raw)
+                parsed = Self.conversationResponse(
+                    from: raw,
+                    fallbackThinkingSummary: fallbackThinkingSummary
+                )
             }
             if let correction,
                Self.contradictsAuthorshipCorrection(
                     correction,
-                    response: responseText
+                    response: parsed.text
                ) {
                 raw = try await runtime.generate(
                     systemInstruction: systemInstruction + """
@@ -230,25 +240,20 @@ struct LiteRTAquinasModel: AquinasModel {
                     sampling: .conversation.retryVariant
                 )
                 try Task.checkCancellation()
-                responseText = Self.plainConversationText(from: raw)
+                parsed = Self.conversationResponse(
+                    from: raw,
+                    fallbackThinkingSummary: fallbackThinkingSummary
+                )
             }
-            guard !responseText.isEmpty,
+            guard !parsed.text.isEmpty,
                   !Self.duplicatesEarlierAnswer(
-                    responseText,
+                    parsed.text,
                     in: context.transcript
                   ) else {
                 throw AquinasModelActionError.invalidResponse
             }
-            onUpdate(.responseText(responseText))
-
-            // Key-term metadata is generated separately so malformed or truncated JSON can
-            // never replace, truncate, or leak into the answer the user sees.
-            let keyTerms = await generatePresentationKeyTerms(in: responseText)
-            return ModelResponse(
-                text: responseText,
-                thinkingSummary: fallbackThinkingSummary,
-                keyTerms: keyTerms
-            )
+            onUpdate(.responseText(parsed.text))
+            return parsed
         } catch {
             guard !Task.isCancelled else {
                 return ModelResponse(text: "")
@@ -494,8 +499,10 @@ struct LiteRTAquinasModel: AquinasModel {
         The numeric weights and source vectors have already identified a weighted semantic center.
         Write exactly five distinct candidate Insights that articulate that shared region. Respect
         every nonzero source and its relative weight. Each candidate must be a real synthesis in
-        prose—not a checklist, glossary, simple 50/50 metaphor, or cosmetic rewrite. Return JSON
-        only with this shape:
+        prose—not a checklist, glossary, simple 50/50 metaphor, or cosmetic rewrite. Each "title"
+        must be a short Insight title, 1-4 words and as few as possible — never a full clause or
+        sentence; put the actual synthesis in "definition" instead. Return JSON only with this
+        shape:
         {"candidates":[{"title":"...","definition":"..."},{"title":"...","definition":"..."},
         {"title":"...","definition":"..."},{"title":"...","definition":"..."},
         {"title":"...","definition":"..."}]}
@@ -511,7 +518,7 @@ struct LiteRTAquinasModel: AquinasModel {
                 throw AquinasModelActionError.invalidResponse
             }
             return try response.candidates.map {
-                try $0.validatedConcept()
+                try $0.validatedConcept(maxTitleWords: 4)
             }
         } catch {
             if Task.isCancelled { throw CancellationError() }
@@ -714,62 +721,6 @@ struct LiteRTAquinasModel: AquinasModel {
         conversationResponse(from: raw).text.trimmed
     }
 
-    /// Runs as a separate call from the main answer so malformed or truncated JSON can never
-    /// replace, truncate, or delay the answer the user sees.
-    private func generatePresentationKeyTerms(
-        in response: String
-    ) async -> [KeyTerm] {
-        let fallback = Self.foundationalKeyTerms(in: response)
-        do {
-            let raw = try await runtime.generate(
-                systemInstruction: Self.neutralStructuredSystem,
-                message: Message(Self.keyTermsPrompt(for: response)),
-                sampling: .structured
-            )
-            try Task.checkCancellation()
-            return Self.presentationKeyTerms(from: raw, in: response) ?? fallback
-        } catch {
-            return fallback
-        }
-    }
-
-    /// `nonisolated` since it's a pure string builder with no actor-isolated state to protect.
-    nonisolated static func keyTermsPrompt(for response: String) -> String {
-        """
-        Stop the current persona voice. Perform a neutral application task: identify the concepts
-        in the answer below that a reader would most need to understand, or would most benefit
-        from exploring further, to genuinely grasp the passage. Favor terms the argument actually
-        depends on: technical, theological, or philosophical concepts; named doctrines, works, and
-        councils; and key distinctions the reasoning turns on. Do not favor a term merely because
-        it is easy to copy exactly, and do not select incidental words, generic fragments, or
-        connective phrases that carry no independent concept.
-
-        Survey the whole answer rather than stopping after the first candidate you find — a
-        substantive answer usually has several terms worth surfacing, not just one. Select every
-        term that genuinely qualifies, up to eight. Return fewer only when the answer truly does
-        not contain that many, and return an empty array only when nothing in it merits a
-        definition.
-
-        Every display_text and context_excerpt must be copied exactly, character for character,
-        from the answer, and each context_excerpt must contain its display_text. Return only
-        JSON, with no persona voice, markdown fence, or preamble, in this exact shape:
-        {"key_terms":[{"display_text":"Exact text from answer","canonical_term":"Canonical concept name","context_excerpt":"Exact excerpt containing display_text"}]}
-
-        Answer:
-        \(response)
-        """
-    }
-
-    static func presentationKeyTerms(
-        from raw: String,
-        in response: String
-    ) -> [KeyTerm]? {
-        guard let payload: LocalKeyTermsPayload = try? decodeJSON(raw) else {
-            return nil
-        }
-        return validatedKeyTerms(payload.keyTerms, in: response)
-    }
-
     private func generateStructured(_ prompt: String) async throws -> String {
         try await runtime.generate(
             systemInstruction: Self.neutralStructuredSystem,
@@ -843,9 +794,26 @@ private extension LiteRTAquinasModel {
             "Earlier compacted conversation context:\n\($0)"
         } ?? "")
 
-        Return only the complete answer as natural prose. Do not return JSON, XML, metadata, task
-        tags, a key-term list, or a thinking summary. Never echo control markup. Finish the answer
-        before stopping.
+        Return only JSON, with no markdown fence or preamble, in this exact shape:
+        {"response":"Full natural-prose answer","key_terms":[{"display_text":"Exact text from the answer","canonical_term":"Canonical concept name","context_excerpt":"Exact excerpt from the answer containing display_text"}]}
+
+        Write "response" first and complete it in full before adding "key_terms" — never let the
+        key-term list interrupt, replace, or leak into the answer.
+
+        For key_terms: identify the foundational concepts a reader would most need to understand,
+        or would most benefit from exploring further, to genuinely grasp the passage. Prefer
+        single words or short terms over long descriptive phrases — "prudence" or "natural law"
+        rather than a phrase describing them. Favor terms the argument actually depends on, named
+        doctrines/works/councils, and concepts worth a reader's clarification or further
+        exploration; do not select incidental words, generic fragments, or connective phrases
+        that carry no independent concept. Select every term that genuinely qualifies, up to
+        eight; return fewer only when the answer truly does not contain that many, and return an
+        empty array when nothing merits a definition. Every display_text and context_excerpt must
+        be copied exactly, character for character, from the answer, and each context_excerpt
+        must contain its display_text.
+
+        Do not return XML, task tags, or a thinking summary. Never echo control markup. Finish the
+        JSON object before stopping.
         """
     }
 
@@ -1662,11 +1630,24 @@ private struct DefinitionPayload: Codable {
     let context: String?
     let definition: String
 
-    func validatedConcept() throws -> ConceptDefinition {
-        let title = title.trimmed
+    /// `maxTitleWords` shortens a checkpoint response that ignored the prompt's own length
+    /// instruction (e.g. a "short Insight title" prompt sometimes still comes back with a full
+    /// clause) down to its first N words. This checkpoint doesn't reliably follow a word-count
+    /// instruction, so *rejecting* the whole candidate here — throwing, same as an empty title —
+    /// made every Midpoint generation fail outright whenever it overshot; keeping the words it
+    /// did write is a graceful trim, not a content-integrity concern the way a fabricated fact
+    /// would be.
+    func validatedConcept(maxTitleWords: Int? = nil) throws -> ConceptDefinition {
         let definition = definition.trimmed
+        var title = self.title.trimmed
         guard !title.isEmpty, !definition.isEmpty else {
             throw AquinasModelActionError.invalidResponse
+        }
+        if let maxTitleWords {
+            let words = title.split(whereSeparator: \.isWhitespace)
+            if words.count > maxTitleWords {
+                title = words.prefix(maxTitleWords).joined(separator: " ")
+            }
         }
         return ConceptDefinition(
             id: ConceptDefinition.stableID(forTerm: title),
@@ -1722,14 +1703,6 @@ private struct LocalConversationPayload: Decodable {
             [LocalKeyTermPayload].self,
             forKey: .keyTerms
         ) ?? []
-    }
-}
-
-private struct LocalKeyTermsPayload: Decodable {
-    let keyTerms: [LocalKeyTermPayload]
-
-    private enum CodingKeys: String, CodingKey {
-        case keyTerms = "key_terms"
     }
 }
 

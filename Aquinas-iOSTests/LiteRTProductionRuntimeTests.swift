@@ -186,21 +186,13 @@ struct LiteRTProductionRuntimeTests {
     }
 
     @MainActor
-    @Test("Separate key-term metadata accepts only exact answer text")
-    func separateKeyTermMetadataIsValidated() throws {
-        let answer = "The First Council of Constantinople met in 381."
-        let raw = #"{"key_terms":[{"display_text":"First Council of Constantinople","canonical_term":"First Council of Constantinople","context_excerpt":"The First Council of Constantinople met in 381."},{"display_text":"Council of Adhesion","canonical_term":"Council of Adhesion","context_excerpt":"Council of Adhesion"}]}"#
-        let terms = try #require(
-            LiteRTAquinasModel.presentationKeyTerms(from: raw, in: answer)
-        )
+    @Test("Single-pass key-term metadata accepts only exact answer text")
+    func singlePassKeyTermMetadataIsValidated() {
+        let raw = #"{"response":"The First Council of Constantinople met in 381.","key_terms":[{"display_text":"First Council of Constantinople","canonical_term":"First Council of Constantinople","context_excerpt":"The First Council of Constantinople met in 381."},{"display_text":"Council of Adhesion","canonical_term":"Council of Adhesion","context_excerpt":"Council of Adhesion"}]}"#
+        let response = LiteRTAquinasModel.conversationResponse(from: raw)
 
-        #expect(terms.map(\.displayText) == ["First Council of Constantinople"])
-        #expect(
-            LiteRTAquinasModel.presentationKeyTerms(
-                from: "truncated metadata",
-                in: answer
-            ) == nil
-        )
+        #expect(response.text == "The First Council of Constantinople met in 381.")
+        #expect(response.keyTerms.map(\.displayText) == ["First Council of Constantinople"])
     }
 
     @Test("Generation guard rejects exact repetitive loops")
