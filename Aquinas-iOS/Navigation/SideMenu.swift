@@ -464,7 +464,7 @@ struct AquinasSideMenu: View {
                             .font(.system(size: 10, weight: .semibold))
                             .sfSymbolDrawOn()
                         Text("New Conversation")
-                            .font(.custom("Figtree-Regular", size: 14))
+                            .font(.custom("Figtree-Bold", size: 14))
                     }
                     .foregroundColor(AquinasTheme.Colors.canvas)
                     .padding(.horizontal, 20)
@@ -604,7 +604,9 @@ struct AquinasSideMenu: View {
         if isLoading {
             return .loading
         }
-        if !modelTasks.completedUserQuestionBranchIDs.isDisjoint(with: branchIDs) {
+        // Already open and being viewed — the answer's been seen, so no unread dot.
+        let isCurrentlyViewed = activePage == .conversation && conversation.id == activeConversationID
+        if !isCurrentlyViewed, !modelTasks.completedUserQuestionBranchIDs.isDisjoint(with: branchIDs) {
             return .completed
         }
         return .idle

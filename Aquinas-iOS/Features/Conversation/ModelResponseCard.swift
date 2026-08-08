@@ -44,7 +44,6 @@ struct ModelResponseCard: View {
     @State private var showResponseContent: Bool
     @State private var isThinkingExpanded: Bool = false
     @State private var visibleThinkingLineCount: Int = 0
-    @State private var isThinkingRuleVisible: Bool = false
     @State private var isThinkingCollapsing: Bool = false
     @State private var hasStartedFinishThinking: Bool = false
     @State private var thinkingStartedAt: Date
@@ -150,7 +149,8 @@ struct ModelResponseCard: View {
                             funStatusText: funStatusText,
                             font: responseFont.textFont(size: conversationFontSize),
                             color: brandBrown,
-                            startedAt: thinkingStartedAt
+                            startedAt: thinkingStartedAt,
+                            responseTextAlignment: responseTextAlignment
                         )
                             .transition(.opacity.combined(with: .scale(scale: 0.96)))
                     } else if canShowThinkingSummaryButton {
@@ -160,7 +160,6 @@ struct ModelResponseCard: View {
                             } else {
                                 isThinkingCollapsing = false
                                 visibleThinkingLineCount = 0
-                                isThinkingRuleVisible = false
                                 withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
                                     isThinkingExpanded = true
                                 }
@@ -190,24 +189,19 @@ struct ModelResponseCard: View {
                 }
 
                 if presentsThinkingUI && !isThinking && isThinkingExpanded {
-                    VStack(alignment: .leading, spacing: 16) {
-                        VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 16) {
+                        VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 8) {
                             ForEach(Array(thinkingSummaryLines.enumerated()), id: \.offset) { index, line in
                                 Text(line)
                                     .font(responseFont.textFont(size: conversationFontSize))
                                     .lineSpacing(8)
+                                    .multilineTextAlignment(responseTextAlignment.textAlignment)
                                     .foregroundColor(AquinasTheme.Colors.placeholderText)
                                     .fixedSize(horizontal: false, vertical: true)
                                     .opacity(index < visibleThinkingLineCount ? 1 : 0)
                             }
                         }
-                        .padding(.leading, 24)
-                        .overlay(alignment: .leading) {
-                            Rectangle()
-                                .fill(AquinasTheme.Colors.quietBorder)
-                                .frame(width: 2)
-                                .opacity(isThinkingRuleVisible ? 1 : 0)
-                        }
+                        .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
 
                         Button(action: {
                             collapseThinking()
@@ -239,13 +233,6 @@ struct ModelResponseCard: View {
                             }
                             try? await Task.sleep(for: .milliseconds(50))
                             guard !Task.isCancelled, !isThinkingCollapsing else { return }
-                        }
-                    }
-                    .task {
-                        try? await Task.sleep(for: .milliseconds(425))
-                        guard !Task.isCancelled, !isThinkingCollapsing else { return }
-                        withAnimation(.easeInOut(duration: 0.3)) {
-                            isThinkingRuleVisible = true
                         }
                     }
                 }
@@ -372,7 +359,6 @@ struct ModelResponseCard: View {
         hasStartedFinishThinking = false
         isThinkingExpanded = false
         visibleThinkingLineCount = 0
-        isThinkingRuleVisible = false
         isThinkingCollapsing = false
         revealedResponseWordCount = 0
         isResponseFullyRevealed = false
@@ -437,7 +423,6 @@ struct ModelResponseCard: View {
         isThinkingCollapsing = true
         withAnimation(.easeOut(duration: 0.1)) {
             visibleThinkingLineCount = 0
-            isThinkingRuleVisible = false
         }
 
         Task {
@@ -458,6 +443,7 @@ private struct LiveThinkingProgressView: View {
     let font: Font
     let color: Color
     let startedAt: Date
+    var responseTextAlignment: ResponseTextAlignmentOption = .left
 
     private var showsDetailedProgress: Bool {
         !summaryLines.isEmpty || isWritingResponse
@@ -474,15 +460,15 @@ private struct LiveThinkingProgressView: View {
     }
 
     var body: some View {
-        VStack(alignment: showsDetailedProgress ? .leading : .center, spacing: 8) {
+        VStack(alignment: showsDetailedProgress ? responseTextAlignment.horizontalAlignment : .center, spacing: 8) {
             Group {
                 if showsDetailedProgress {
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 8) {
                         ForEach(Array(summaryLines.enumerated()), id: \.offset) { index, line in
                             Text(line)
                                 .font(font)
                                 .lineSpacing(8)
-                                .multilineTextAlignment(.leading)
+                                .multilineTextAlignment(responseTextAlignment.textAlignment)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .modifier(
                                     ThinkingShimmer(
@@ -498,14 +484,14 @@ private struct LiveThinkingProgressView: View {
                                 .font(font)
                                 .fontWeight(.bold)
                                 .lineSpacing(8)
-                                .multilineTextAlignment(.leading)
+                                .multilineTextAlignment(responseTextAlignment.textAlignment)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .modifier(ThinkingShimmer(isActive: true, color: color))
                                 .transition(.glideFadeUp)
                                 .accessibilityLabel("Writing response")
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
                 } else {
                     if isQueuedForModel {
@@ -536,7 +522,7 @@ private struct LiveThinkingProgressView: View {
                     estimatedTokenCount: estimatedTokenCount,
                     color: color
                 )
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
                 .transition(.opacity)
             }
         }

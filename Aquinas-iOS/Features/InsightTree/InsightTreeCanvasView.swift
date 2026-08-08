@@ -150,6 +150,36 @@ struct InsightTreeCanvasView: View {
     @State private var breezeStartedAt: CFTimeInterval?
     @State private var breezeDirection = CGVector(dx: 0.92, dy: -0.38)
 
+    // MARK: - Chip rotate-drag
+    /// The Insight chip currently being press-and-dragged around its parent Node. While set,
+    /// `insightWorldPosition` reports the live drag point instead of the (angle, bond length)
+    /// pair, so the chip and its connector line follow the finger anywhere — including stretching
+    /// past the chip's normal orbit radius.
+    @State private var draggingChipID: UUID? = nil
+    @State private var draggingChipWorldPosition: CGPoint? = nil
+    /// Where the dragged chip started, captured once when the drag is promoted. Any placed
+    /// Midpoint it's a source of leans toward it by a fraction of `live - start` (see
+    /// `stepSimulation`'s pinned-body loop) — the delta, not the raw drag point, is what that
+    /// Midpoint follows.
+    @State private var draggingChipStartWorldPosition: CGPoint? = nil
+    /// Insight chip angles the user (or a Midpoint connection) has deliberately pointed somewhere
+    /// specific — the ongoing VSEPR angular-spread simulation must never overwrite these, or the
+    /// very torque that keeps siblings from overlapping quietly rotates a chosen angle right back
+    /// out from under it a few frames later.
+    @State private var pinnedChipAngleIDs: Set<UUID> = []
+    /// Sticky for one `panGesture` lifetime: set as soon as a chip rotate-drag is seen to be in
+    /// progress, so `.onEnded` — which fires with the gesture's full raw translation regardless of
+    /// what `.onChanged`/`.updating` did — knows not to commit that translation as a canvas pan.
+    @State private var panGestureBlockedByChipDrag = false
+    /// The chip a touch-down is currently pending a long-press timer for (see
+    /// `chipRotateDragGesture`). Kept as plain state rather than `LongPressGesture.sequenced` —
+    /// composed with the always-simultaneous root pan gesture, the sequenced form dropped its own
+    /// `.onEnded` on release often enough in practice to leave `draggingChipID` stuck, freezing
+    /// the whole canvas at half opacity. A single `DragGesture` has none of that ambiguity.
+    @State private var chipPressCandidateID: UUID? = nil
+    @State private var chipPressStartLocation: CGPoint? = nil
+    @State private var chipPressLastLocation: CGPoint? = nil
+
     // Cleanup-pass constants. Global structure comes from the view model's semantic (MDS)
     // layout; the sim only anchors nodes to those targets, separates overlaps, and spreads
     // chip labels — it never invents structure of its own.
@@ -489,6 +519,16 @@ struct InsightTreeCanvasView: View {
                 guard let nearest = nearestSelectedTarget(to: handle) else { return }
                 onMidpointPlaced(handle, nearest, midpointWeights(for: handle))
             }
+            // A freshly placed Midpoint's own two source chips haven't been manually angled by
+            // anyone yet — point both of them at it immediately so the new connector doesn't
+            // start out crossing some other line by default.
+            .onChange(of: placedMidpointSources) { _, newValue in
+                withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
+                    for midpointID in newValue.keys {
+                        reangleMidpointSources(of: midpointID)
+                    }
+                }
+            }
             .onDisappear {
                 entranceTask?.cancel()
                 midpointRevealTask?.cancel()
@@ -540,12 +580,27 @@ struct InsightTreeCanvasView: View {
     private func panGesture(camera: InsightTreeCamera, size: CGSize) -> some Gesture {
         DragGesture(minimumDistance: 2)
             .updating($dragOffset) { value, state, _ in
+                // An Insight chip's own press-and-hold rotate-drag (see `chipRotateDragGesture`)
+                // is attached lower in the hierarchy as merely `.simultaneousGesture`, which does
+                // NOT stop this root-level pan gesture from also recognizing the same touch once
+                // it moves — so panning the whole canvas would otherwise hijack every chip drag.
+                // The hold itself doesn't move enough to trip `minimumDistance: 2`, so this guard
+                // only ever needs to catch the drag phase, which starts after `draggingChipID` is
+                // already set.
+                guard draggingChipID == nil else {
+                    panGestureBlockedByChipDrag = true
+                    return
+                }
                 // Lock the handle-vs-pan decision to the gesture's start so it can't
                 // flip to panning as the handle moves away from the finger.
                 guard !isHandleDragStart(value.startLocation, camera: camera, size: size) else { return }
                 state = value.translation
             }
             .onChanged { value in
+                guard draggingChipID == nil else {
+                    panGestureBlockedByChipDrag = true
+                    return
+                }
                 if dragStartHandleWorld == nil {
                     dragStartHandleWorld = midpointHandleWorld   // capture once at gesture start
                 }
@@ -571,6 +626,10 @@ struct InsightTreeCanvasView: View {
                 dragStartHandleWorld = nil
                 lastHandleHapticPercent = nil
                 guard !wasHandleDrag else { return }
+                guard !panGestureBlockedByChipDrag else {
+                    panGestureBlockedByChipDrag = false
+                    return
+                }
                 offset.width += value.translation.width
                 offset.height += value.translation.height
 
@@ -593,6 +652,112 @@ struct InsightTreeCanvasView: View {
         // Generous grab zone, biased upward to cover the bobbing icon that sits above the circle.
         let center = CGPoint(x: screen.x, y: screen.y - 16)
         return hypot(startLocation.x - center.x, startLocation.y - center.y) <= 64
+    }
+
+    /// Press-and-hold an Insight chip, then drag it anywhere — the connector line stretches to
+    /// follow (see `insightWorldPosition`'s `draggingChipID` check). On release the bond length
+    /// eases back to what it was before (relatedness to the parent Node is unchanged), but the
+    /// angle you dragged to sticks. Any placed Midpoint this chip is a source of gets its other
+    /// source re-aimed at the same time, so the two ends of that connection keep facing each
+    /// other instead of drifting back into a crossing line.
+    private func chipRotateDragGesture(
+        insight: InsightModel,
+        node: NodeModel,
+        index: Int,
+        count: Int,
+        isPinnedAtNode: Bool,
+        camera: InsightTreeCamera,
+        size: CGSize
+    ) -> some Gesture {
+        DragGesture(minimumDistance: 0, coordinateSpace: .named(Self.canvasSpace))
+            .onChanged { value in
+                if draggingChipID == insight.id {
+                    draggingChipWorldPosition = camera.screenToWorld(value.location, in: size)
+                    // Top up the frame budget every move so a long drag never lets the sim
+                    // expire mid-gesture — but WITHOUT re-boosting `alpha` (startSim's own
+                    // `max(alpha, intensity)` would do that on every single move event). Alpha
+                    // scales both the repulsion force and its random per-frame jitter term, so
+                    // continuously re-flooring it near the drag's initial intensity kept the
+                    // whole layout visibly trembling for as long as the drag lasted; letting it
+                    // decay on its own settles the jitter while collision avoidance stays live.
+                    simFramesRemaining = max(simFramesRemaining, Self.settleFrameBudget)
+                    return
+                }
+                guard draggingChipID == nil else { return }   // some other chip owns the drag
+                chipPressLastLocation = value.location
+                guard chipPressCandidateID != insight.id else { return }   // timer already armed
+                chipPressCandidateID = insight.id
+                chipPressStartLocation = value.location
+                chipPressLastLocation = value.location
+                let capturedID = insight.id
+                // A placed Midpoint's chip sits ON its node — nothing to orbit, so its "start"
+                // is just its own current position, and dragging repositions it freely instead
+                // of picking a new angle.
+                let startWorld = isPinnedAtNode ? node.position : insightWorldPosition(for: node, index: index, count: count)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    guard chipPressCandidateID == capturedID, draggingChipID == nil else { return }
+                    // Cancelled if the finger drifted too far during the hold — that's a pan,
+                    // not a rotate-drag, and the root pan gesture is already handling it.
+                    if let start = chipPressStartLocation, let last = chipPressLastLocation,
+                       hypot(last.x - start.x, last.y - start.y) > 14 {
+                        chipPressCandidateID = nil
+                        return
+                    }
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.75)
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                        draggingChipID = capturedID
+                        draggingChipWorldPosition = startWorld
+                        draggingChipStartWorldPosition = startWorld
+                    }
+                    // Keep the sim actively stepping for the whole drag — nearby chips/nodes
+                    // need live collision forces reacting every frame to make room, not just a
+                    // one-shot settle once the finger lifts. A modest starting intensity (rather
+                    // than a full topology-change jolt) keeps that initial nudge from reading as
+                    // a jitter itself.
+                    startSim(intensity: 0.22, alphaDecay: Self.updateAlphaDecay, frameBudget: Self.settleFrameBudget)
+                }
+            }
+            .onEnded { value in
+                let wasDragging = draggingChipID == insight.id
+                if chipPressCandidateID == insight.id {
+                    chipPressCandidateID = nil
+                }
+                guard wasDragging else { return }   // released before the hold armed: a plain tap
+                // Commit whatever position the drag settled at (either this Midpoint's own free
+                // reposition, or a followed Midpoint's drift — see `stepSimulation`'s pinned-body
+                // loop) into the view model BEFORE clearing the drag state below — otherwise the
+                // very next simulation tick's "pinned bodies track their authoritative
+                // view-model position" sync would read the OLD, uncommitted position and snap
+                // straight back.
+                persistLivePositions()
+                if isPinnedAtNode {
+                    // Free reposition: wherever it was dropped IS the new position — no angle or
+                    // bond length to compute (there's no orbit to compute them around).
+                    withAnimation(.spring(response: 0.75, dampingFraction: 0.8)) {
+                        draggingChipID = nil
+                        draggingChipWorldPosition = nil
+                        draggingChipStartWorldPosition = nil
+                    }
+                    UISelectionFeedbackGenerator().selectionChanged()
+                    return
+                }
+                let releasePoint = camera.screenToWorld(value.location, in: size)
+                let finalAngle = Double(atan2(
+                    releasePoint.y - node.position.y,
+                    releasePoint.x - node.position.x
+                ))
+                withAnimation(.spring(response: 0.75, dampingFraction: 0.8)) {
+                    chipAngles[insight.id] = ChipAngle(angle: finalAngle)
+                    pinnedChipAngleIDs.insert(insight.id)
+                    draggingChipID = nil
+                    draggingChipWorldPosition = nil
+                    draggingChipStartWorldPosition = nil
+                    for midpointID in midpointIDs(sourcedBy: insight.id) {
+                        reangleMidpointSources(of: midpointID, excluding: insight.id)
+                    }
+                }
+                UISelectionFeedbackGenerator().selectionChanged()
+            }
     }
 
     private func zoomGesture(in size: CGSize) -> some Gesture {
@@ -1691,9 +1856,19 @@ struct InsightTreeCanvasView: View {
         .transition(.glideFadeUp)
         // 2.5D depth: farther nodes render smaller, dimmer, and behind nearer ones.
         .scaleEffect(depthScale(node.id))
-        .opacity(depthOpacity(node.id))
+        // While rotate-dragging a chip, every Node recedes so the dragged chip alone stands out.
+        // No `.animation(_, value:)` here — see the matching note in `insightLabel`; a placed
+        // Midpoint's `.position()` below needs to ride whatever ambient animation is active
+        // (its live drag-follow), not get locked to a spring keyed only to `draggingChipID`.
+        .opacity(depthOpacity(node.id) * chipDragDimFactor)
         .position(position)
         .zIndex((node.isSuggested ? 20 : 10) + Double(depthFactor(node.id)) * 5)
+    }
+
+    /// Dims every Node and every non-dragged Insight chip to half opacity while a chip
+    /// rotate-drag is active, so the one chip under the finger reads unambiguously.
+    private var chipDragDimFactor: Double {
+        draggingChipID == nil ? 1.0 : 0.5
     }
 
     /// Two quick medium taps, fired as a generated insight's shockwave bursts out.
@@ -1785,16 +1960,37 @@ struct InsightTreeCanvasView: View {
             focusHoveredTarget(at: worldPosition, in: size)
             onInsightTapped(insight)
         }
+        .simultaneousGesture(
+            chipRotateDragGesture(
+                insight: insight,
+                node: node,
+                index: index,
+                count: count,
+                isPinnedAtNode: isPinnedAtNode,
+                camera: camera,
+                size: size
+            ),
+            isEnabled: canAcceptTap
+        )
         .offset(y: isVisible ? 0 : 24)
         .opacity(isVisible ? 1 : 0)
         .blur(radius: isVisible ? 0 : 8)
         .animation(.spring(response: 0.6, dampingFraction: 0.75), value: isVisible)
         .transition(.scale(scale: 0.88, anchor: .center).combined(with: .opacity))
         // 2.5D depth: chips inherit their node's depth so the whole cluster recedes together.
-        .scaleEffect(depthScale(node.id))
-        .opacity(depthOpacity(node.id))
+        // While rotate-dragging, the dragged chip grows 5% and stays full opacity; every other
+        // chip dims along with the Nodes (see `chipDragDimFactor`).
+        // No `.animation(_, value:)` here: that resets the animation context for every modifier
+        // after it — including `.position()` below — to ONLY animate on `draggingChipID`
+        // changes, using its own spring. That decoupled the chip from `AnimatableLine`'s
+        // connector, which has no such override and just rides whatever ambient `withAnimation`
+        // is active — so the line eased back on release while the chip itself snapped instantly.
+        // Wrapping the state mutations in `chipRotateDragGesture` in `withAnimation` covers scale,
+        // opacity, AND position uniformly, the same way it already covers the connector line.
+        .scaleEffect(depthScale(node.id) * (draggingChipID == insight.id ? 1.05 : 1.0))
+        .opacity(depthOpacity(node.id) * (draggingChipID == insight.id ? 1.0 : chipDragDimFactor))
         .position(position)
-        .zIndex(30 + Double(depthFactor(node.id)) * 5)
+        .zIndex(30 + Double(depthFactor(node.id)) * 5 + (draggingChipID == insight.id ? 100 : 0))
     }
 
     private func insightFocusTarget(for insightID: UUID) -> CGPoint? {
@@ -1951,6 +2147,11 @@ struct InsightTreeCanvasView: View {
         let visibleInsights = canvasInsights(for: node)
         guard index < visibleInsights.count else { return node.position }
         let insightID = visibleInsights[index].id
+        // While this exact chip is being press-dragged, it follows the finger anywhere — the
+        // connector line stretches to match — rather than the fixed (angle, bond length) orbit.
+        if draggingChipID == insightID, let live = draggingChipWorldPosition {
+            return live
+        }
         // Free VSEPR bond angle (falls back to the even base angle until the sim seeds it).
         let angle = chipAngles[insightID]?.angle ?? baseChipAngle(index: index, count: count)
         let radius = bondLength(forInsightID: insightID)
@@ -1958,6 +2159,38 @@ struct InsightTreeCanvasView: View {
             x: node.position.x + cos(angle) * radius,
             y: node.position.y + sin(angle) * radius
         )
+    }
+
+    /// The Node currently hosting `insightID` as one of its own (non-pinned) chips.
+    private func parentNode(ofInsightID insightID: UUID) -> NodeModel? {
+        nodes.first { node in
+            !placedMidpointNodeIDs.contains(node.id) && node.insights.contains { $0.id == insightID }
+        }
+    }
+
+    /// Points every source of a placed Midpoint at that Midpoint's own node, except `excluding`
+    /// (the chip the user just deliberately dragged, whose angle is authoritative). Two connected
+    /// chips facing each other is what keeps their line from cutting across an unrelated one —
+    /// e.g. the line between their own two parent Nodes.
+    private func reangleMidpointSources(of midpointID: UUID, excluding: UUID? = nil) {
+        guard let midpointNode = nodes.first(where: { $0.id == midpointID }),
+              let sources = placedMidpointSources[midpointID] else { return }
+        for source in sources where !source.isNode && source.insightID != excluding {
+            guard let parent = parentNode(ofInsightID: source.insightID) else { continue }
+            let angle = Double(atan2(
+                midpointNode.position.y - parent.position.y,
+                midpointNode.position.x - parent.position.x
+            ))
+            chipAngles[source.insightID] = ChipAngle(angle: angle)
+            pinnedChipAngleIDs.insert(source.insightID)
+        }
+    }
+
+    /// Every placed Midpoint that `insightID` is itself a source of.
+    private func midpointIDs(sourcedBy insightID: UUID) -> [UUID] {
+        placedMidpointSources.compactMap { midpointID, sources in
+            sources.contains { !$0.isNode && $0.insightID == insightID } ? midpointID : nil
+        }
     }
 
     // MARK: - 2.5D Depth Cues
@@ -2096,6 +2329,7 @@ struct InsightTreeCanvasView: View {
         // sibling Insight bonds and all node-to-node lines connected to the parent concept.
         let chipIDs = Set(nodes.flatMap { canvasInsights(for: $0).map(\.id) })
         var nextAngles = chipAngles.filter { chipIDs.contains($0.key) }
+        pinnedChipAngleIDs.formIntersection(chipIDs)
         for node in nodes {
             let visibleInsights = canvasInsights(for: node)
             var occupiedAngles = connectedNodeBondAngles(for: node.id)
@@ -2188,9 +2422,22 @@ struct InsightTreeCanvasView: View {
             }
             let visibleInsights = canvasInsights(for: node)
             for (index, insight) in visibleInsights.enumerated() {
-                let theta = chipAngles[insight.id]?.angle ?? baseChipAngle(index: index, count: visibleInsights.count)
-                let radius = bondLength(forInsightID: insight.id)
-                let pos = CGPoint(x: body.pos.x + cos(theta) * radius, y: body.pos.y + sin(theta) * radius)
+                let theta: Double
+                let radius: CGFloat
+                let pos: CGPoint
+                if draggingChipID == insight.id, let live = draggingChipWorldPosition {
+                    // The dragged chip's real-time position, so collision/spread this frame
+                    // reacts to where it actually is right now instead of its last committed
+                    // (angle, bond length) — this is what makes nearby chips make room for it
+                    // live instead of only after the drag ends.
+                    pos = live
+                    radius = hypot(live.x - body.pos.x, live.y - body.pos.y)
+                    theta = Double(atan2(live.y - body.pos.y, live.x - body.pos.x))
+                } else {
+                    theta = chipAngles[insight.id]?.angle ?? baseChipAngle(index: index, count: visibleInsights.count)
+                    radius = bondLength(forInsightID: insight.id)
+                    pos = CGPoint(x: body.pos.x + cos(theta) * radius, y: body.pos.y + sin(theta) * radius)
+                }
                 let size = insightCollisionSize(for: insight)
                 chipInfos.append(
                     ChipInfo(
@@ -2378,6 +2625,11 @@ struct InsightTreeCanvasView: View {
         if !chipTorque.isEmpty {
             var nextAngles = chipAngles
             for (id, torque) in chipTorque {
+                // A pinned chip (deliberately dragged, or facing a Midpoint it's a source of)
+                // still repels its siblings via the torque IT exerts on THEM above — only the
+                // write-back of ITS OWN angle is skipped, so the spread simulation can't quietly
+                // rotate a chosen angle back out from under it.
+                guard !pinnedChipAngleIDs.contains(id), id != draggingChipID else { continue }
                 guard var ch = nextAngles[id] else { continue }
                 let rawStep = max(-Self.chipMaxAngStep, min(Self.chipMaxAngStep, torque * Self.chipAngGain * Double(dtScale)))
                 let step = rawStep * cool
@@ -2405,8 +2657,30 @@ struct InsightTreeCanvasView: View {
             maxMove = max(maxMove, hypot(stepX, stepY))
         }
 
-        // Pinned bodies track their authoritative view-model position.
+        // Pinned bodies track their authoritative view-model position — with two exceptions:
+        // a placed Midpoint being dragged directly (its own chip has no orbit, so the drag just
+        // repositions it 1:1), and a placed Midpoint currently sourced by the chip being
+        // rotate-dragged, which leans toward it by a fraction of how far that chip has moved from
+        // where the drag started. Both read live off `draggingChipWorldPosition` (updated every
+        // drag move, bypassing the chip's own pinned angle/radius — see `insightWorldPosition`).
         for id in pinned {
+            if id == draggingChipID, let live = draggingChipWorldPosition {
+                next[id]?.pos = live
+                continue
+            }
+            if placedMidpointNodeIDs.contains(id),
+               let draggingChipID, let live = draggingChipWorldPosition,
+               let start = draggingChipStartWorldPosition,
+               let sources = placedMidpointSources[id],
+               sources.contains(where: { !$0.isNode && $0.insightID == draggingChipID }) {
+                let followFactor: CGFloat = 0.35
+                let base = nodeByID[id]?.position ?? next[id]?.pos ?? .zero
+                next[id]?.pos = CGPoint(
+                    x: base.x + (live.x - start.x) * followFactor,
+                    y: base.y + (live.y - start.y) * followFactor
+                )
+                continue
+            }
             if let node = nodeByID[id] { next[id]?.pos = node.position }
         }
 
@@ -2450,9 +2724,16 @@ struct InsightTreeCanvasView: View {
         InsightDiscoveryStore.loadSeenInsightIDs()
     }
 
+    /// Merges this open's visible insights into the persisted "seen" set — never replaces it.
+    /// `seenInsightIDsKey` is one shared UserDefaults key across every Insight Tree instance (the
+    /// Global tree and every per-conversation tree), and the same saved Insight can legitimately
+    /// appear in more than one of them. A plain overwrite here dropped every OTHER tree's
+    /// previously-seen insights the moment this tree opened — so tapping an insight to clear its
+    /// blue dot, then opening a different tree containing that same insight and coming back,
+    /// re-flagged it "new" on `computeNewInsights()`'s next diff and put the dot right back.
     private func saveAllInsightIDsAsSeen() {
-        let ids = nodes.flatMap { $0.insights }.map(\.id)
-        InsightDiscoveryStore.saveSeenInsightIDs(ids)
+        let ids = Set(nodes.flatMap { $0.insights }.map(\.id))
+        InsightDiscoveryStore.saveSeenInsightIDs(Array(loadSeenInsightIDs().union(ids)))
     }
 
     /// Returns insights that weren't present the last time InsightTree was opened.

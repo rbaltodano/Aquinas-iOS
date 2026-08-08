@@ -88,6 +88,10 @@ struct ChatThreadColumn: View {
     var studyTopicTitle: String? = nil
     var onTapEyebrow: () -> Void = {}
     var emptyStatePromptQuestion: String = ""
+    /// Optional paragraph shown beneath the header title on a fresh new-conversation prompt (e.g.
+    /// the Today in History description) -- distinct from `hiddenPromptContext`, which feeds the
+    /// model but never renders.
+    var emptyStatePromptSubtitle: String = ""
     var showsThinkingIntro: Bool = true
     /// Live conversation title, shown as the root branch's heading (updates on rename).
     var conversationTitle: String = ""
@@ -121,6 +125,9 @@ struct ChatThreadColumn: View {
     var onInlineInsightQuote: (ConceptDefinition) -> Void = { _ in }
     var onInlineInsightFork: (ConceptDefinition, Int) -> Void = { _, _ in }
     var onInlineInsightToggleSaved: (ConceptDefinition) -> Void = { _ in }
+    /// (question text, response index) -- the same `index` the block enumeration already uses,
+    /// so the caller can derive a stable per-turn id the same way tree-analysis does.
+    var onFlagQuote: (String, Int) -> Void = { _, _ in }
 
     private var modelResponseLineHeight: CGFloat {
         let fontName = responseFont == .sans
@@ -264,6 +271,10 @@ struct ChatThreadColumn: View {
         emptyStateEyebrow.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private var trimmedEmptyStatePromptSubtitle: String {
+        emptyStatePromptSubtitle.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private var eyebrowDisplayText: String {
         if let studyTopicTitle {
             let trimmed = studyTopicTitle.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -283,7 +294,21 @@ struct ChatThreadColumn: View {
         trimmedEmptyStateEyebrow.caseInsensitiveCompare("QUESTION OF THE DAY") == .orderedSame
     }
 
+    /// The permanent record that this branch started from a Question of the Day — persisted on
+    /// the branch itself (unlike `isQuestionOfTheDayPrompt`, which is driven by transient view
+    /// state that resets on relaunch), so the header never drifts to the conversation's title.
+    private var pinnedHeaderQuestion: String? {
+        guard let pinned = branchData.pinnedHeaderQuestion?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !pinned.isEmpty else {
+            return nil
+        }
+        return pinned
+    }
+
     private var newConversationHeaderTitle: String {
+        if let pinnedHeaderQuestion {
+            return pinnedHeaderQuestion
+        }
         if !isQuestionOfTheDayPrompt, branchData.generatedBranchTitle != nil {
             return displayBranchTitle
         }
@@ -649,7 +674,11 @@ struct ChatThreadColumn: View {
     }
 
     private func finalizePendingGeneratedTitleIfNeeded() {
-        guard branchData.generatedBranchTitle == nil,
+        // A pinned header (Question of the Day, Today in History) already fixed both the
+        // in-conversation heading and the conversation's title at creation time -- an
+        // auto-generated title from the user's typed answer must not overwrite either.
+        guard branchData.pinnedHeaderQuestion == nil,
+              branchData.generatedBranchTitle == nil,
               let pendingQuestion = pendingGeneratedTitleQuestion else { return }
         let title = generatedTitle(from: pendingQuestion)
         pendingGeneratedTitleQuestion = nil
@@ -794,13 +823,12 @@ struct ChatThreadColumn: View {
                 }
 
                 if isEditingBigTitle {
-                    TextField("Conversation title", text: $bigTitleDraft, axis: .vertical)
+                    TextField("Conversation title", text: $bigTitleDraft)
                         .font(.custom("LibreBaskerville-Regular", size: 28))
                         .foregroundColor(AquinasTheme.Colors.headingText)
                         .lineSpacing(14)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: .infinity, alignment: .center)
-                        .fixedSize(horizontal: false, vertical: true)
                         .focused($isBigTitleFocused)
                         .submitLabel(.done)
                         .onSubmit {
@@ -809,7 +837,7 @@ struct ChatThreadColumn: View {
                         }
                 } else {
                     Text(newConversationHeaderTitle)
-                        .font(.custom("LibreBaskerville-Regular", size: 28))
+                        .font(.custom("LibreBaskerville-Regular", size: pinnedHeaderQuestion != nil ? 18 : 28))
                         .foregroundColor(AquinasTheme.Colors.headingText)
                         .lineSpacing(14)
                         .multilineTextAlignment(.center)
@@ -817,10 +845,22 @@ struct ChatThreadColumn: View {
                         .id(newConversationHeaderTitle)
                         .transition(.blurredTitleReplacement)
                         .onTapGesture {
+                            // A Question of the Day is pinned permanently — not renameable,
+                            // since it isn't the conversation's title to begin with.
+                            guard pinnedHeaderQuestion == nil else { return }
                             bigTitleDraft = newConversationHeaderTitle
                             isEditingBigTitle = true
                             isBigTitleFocused = true
                         }
+                }
+
+                if !isEditingBigTitle, !trimmedEmptyStatePromptSubtitle.isEmpty {
+                    Text(trimmedEmptyStatePromptSubtitle)
+                        .font(AquinasTheme.Typography.body)
+                        .foregroundColor(AquinasTheme.Colors.paragraphText)
+                        .lineSpacing(7)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity, alignment: .center)
                 }
             }
 
@@ -1135,6 +1175,13 @@ struct ChatThreadColumn: View {
                             .frame(maxWidth: .infinity)
                         }
                         .frame(maxWidth: .infinity)
+                        .contextMenu {
+                            Button {
+                                onFlagQuote(questionText, index)
+                            } label: {
+                                Label("Flag as a Quote Worth Remembering", systemImage: "quote.opening")
+                            }
+                        }
                     }
                 }
             }

@@ -66,12 +66,13 @@ xcodebuild -list -project ../Aquinas-iOS.xcodeproj
 Lists available schemes and targets.
 
 ```sh
-xcodebuild -project ../Aquinas-iOS.xcodeproj -scheme Aquinas-iOS -destination 'generic/platform=iOS Simulator' build
+xcodebuild -project ../Aquinas-iOS.xcodeproj -scheme Aquinas-iOS -destination 'platform=iOS Simulator,name=iPhone 17' build
 ```
 
 Builds the app for the iOS Simulator. Use this before handing off changes.
 
-The exact bundled LiteRT package has an arm64 simulator slice. Use
+The exact bundled LiteRT package only has an arm64 simulator slice, so `generic/platform=iOS
+Simulator` fails to link — always target a concrete arm64 simulator destination instead. Use
 `--litert-probe --litert-probe-auto` for cable-free local-inference checks on Apple-silicon Macs;
 simulator timing does not replace final physical-device thermal and memory verification.
 For pre-LiteRT comparison, launch a Debug simulator build with `--force-backend-model` while the

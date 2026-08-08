@@ -109,7 +109,7 @@ struct EdgeModel: Identifiable, Equatable {
 
 /// A source a placed midpoint was spawned from — either a specific insight chip (`isNode == false`,
 /// connect to the chip) or a whole node concept (`isNode == true`, connect to the node center).
-struct MidpointSource: Equatable {
+struct MidpointSource: Equatable, Codable {
     let insightID: UUID
     let isNode: Bool
 }

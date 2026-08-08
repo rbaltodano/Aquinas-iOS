@@ -191,16 +191,15 @@ struct LiteRTAquinasModel: AquinasModel {
                 sampling: .conversation
             )
             try Task.checkCancellation()
-            // The answer and its key terms come back from one generation call as JSON;
-            // `conversationResponse` salvages the "response" field on its own even when the
-            // model is cut off mid-`key_terms`, so metadata still cannot corrupt or truncate
-            // the visible answer.
-            var parsed = Self.conversationResponse(
-                from: raw,
-                fallbackThinkingSummary: fallbackThinkingSummary
+            // The model marks key terms inline in the same pass ({{term}}) instead of a
+            // separate list — there's no exact-recall step to fail, since the marker IS the
+            // term as it appears in the text. `inlineAnnotatedResponse` strips the markers back
+            // out and turns their positions into validated `KeyTerm`s.
+            var (responseText, keyTerms) = Self.inlineAnnotatedResponse(
+                from: Self.plainConversationText(from: raw)
             )
             if Self.duplicatesEarlierAnswer(
-                parsed.text,
+                responseText,
                 in: context.transcript
             ) {
                 // Recover once from a native session returning the previous turn verbatim.
@@ -217,15 +216,14 @@ struct LiteRTAquinasModel: AquinasModel {
                     sampling: .conversation.retryVariant
                 )
                 try Task.checkCancellation()
-                parsed = Self.conversationResponse(
-                    from: raw,
-                    fallbackThinkingSummary: fallbackThinkingSummary
+                (responseText, keyTerms) = Self.inlineAnnotatedResponse(
+                    from: Self.plainConversationText(from: raw)
                 )
             }
             if let correction,
                Self.contradictsAuthorshipCorrection(
                     correction,
-                    response: parsed.text
+                    response: responseText
                ) {
                 raw = try await runtime.generate(
                     systemInstruction: systemInstruction + """
@@ -240,20 +238,25 @@ struct LiteRTAquinasModel: AquinasModel {
                     sampling: .conversation.retryVariant
                 )
                 try Task.checkCancellation()
-                parsed = Self.conversationResponse(
-                    from: raw,
-                    fallbackThinkingSummary: fallbackThinkingSummary
+                (responseText, keyTerms) = Self.inlineAnnotatedResponse(
+                    from: Self.plainConversationText(from: raw)
                 )
             }
-            guard !parsed.text.isEmpty,
+            guard !responseText.isEmpty,
                   !Self.duplicatesEarlierAnswer(
-                    parsed.text,
+                    responseText,
                     in: context.transcript
                   ) else {
                 throw AquinasModelActionError.invalidResponse
             }
-            onUpdate(.responseText(parsed.text))
-            return parsed
+            onUpdate(.responseText(responseText))
+            // Key terms are only ever the model's own inline {{markers}} — no heuristic
+            // fallback. A turn with no markers legitimately has zero highlighted terms.
+            return ModelResponse(
+                text: responseText,
+                thinkingSummary: fallbackThinkingSummary,
+                keyTerms: keyTerms
+            )
         } catch {
             guard !Task.isCancelled else {
                 return ModelResponse(text: "")
@@ -695,7 +698,7 @@ struct LiteRTAquinasModel: AquinasModel {
             return ModelResponse(
                 text: visibleText,
                 thinkingSummary: fallbackThinkingSummary,
-                keyTerms: foundationalKeyTerms(in: visibleText)
+                keyTerms: []
             )
         }
 
@@ -719,6 +722,69 @@ struct LiteRTAquinasModel: AquinasModel {
 
     static func plainConversationText(from raw: String) -> String {
         conversationResponse(from: raw).text.trimmed
+    }
+
+    /// Strips model-authored `{{term}}` markers out of `text` and turns each into a `KeyTerm`.
+    /// Because the marker is removed in place — the surrounding prose never moves — `displayText`
+    /// is always an exact substring of the returned text by construction; there's no separate
+    /// "recall this exactly" step for the model to get wrong.
+    static func inlineAnnotatedResponse(from text: String) -> (text: String, keyTerms: [KeyTerm]) {
+        var strippedText = ""
+        var markers: [(term: String, offset: Int)] = []
+        var searchIndex = text.startIndex
+        markerLoop: while let openRange = text.range(
+            of: "{{",
+            range: searchIndex..<text.endIndex
+        ) {
+            strippedText += text[searchIndex..<openRange.lowerBound]
+            guard let closeRange = text.range(
+                of: "}}",
+                range: openRange.upperBound..<text.endIndex
+            ) else {
+                // An unterminated marker only happens when generation was cut off mid-answer
+                // (repetition guard, truncation). Drop the dangling fragment rather than leaking
+                // literal braces into the visible answer.
+                searchIndex = text.endIndex
+                break markerLoop
+            }
+            let term = String(text[openRange.upperBound..<closeRange.lowerBound]).trimmed
+            if !term.isEmpty, term.count <= 60, !term.contains("{{") {
+                markers.append((term, strippedText.count))
+                strippedText += term
+            }
+            searchIndex = closeRange.upperBound
+        }
+        strippedText += text[searchIndex..<text.endIndex]
+
+        var usedCanonical = Set<String>()
+        let keyTerms: [KeyTerm] = markers.compactMap { marker in
+            guard let termStart = strippedText.index(
+                strippedText.startIndex,
+                offsetBy: marker.offset,
+                limitedBy: strippedText.endIndex
+            ), let termEnd = strippedText.index(
+                termStart,
+                offsetBy: marker.term.count,
+                limitedBy: strippedText.endIndex
+            ) else { return nil }
+            let display = String(strippedText[termStart..<termEnd])
+            let canonical = display.folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: .current
+            )
+            .lowercased()
+            guard isMeaningfulKeyTerm(displayText: display, canonicalTerm: canonical),
+                  usedCanonical.insert(canonical).inserted else {
+                return nil
+            }
+            return KeyTerm(
+                displayText: display,
+                canonicalTerm: display,
+                contextExcerpt: contextExcerpt(containing: display, in: strippedText)
+            )
+        }
+
+        return (strippedText, Array(keyTerms.prefix(8)))
     }
 
     private func generateStructured(_ prompt: String) async throws -> String {
@@ -794,26 +860,21 @@ private extension LiteRTAquinasModel {
             "Earlier compacted conversation context:\n\($0)"
         } ?? "")
 
-        Return only JSON, with no markdown fence or preamble, in this exact shape:
-        {"response":"Full natural-prose answer","key_terms":[{"display_text":"Exact text from the answer","canonical_term":"Canonical concept name","context_excerpt":"Exact excerpt from the answer containing display_text"}]}
+        Return only the complete answer as natural prose. Do not return JSON, XML, metadata, a
+        separate key-term list, or a thinking summary. Never echo control markup.
 
-        Write "response" first and complete it in full before adding "key_terms" — never let the
-        key-term list interrupt, replace, or leak into the answer.
-
-        For key_terms: identify the foundational concepts a reader would most need to understand,
-        or would most benefit from exploring further, to genuinely grasp the passage. Prefer
-        single words or short terms over long descriptive phrases — "prudence" or "natural law"
-        rather than a phrase describing them. Favor terms the argument actually depends on, named
-        doctrines/works/councils, and concepts worth a reader's clarification or further
-        exploration; do not select incidental words, generic fragments, or connective phrases
-        that carry no independent concept. Select every term that genuinely qualifies, up to
-        eight; return fewer only when the answer truly does not contain that many, and return an
-        empty array when nothing merits a definition. Every display_text and context_excerpt must
-        be copied exactly, character for character, from the answer, and each context_excerpt
-        must contain its display_text.
-
-        Do not return XML, task tags, or a thinking summary. Never echo control markup. Finish the
-        JSON object before stopping.
+        As you write, mark the foundational concepts a reader would most need to understand, or
+        would most benefit from exploring further, by wrapping just that word or short term in
+        double curly braces exactly where it occurs — for example "Aquinas distinguishes
+        {{essence}} from {{existence}}." Prefer marking single words or short terms over long
+        descriptive phrases. Mark terms the argument actually depends on, named
+        doctrines/works/councils, and concepts worth further exploration — err toward marking a
+        genuinely relevant term rather than skipping it; a substantive multi-paragraph answer
+        typically has five to eight such terms, a shorter answer fewer, and a purely
+        conversational reply none. Do not mark generic or connective words, and do not mark the
+        same concept twice. Every marker must open with {{ and close with }} around only that
+        term, never spanning a whole sentence, and never nested. Finish the answer before
+        stopping.
         """
     }
 
@@ -1109,10 +1170,22 @@ private extension LiteRTAquinasModel {
             return nil
         }
         let earlierTranscript = context.transcript[..<latestIndex]
-        let previousQuestion = earlierTranscript.reversed().compactMap { block -> String? in
-            guard case .user(let question, _, _) = block else { return nil }
-            return question
-        }.first
+        // A real previous *question* only exists once the model has actually answered
+        // something — i.e. earlierTranscript contains an assistant `.text` reply. A leading
+        // `.user` block with no response yet is hidden prompt context (e.g. Question of the Day's
+        // or Today in History's tagged context), not a prior turn, and must not be compared
+        // against the user's real question for topic-shift detection — that comparison always
+        // looks like an unrelated subject change and silently wipes the hidden context.
+        let hasEarlierResponse = earlierTranscript.contains { block in
+            if case .text = block { return true }
+            return false
+        }
+        let previousQuestion = hasEarlierResponse
+            ? earlierTranscript.reversed().compactMap { block -> String? in
+                guard case .user(let question, _, _) = block else { return nil }
+                return question
+            }.first
+            : nil
         let latestQuestion: String
         if case .user(let question, _, _) = context.transcript[latestIndex] {
             latestQuestion = question
@@ -1372,108 +1445,6 @@ private extension LiteRTAquinasModel {
             let allButLast = titles.dropLast().joined(separator: ", ")
             return ["Consulting \(allButLast), and \(titles.last!)."]
         }
-    }
-
-    static func foundationalKeyTerms(in response: String) -> [KeyTerm] {
-        let preferredPhrases = [
-            "First Council of Constantinople", "Second Council of Constantinople",
-            "First Council of Nicaea", "Second Council of Nicaea",
-            "Council of Constantinople", "Council of Nicaea", "Apostle Paul", "Didache",
-            "practical wisdom", "practical reason", "moral virtue", "intellectual virtue",
-            "natural law", "first principle", "first principles", "common good",
-            "human flourishing", "final cause", "efficient cause", "formal cause",
-            "material cause", "act and potency", "double effect", "moral object",
-            "free will", "conscience", "substantial form"
-        ]
-        var selected: [(display: String, canonical: String, location: Int, score: Int)] = []
-        var usedCanonical = Set<String>()
-        var coveredRanges: [Range<String.Index>] = []
-
-        for phrase in preferredPhrases {
-            guard let range = response.range(
-                of: phrase,
-                options: [.caseInsensitive, .diacriticInsensitive]
-            ), !coveredRanges.contains(where: { $0.overlaps(range) }) else {
-                continue
-            }
-            let display = String(response[range])
-            let canonical = phrase.lowercased()
-            if usedCanonical.insert(canonical).inserted {
-                coveredRanges.append(range)
-                selected.append((
-                    display,
-                    canonical,
-                    response.distance(from: response.startIndex, to: range.lowerBound),
-                    100
-                ))
-            }
-        }
-
-        let philosophicalTerms: Set<String> = [
-            "analogy", "causality", "conscience", "essence", "existence", "flourishing",
-            "intellect", "justice", "metaphysics", "morality", "ontology", "participation",
-            "potentiality", "prudence", "reason", "teleology", "temperance", "virtue",
-            "wisdom"
-        ]
-        let regex = try? NSRegularExpression(
-            pattern: #"\b[\p{L}][\p{L}'’\-]{4,}\b"#
-        )
-        let fullRange = NSRange(response.startIndex..., in: response)
-        var words: [String: (display: String, count: Int, location: Int)] = [:]
-        regex?.enumerateMatches(in: response, range: fullRange) { match, _, _ in
-            guard let match,
-                  let range = Range(match.range, in: response) else {
-                return
-            }
-            let display = String(response[range])
-            let canonical = display.folding(
-                options: [.caseInsensitive, .diacriticInsensitive],
-                locale: .current
-            )
-            .lowercased()
-            guard philosophicalTerms.contains(canonical),
-                  !usedCanonical.contains(canonical) else {
-                return
-            }
-            let location = response.distance(
-                from: response.startIndex,
-                to: range.lowerBound
-            )
-            if let current = words[canonical] {
-                words[canonical] = (
-                    current.display,
-                    current.count + 1,
-                    current.location
-                )
-            } else {
-                words[canonical] = (display, 1, location)
-            }
-        }
-
-        selected.append(contentsOf: words.map { canonical, value in
-            let score = (philosophicalTerms.contains(canonical) ? 30 : 0)
-                + min(canonical.count, 16)
-                + min(value.count, 4) * 3
-            return (value.display, canonical, value.location, score)
-        })
-
-        return selected
-            .sorted {
-                $0.score == $1.score
-                    ? $0.location < $1.location
-                    : $0.score > $1.score
-            }
-            .prefix(5)
-            .map { candidate in
-                KeyTerm(
-                    displayText: candidate.display,
-                    canonicalTerm: candidate.canonical,
-                    contextExcerpt: contextExcerpt(
-                        containing: candidate.display,
-                        in: response
-                    )
-                )
-            }
     }
 
     static func sanitizedVisibleText(_ raw: String) -> String {

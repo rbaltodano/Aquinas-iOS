@@ -991,30 +991,6 @@ struct StudyTopicDetailView: View {
                                 .frame(maxWidth: .infinity)
                                 .animation(.spring(response: 0.34, dampingFraction: 0.86), value: normalizedTopicSearchText)
                             }
-
-                            Button(action: {
-                                onTopicTouched()
-                                isExistingConversationPickerOpen = true
-                            }) {
-                                HStack(spacing: 8) {
-                                    Image(systemName: "plus")
-                                        .font(.system(size: 10, weight: .bold))
-                                        .sfSymbolDrawOn()
-                                    Text("Add Existing Conversation")
-                                        .font(.custom("Figtree-Regular", size: 14))
-                                }
-                                .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.5))
-                                .frame(maxWidth: .infinity)
-                                .padding(24)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 28, style: .continuous)
-                                        .stroke(
-                                            AquinasTheme.Colors.darkText.opacity(0.15),
-                                            style: StrokeStyle(lineWidth: 1, dash: [5, 4])
-                                        )
-                                    )
-                            }
-                            .buttonStyle(.plain)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.top, 24)

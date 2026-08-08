@@ -11,6 +11,7 @@ import UIKit
 /// The compact disclaimer and copy control shown beneath every completed model response.
 struct ModelResponseFooter: View {
     let copyText: String
+    var responseTextAlignment: ResponseTextAlignmentOption = .left
 
     @State private var showsCopiedConfirmation = false
 
@@ -33,7 +34,7 @@ struct ModelResponseFooter: View {
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
     }
 
     private func copyResponse() {

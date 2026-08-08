@@ -227,9 +227,18 @@ struct ContentView: View {
     @State private var newConversationInsightQuoteRequest: NewConversationInsightQuoteRequest? = nil
     @State private var studyTopicTreeSelectionRequest: StudyTopicTreeSelectionRequest? = nil
     @State private var newConversationRequest: Int = 0
+    /// Must be owned here, not as local `@State` inside `CurrentConversationView` — that view
+    /// gets torn down and recreated on every page switch, so a locally-reset "handled" counter
+    /// would forget it had already handled a request. `newConversationRequest` itself lives at
+    /// this same app-shell level and persists for the whole session; once it's been incremented
+    /// even once, a freshly-reset local counter would never match it again, causing every later
+    /// remount of the conversation page to spuriously fire `startNewConversation()` — discarding
+    /// whatever conversation had just correctly loaded, including one still mid-generation.
+    @State private var handledNewConversationRequest: Int = 0
     @State private var pendingNewConversationQuestion: String = ""
     @State private var pendingNewConversationEyebrow: String = ""
     @State private var pendingNewConversationPromptContext: String = ""
+    @State private var pendingNewConversationSubtitle: String = ""
     @State private var newConversationTopicID: UUID? = nil
     @State private var newConversationIsStudyTopic: Bool = false
     @State private var deletedConversationID: UUID? = nil
@@ -238,10 +247,14 @@ struct ContentView: View {
     @AppStorage("aquinas.settings.userName") private var userName: String = ""
     @AppStorage(SettingsStorageKey.customInstructions) private var customInstructions: String = ""
     @State private var globalInsightSelectionRequest: Int = 0
+    /// Set when returning to the global Insight Tree after removing a quoted Insight's chip
+    /// from a conversation's composer — the tree hovers/selects this Insight on appear.
+    @State private var globalInsightRestoreSelectionID: UUID? = nil
     @State private var globalInsightClearSelectionRequest: Int = 0
     @State private var globalInsightDismissHoverRequest: Int = 0
     @State private var globalInsightCreateConceptRequest: Int = 0
-    @State private var globalInsightPromotedIDs: [UUID] = []
+    @State private var globalInsightPromotedIDs: [UUID] =
+        GlobalInsightPromotedIDsStore.load()
     @State private var globalInsightInquireConnectionRequest: Int = 0
     @State private var globalInsightMidpointEnterRequest: Int = 0
     @State private var globalInsightMidpointCenterRequest: Int = 0
@@ -258,6 +271,8 @@ struct ContentView: View {
     @State private var globalInsightIsPersonalityMenuOpen: Bool = false
     @State private var globalInsightHighlightedBridge: (UUID, UUID)? = nil
     @State private var globalInsightHighlightRequest: Int = 0
+    @State private var globalInsightHighlightedNodeID: UUID? = nil
+    @State private var globalInsightNodeFocusRequest: Int = 0
     @State private var globalInsightIsSearchActive: Bool = false
     @State private var globalInsightSearchQuery: String = ""
     @State private var globalInsightSearchResultIndex: Int = 0
@@ -271,6 +286,11 @@ struct ContentView: View {
     @State private var questionOfTheDay = HomeQuestionOfTheDayStore.loadPending()
     @State private var dailyQuestionRefreshTask: Task<Void, Never>? = nil
     @State private var isDailyQuestionGenerationErrorPresented: Bool = false
+    @State private var homeLooseThread: LooseThreadCard? = nil
+    @State private var homeTodayInHistory: TodayInHistoryCard? = nil
+    @State private var homeGlossedTerm: GlossedTermCard? = nil
+    @State private var homeYourQuote: YourQuoteCard? = nil
+    @Environment(\.homeBackendService) private var homeBackendService
     @AppStorage("aquinas.settings.conversationFontSize") private var conversationFontSize: ConversationFontSizeOption = .small
     @AppStorage("aquinas.settings.inputTextAlignment") private var inputTextAlignment: InputTextAlignmentOption = .center
     @AppStorage("aquinas.settings.inputFont") private var inputFont: ConversationFontOption = .serif
@@ -345,6 +365,9 @@ struct ContentView: View {
             clearSelectionRequest: globalInsightClearSelectionRequest,
             dismissHoverRequest: globalInsightDismissHoverRequest,
             createConceptRequest: globalInsightCreateConceptRequest,
+            restoreSelectedInsightID: globalInsightRestoreSelectionID,
+            restoreSelectedNodeID: globalInsightHighlightedNodeID,
+            nodeSelectionRequest: globalInsightNodeFocusRequest,
             promotedInsightIDs: globalInsightPromotedIDs,
             onRemoveInsight: { def in
                 withAnimation {
@@ -377,7 +400,10 @@ struct ContentView: View {
             onSelectionStateChange: { globalInsightHasCanvasHover = $0 },
             onInsightSelectionStateChange: { globalInsightHasInsightHover = $0 },
             onSelectedCanvasItemCountChange: { globalInsightSelectedItemCount = $0 },
-            onPromotedInsightIDsChange: { globalInsightPromotedIDs = $0 },
+            onPromotedInsightIDsChange: {
+                globalInsightPromotedIDs = $0
+                GlobalInsightPromotedIDsStore.save($0)
+            },
             savedConceptIDs: Set(collectedDefinitions.map(\.id)),
             onToggleSavedConcept: { concept in
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
@@ -533,16 +559,23 @@ struct ContentView: View {
                 studyTopicTreeSelectionRequest = request
                 activePage = .studyTopics
             },
+            onReturnToGlobalInsights: { insight in
+                globalInsightRestoreSelectionID = insight.id
+                activePage = .insights
+            },
             onQuestionOfTheDayAnswered: markQuestionOfTheDayAnswered,
+            onTodayInHistoryAnswered: markTodayInHistoryAnswered,
             collectedDefinitions: $collectedDefinitions,
             sideMenuConversations: $sideMenuConversations,
             sideMenuCurrentTitle: $sideMenuCurrentTitle,
             sideMenuActiveConversationID: $sideMenuActiveConversationID,
             requestedConversationID: $requestedConversationID,
             newConversationRequest: $newConversationRequest,
+            handledNewConversationRequest: $handledNewConversationRequest,
             pendingNewConversationQuestion: $pendingNewConversationQuestion,
             pendingNewConversationEyebrow: $pendingNewConversationEyebrow,
             pendingNewConversationPromptContext: $pendingNewConversationPromptContext,
+            pendingNewConversationSubtitle: $pendingNewConversationSubtitle,
             newConversationTopicID: $newConversationTopicID,
             newConversationIsStudyTopic: $newConversationIsStudyTopic,
             deletedConversationID: $deletedConversationID,
@@ -592,6 +625,10 @@ struct ContentView: View {
                                     savedInsights: collectedDefinitions,
                                     userName: userName,
                                     questionOfTheDay: questionOfTheDay,
+                                    looseThread: homeLooseThread,
+                                    todayInHistory: homeTodayInHistory,
+                                    glossedTerm: homeGlossedTerm,
+                                    yourQuote: homeYourQuote,
                                     onOpenMenu: {
                                         dismissKeyboard()
                                         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
@@ -619,7 +656,23 @@ struct ContentView: View {
                                         globalInsightHighlightRequest += 1
                                         activePage = .insights
                                     },
-                                    onRefresh: refreshPersistedContent
+                                    onFocusNode: { nodeID in
+                                        globalInsightHighlightedNodeID = nodeID
+                                        globalInsightNodeFocusRequest += 1
+                                        activePage = .insights
+                                    },
+                                    onStartTodayInHistory: { card in
+                                        pendingNewConversationQuestion = card.title
+                                        pendingNewConversationEyebrow = "TODAY IN HISTORY"
+                                        pendingNewConversationPromptContext = card.taggedPromptContext
+                                        pendingNewConversationSubtitle = card.description
+                                        newConversationRequest += 1
+                                        activePage = .conversation
+                                    },
+                                    onRefresh: refreshPersistedContent,
+                                    onLoadHomeSections: {
+                                        Task { await refreshHomeSections() }
+                                    }
                                 )
                                 .safeAreaInset(edge: .bottom) {
                                     PageModelControls(
@@ -1123,6 +1176,15 @@ struct ContentView: View {
         .onChange(of: modelTasks.isBusy) { _, _ in
             scheduleDailyQuestionRefreshIfNeeded()
         }
+        // Mirrors CurrentConversationView's identical interlock for its own per-conversation
+        // Insight Tree — the Global tree had the same "both open at once" gap since nothing here
+        // reacted to a hover starting after the Model Tasks popup was already open.
+        .onChange(of: globalInsightHasInsightHover) { _, isHoveringInsight in
+            guard isHoveringInsight else { return }
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                modelTasksPopupState.reset()
+            }
+        }
         .onChange(of: modelTasks.latestCompletedTask) { _, completedTask in
             guard let completedTask, completedTask.originPage != .insights else { return }
             suppressGlobalTreePromptUntilExternalModelCompletion = false
@@ -1192,6 +1254,14 @@ struct ContentView: View {
             self.questionOfTheDay = nil
         }
         scheduleDailyQuestionRefreshIfNeeded()
+    }
+
+    private func markTodayInHistoryAnswered() {
+        guard homeTodayInHistory != nil else { return }
+        HomeTodayInHistoryStore.markAnswered()
+        withAnimation(.easeInOut(duration: 0.25)) {
+            homeTodayInHistory = nil
+        }
     }
 
     private func scheduleDailyQuestionRefreshIfNeeded(
@@ -1356,6 +1426,37 @@ struct ContentView: View {
         }
 
         collectedDefinitions = InsightLibraryStore.load()
+    }
+
+    /// Fetches the four backend-driven Home sections. Fail-quiet like every other background
+    /// fetch in this codebase: a `nil` result (whether from a backend "nothing qualifies" `null`
+    /// or a network failure) simply means that section doesn't render -- no error state, no retry.
+    private func refreshHomeSections() async {
+        guard AquinasBackendConfiguration.canRecoverFromCurrentDevice,
+              let conversationID = HomeSectionSourceSelector.selectConversationID(
+                conversations: sideMenuConversations,
+                activeConversationID: sideMenuActiveConversationID
+              ) else {
+            return
+        }
+
+        async let looseThread = try? homeBackendService.looseThread(conversationID: conversationID)
+        async let todayInHistory = try? homeBackendService.todayInHistory(
+            conversationID: conversationID,
+            overrideDate: nil
+        )
+        async let glossedTerm = try? homeBackendService.glossedTerm(conversationID: conversationID)
+        async let yourQuote = try? homeBackendService.yourQuote(conversationID: conversationID)
+
+        let (resolvedLooseThread, resolvedTodayInHistory, resolvedGlossedTerm, resolvedYourQuote) =
+            await (looseThread, todayInHistory, glossedTerm, yourQuote)
+
+        withAnimation(.easeInOut(duration: 0.35)) {
+            homeLooseThread = resolvedLooseThread ?? nil
+            homeTodayInHistory = HomeTodayInHistoryStore.isAnswered() ? nil : (resolvedTodayInHistory ?? nil)
+            homeGlossedTerm = resolvedGlossedTerm ?? nil
+            homeYourQuote = resolvedYourQuote ?? nil
+        }
     }
 
     private func askGlobalInsightInNewConversation() {

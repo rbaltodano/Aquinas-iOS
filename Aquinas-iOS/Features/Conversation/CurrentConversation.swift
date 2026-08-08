@@ -23,16 +23,29 @@ struct CurrentConversationView: View {
     var onCanvasModeChange: (Bool) -> Void = { _ in }
     var onRequestConversationPage: () -> Void = {}
     var onReturnToStudyTopicTree: (StudyTopicTreeSelectionRequest) -> Void = { _ in }
+    /// Mirrors `onReturnToStudyTopicTree` for an Insight quoted from the global Insight Tree
+    /// (`topicID == nil`) rather than a Study Topic's — removing the quoted chip should land
+    /// back on that same tree with the Insight hovered, not just clear the composer.
+    var onReturnToGlobalInsights: (ConceptDefinition) -> Void = { _ in }
     var onQuestionOfTheDayAnswered: () -> Void = {}
+    var onTodayInHistoryAnswered: () -> Void = {}
     @Binding var collectedDefinitions:         [ConceptDefinition]
     @Binding var sideMenuConversations:        [InquiryConversation]
     @Binding var sideMenuCurrentTitle:         String
     @Binding var sideMenuActiveConversationID: UUID?
     @Binding var requestedConversationID:      UUID?
     @Binding var newConversationRequest:       Int
+    /// Owned by ContentView, not local state here — see its declaration for why: this view is
+    /// torn down and recreated on every page switch, so a locally-reset counter would forget
+    /// it had already handled a request and spuriously re-fire `startNewConversation()` on
+    /// every later remount once `newConversationRequest` had ever been incremented.
+    @Binding var handledNewConversationRequest: Int
     @Binding var pendingNewConversationQuestion: String
     @Binding var pendingNewConversationEyebrow: String
     @Binding var pendingNewConversationPromptContext: String
+    /// Visible paragraph shown beneath the header title (e.g. a Today in History description) --
+    /// distinct from `pendingNewConversationPromptContext`, which the model sees but never renders.
+    @Binding var pendingNewConversationSubtitle: String
     /// Set by ContentView before incrementing `newConversationRequest` when the
     /// user taps "New Conversation" inside a study topic. The new conversation
     /// is tagged with this ID, then the binding is cleared.
@@ -61,13 +74,13 @@ struct CurrentConversationView: View {
     @Environment(\.aquinasModel) private var aquinasModel
     @Environment(\.embeddingProvider) private var embeddingProvider
     @Environment(\.insightTreeService) private var insightTreeService
+    @Environment(\.homeBackendService) private var homeBackendService
     @Environment(\.modelCompletionNotifications) private var modelCompletionNotifications
     @Environment(\.scenePhase) private var scenePhase
 
     // MARK: Conversation list (source of truth for side menu)
     @State private var conversations: [InquiryConversation] = []
     @State private var activeConversationID: UUID? = nil
-    @State private var handledNewConversationRequest: Int = 0
 
     // MARK: Branch state (working copy of the active conversation's branches)
     @State private var activeBranches: [ChatBranch] = [ChatBranch(startingConcept: nil)]
@@ -122,6 +135,7 @@ struct CurrentConversationView: View {
     @State private var pendingResponseCount: Int = 0
     @State private var activeEmptyPromptEyebrow: String = ""
     @State private var activeEmptyPromptQuestion: String = ""
+    @State private var activeEmptyPromptSubtitle: String = ""
     @Binding var uploadedFiles: [UploadedFile]
     @State private var targetSpawnY: CGFloat = 300
     @State private var targetSpawnResponseIndex: Int? = nil
@@ -311,6 +325,26 @@ struct CurrentConversationView: View {
             )
         )
         scheduleInsightTreeUpdateAfterIdle()
+    }
+
+    /// The explicit user-flag path for "Your Own Quote" -- fire-and-forget, no UI feedback beyond
+    /// the context menu itself dismissing, matching this codebase's fail-quiet background-fetch
+    /// convention (see `HomeBackendService`).
+    private func flagQuote(_ questionText: String, branchID: UUID, responseIndex: Int) {
+        guard let conversationID = activeConversationID,
+              AquinasBackendConfiguration.canRecoverFromCurrentDevice else {
+            return
+        }
+        let responseID = stableUUID(
+            from: "flag-quote:v1:\(conversationID.uuidString):\(branchID.uuidString):\(responseIndex)"
+        )
+        Task {
+            try? await homeBackendService.flagQuote(
+                conversationID: conversationID,
+                responseID: responseID,
+                quoteText: questionText
+            )
+        }
     }
 
     /// Waits for 5s of idle time — same debounce window the backend queue uses — before
@@ -760,7 +794,7 @@ struct CurrentConversationView: View {
         }
 
         switchToConversation(conversation)
-        pendingStudyTopicQuoteReturn = request.topicID == nil ? nil : request
+        pendingStudyTopicQuoteReturn = request
         insightConversationQuoteRequest = nil
         quoteConceptIntoCurrentConversation(request.insight)
         Task {
@@ -770,16 +804,19 @@ struct CurrentConversationView: View {
     }
 
     private func returnToStudyTopicTreeAfterQuoteCancellation() {
-        guard let request = pendingStudyTopicQuoteReturn,
-              let topicID = request.topicID else { return }
+        guard let request = pendingStudyTopicQuoteReturn else { return }
         pendingStudyTopicQuoteReturn = nil
         attachedConcept = nil
-        onReturnToStudyTopicTree(
-            StudyTopicTreeSelectionRequest(
-                topicID: topicID,
-                insightID: request.insight.id
+        if let topicID = request.topicID {
+            onReturnToStudyTopicTree(
+                StudyTopicTreeSelectionRequest(
+                    topicID: topicID,
+                    insightID: request.insight.id
+                )
             )
-        )
+        } else {
+            onReturnToGlobalInsights(request.insight)
+        }
     }
 
     @ViewBuilder
@@ -1150,9 +1187,23 @@ struct CurrentConversationView: View {
         }
         // MARK: - Persistence / conversation management
         .onAppear {
-            if let snapshot = CurrentConversationsStore.load(), !snapshot.conversations.isEmpty {
+            let loadedSnapshot = CurrentConversationsStore.load()
+            if let snapshot = loadedSnapshot, !snapshot.conversations.isEmpty {
                 conversations = snapshot.conversations
-                let targetID = snapshot.activeConversationID ?? snapshot.conversations.first?.id
+                // `openModelTaskPage` (tapping a task in the Model Tasks popup from a different
+                // page) sets `requestedConversationID` *before* this view is even created, so
+                // the `.onChange(of: requestedConversationID)` below never fires for it — that
+                // only catches a value set while this view is already mounted. Without this
+                // check, a fresh mount always fell back to whatever was last persisted as
+                // active, silently ignoring which conversation the tapped task actually belongs
+                // to (surfacing as "tapping the task opens a different/blank conversation").
+                let requestedID = requestedConversationID
+                if let requestedID {
+                    requestedConversationID = nil
+                }
+                let targetID = requestedID
+                    ?? snapshot.activeConversationID
+                    ?? snapshot.conversations.first?.id
                 if let id = targetID, let convo = snapshot.conversations.first(where: { $0.id == id }) {
                     activeConversationID = id
                     activeBranches = convo.branches.isEmpty ? [ChatBranch(startingConcept: nil)] : convo.branches
@@ -1418,6 +1469,7 @@ struct CurrentConversationView: View {
                         conversationForTopicPicker = conversations.first { $0.id == activeConversationID }
                     },
                     emptyStatePromptQuestion: activeEmptyPromptQuestion,
+                    emptyStatePromptSubtitle: activeEmptyPromptSubtitle,
                     showsThinkingIntro: true,
                     conversationTitle: activeTitle,
                     onSpawnYChange: { _, _ in },
@@ -1444,11 +1496,15 @@ struct CurrentConversationView: View {
                         lastFocusedAnchor = "top-input-anchor-\(b.id)"
                     },
                     onTopQuestionSubmitted: {
-                        guard b.parentBranchID == nil,
-                              activeEmptyPromptEyebrow == "QUESTION OF THE DAY" else {
-                            return
+                        guard b.parentBranchID == nil else { return }
+                        switch activeEmptyPromptEyebrow {
+                        case "QUESTION OF THE DAY":
+                            onQuestionOfTheDayAnswered()
+                        case "TODAY IN HISTORY":
+                            onTodayInHistoryAnswered()
+                        default:
+                            break
                         }
-                        onQuestionOfTheDayAnswered()
                     },
                     onBottomInputFocused: {
                         lastFocusedAnchor = "bottom-input-anchor-\(b.id)"
@@ -1533,6 +1589,9 @@ struct CurrentConversationView: View {
                     },
                     onInlineInsightToggleSaved: { concept in
                         toggleSavedConcept(concept)
+                    },
+                    onFlagQuote: { questionText, responseIndex in
+                        flagQuote(questionText, branchID: b.id, responseIndex: responseIndex)
                     }
                 )
                 .padding(.horizontal, 36)
@@ -1817,6 +1876,7 @@ struct CurrentConversationView: View {
         canvasMode.promotedCanvasInsightIDs = conversation.promotedInsightIDs
         activeEmptyPromptEyebrow = ""
         activeEmptyPromptQuestion = ""
+        activeEmptyPromptSubtitle = ""
         publishShellMenuState()
         persistConversations()
         scrollToBottomAfterLayout()
@@ -1835,6 +1895,7 @@ struct CurrentConversationView: View {
         undiscoveredInsightCount = 0
         activeEmptyPromptEyebrow = ""
         activeEmptyPromptQuestion = ""
+        activeEmptyPromptSubtitle = ""
         canvasMode.promotedCanvasInsightIDs = []
         attachedConcept = nil
         uploadedFiles.removeAll()
@@ -1873,36 +1934,64 @@ struct CurrentConversationView: View {
         let pendingPromptContext = pendingNewConversationPromptContext.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
+        let pendingSubtitle = pendingNewConversationSubtitle.trimmingCharacters(in: .whitespacesAndNewlines)
         pendingNewConversationQuestion = ""
         pendingNewConversationEyebrow = ""
         pendingNewConversationPromptContext = ""
-        let freshBranch = ChatBranch(
+        pendingNewConversationSubtitle = ""
+        var freshBranch = ChatBranch(
             startingConcept: nil,
             hiddenPromptContext: pendingPromptContext.isEmpty ? nil : pendingPromptContext
         )
-        let fresh = InquiryConversation(isStudyTopic: isStudyTopic, studyTopicID: topicID)
+        if ["QUESTION OF THE DAY", "TODAY IN HISTORY"].contains(pendingEyebrow), !pendingQuestion.isEmpty {
+            freshBranch.pinnedHeaderQuestion = pendingQuestion
+        }
+        var fresh = InquiryConversation(isStudyTopic: isStudyTopic, studyTopicID: topicID)
+        if let pinned = freshBranch.pinnedHeaderQuestion {
+            fresh.title = pinned
+        }
         conversations.insert(fresh, at: 0)
         activeConversationID = fresh.id
         manuallySavedConversationInsightIDs = []
         activeBranches = [freshBranch]
         activeEmptyPromptEyebrow = pendingEyebrow
         activeEmptyPromptQuestion = pendingQuestion
+        activeEmptyPromptSubtitle = pendingSubtitle
         displayedContextWordCount = 0
         hasTextToSubmit = false
         canvasMode.promotedCanvasInsightIDs = []
         focusedBranchID = activeBranches.first?.id
         if let quoteRequest = newConversationInsightQuoteRequest {
             attachedConcept = quoteRequest.insight
-            if let returnTopicID = quoteRequest.topicID {
-                pendingStudyTopicQuoteReturn = InsightConversationQuoteRequest(
-                    topicID: returnTopicID,
-                    conversationID: fresh.id,
-                    insight: quoteRequest.insight
-                )
-            } else {
-                pendingStudyTopicQuoteReturn = nil
-            }
+            // Set regardless of whether this came from a Study Topic or the global Insight
+            // Tree (`topicID` nil either way is fine — `InsightConversationQuoteRequest`
+            // already models it as optional) — removing the quoted chip should return to
+            // whichever tree it came from with the Insight hovered; see
+            // `returnToStudyTopicTreeAfterQuoteCancellation`'s topicID branch.
+            pendingStudyTopicQuoteReturn = InsightConversationQuoteRequest(
+                topicID: quoteRequest.topicID,
+                conversationID: fresh.id,
+                insight: quoteRequest.insight
+            )
             newConversationInsightQuoteRequest = nil
+
+            // Seed the on-device Insight Tree fallback from the quoted Insight itself rather
+            // than waiting for the first question's answer to generate one — the quoted
+            // Insight already *is* this conversation's subject. The first answer's own
+            // new-subject check (embedding similarity against existing seeds) naturally skips
+            // adding a redundant second seed when it's about the same thing, so this doesn't
+            // need any special-casing on that side.
+            let quotedConcept = quoteRequest.insight
+            LocalInsightTreeSeedStore.appendSeed(
+                LocalInsightTreeSeed(
+                    id: UUID(),
+                    label: quotedConcept.word,
+                    summary: quotedConcept.semanticDefinition,
+                    embedding: computeEmbedding(for: "\(quotedConcept.word). \(quotedConcept.semanticDefinition)"),
+                    createdAt: Date()
+                ),
+                for: fresh.id
+            )
         }
         publishShellMenuState()
         persistConversations()

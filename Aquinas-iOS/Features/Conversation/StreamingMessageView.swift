@@ -460,7 +460,8 @@ struct StreamingMessageView: View {
 
     private var responseFooter: some View {
         ModelResponseFooter(
-            copyText: InlineInsightMarkup.plainText(from: fullText)
+            copyText: InlineInsightMarkup.plainText(from: fullText),
+            responseTextAlignment: responseTextAlignment
         )
         .transition(
             .move(edge: .top)

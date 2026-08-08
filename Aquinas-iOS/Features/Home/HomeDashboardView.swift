@@ -13,12 +13,19 @@ struct HomeDashboardView: View {
     let savedInsights: [ConceptDefinition]
     let userName: String
     let questionOfTheDay: HomeQuestionOfTheDay?
+    let looseThread: LooseThreadCard?
+    let todayInHistory: TodayInHistoryCard?
+    let glossedTerm: GlossedTermCard?
+    let yourQuote: YourQuoteCard?
     var onOpenMenu: () -> Void
     var onSelectConversation: (InquiryConversation) -> Void
     var onNewConversation: () -> Void
     var onStartQuestion: (HomeQuestionOfTheDay) -> Void
     var onOpenInsightBridge: (UUID, UUID) -> Void
+    var onFocusNode: (UUID) -> Void = { _ in }
+    var onStartTodayInHistory: (TodayInHistoryCard) -> Void = { _ in }
     var onRefresh: () -> Void = {}
+    var onLoadHomeSections: () -> Void = {}
 
     @State private var studyTopics: [StudyTopic] = []
     @State private var usageMonth = MonthlyUsageStore.currentMonth()
@@ -60,19 +67,23 @@ struct HomeDashboardView: View {
                     Color.clear.frame(height: 57)
 
                     VStack(alignment: .leading, spacing: 48) {
+                        if let todayInHistory {
+                            HomeTodayInHistorySection(
+                                card: todayInHistory,
+                                onStartConversation: { onStartTodayInHistory(todayInHistory) }
+                            )
+                        }
+
                         HomeFigmaOpeningSection(
                             greeting: HomeDashboardContent.greeting(),
                             userName: displayUserName,
-                            subtitle: HomeDashboardContent.subtitle(
-                                conversationCount: regularConversations.count,
-                                insightCount: savedInsights.count
-                            ),
                             month: usageMonth,
                             conversationCount: regularConversations.count,
                             insightCount: savedInsights.count,
                             studyTopicCount: studyTopics.count,
                             unfinishedCount: unfinishedConversations.count,
                             questionOfTheDay: questionOfTheDay,
+                            hidesGreetingHeader: todayInHistory != nil,
                             onStartQuestion: onStartQuestion
                         )
 
@@ -106,6 +117,30 @@ struct HomeDashboardView: View {
                             HomeFigmaDivider()
                         }
 
+                        if let looseThread {
+                            HomeLooseThreadSection(
+                                card: looseThread,
+                                onOpen: { onFocusNode(looseThread.nodeID) }
+                            )
+
+                            HomeFigmaDivider()
+                        }
+
+                        if let glossedTerm {
+                            HomeGlossedTermSection(
+                                card: glossedTerm,
+                                onOpen: { activeInsight = glossedTerm.asConceptDefinition }
+                            )
+
+                            HomeFigmaDivider()
+                        }
+
+                        if let yourQuote {
+                            HomeYourQuoteSection(card: yourQuote)
+
+                            HomeFigmaDivider()
+                        }
+
                         HomeFigmaReadingSection(items: Array(HomeDashboardContent.furtherStudyItems.prefix(3)))
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -128,6 +163,7 @@ struct HomeDashboardView: View {
             MonthlyUsageStore.recordVisitIfNeeded()
             usageMonth = MonthlyUsageStore.currentMonth()
             studyTopics = StudyTopicStore.load()
+            onLoadHomeSections()
         }
         .sheet(item: $activeInsight) { insight in
             ConceptSheetContent(concept: insight, collectedDefinitions: .constant(savedInsights))
@@ -141,6 +177,7 @@ struct HomeDashboardView: View {
         usageMonth = MonthlyUsageStore.currentMonth()
         studyTopics = StudyTopicStore.load()
         onRefresh()
+        onLoadHomeSections()
     }
 }
 
@@ -149,19 +186,19 @@ struct HomeDashboardView: View {
 private struct HomeFigmaOpeningSection: View {
     let greeting: String
     let userName: String
-    let subtitle: String
     let month: MonthlyUsageMonth
     let conversationCount: Int
     let insightCount: Int
     let studyTopicCount: Int
     let unfinishedCount: Int
     let questionOfTheDay: HomeQuestionOfTheDay?
+    var hidesGreetingHeader: Bool = false
     var onStartQuestion: (HomeQuestionOfTheDay) -> Void
 
     var body: some View {
         VStack(alignment: .center, spacing: 84) {
             VStack(alignment: .center, spacing: 48) {
-                VStack(alignment: .leading, spacing: 8) {
+                if !hidesGreetingHeader {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(HomeDashboardContent.todayString())
                             .font(AquinasTheme.Typography.uiLabel)
@@ -176,13 +213,9 @@ private struct HomeFigmaOpeningSection: View {
                         }
                         .foregroundColor(AquinasTheme.Colors.primaryReadable)
                     }
-
-                    Text(subtitle)
-                        .font(AquinasTheme.Typography.body)
-                        .foregroundColor(AquinasTheme.Colors.placeholderText)
-                        .lineSpacing(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.opacity)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
 
                 HStack(alignment: .center, spacing: 24) {
                     HomeFigmaUsageGrid(month: month)
@@ -377,6 +410,151 @@ private struct HomeInsightBridgeLabel: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct HomeLooseThreadSection: View {
+    let card: LooseThreadCard
+    var onOpen: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            HomeFigmaSectionTitle("Loose Thread")
+
+            Button(action: onOpen) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(card.nodeLabel)
+                        .font(AquinasTheme.Typography.uiHeading)
+                        .foregroundColor(AquinasTheme.Colors.primaryReadable)
+
+                    Text(
+                        card.insightCount == 1
+                            ? "One Insight lives here, but it hasn't connected to anything else in your tree yet."
+                            : "\(card.insightCount) Insights live here, but nothing has connected to them yet."
+                    )
+                    .font(AquinasTheme.Typography.body)
+                    .foregroundColor(AquinasTheme.Colors.paragraphText)
+                    .lineSpacing(7)
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(AquinasTheme.Colors.canvasSecondary)
+                .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .stroke(AquinasTheme.Colors.quietBorder, lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
+
+private struct HomeTodayInHistorySection: View {
+    let card: TodayInHistoryCard
+    var onStartConversation: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("TODAY IN HISTORY")
+                    .font(AquinasTheme.Typography.uiLabel)
+                    .foregroundColor(AquinasTheme.Colors.lightGreen)
+
+                Text(card.title)
+                    .font(.custom("LibreBaskerville-Regular", size: 28))
+                    .foregroundColor(AquinasTheme.Colors.primaryReadable)
+            }
+
+            Text(card.description)
+                .font(AquinasTheme.Typography.body)
+                .foregroundColor(AquinasTheme.Colors.paragraphText)
+                .lineSpacing(7)
+
+            Button(action: onStartConversation) {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.turn.down.right")
+                        .font(.system(size: 12, weight: .bold))
+
+                    Text("Tell me more...")
+                        .font(AquinasTheme.Typography.body)
+                        .fontWeight(.bold)
+                }
+                .foregroundColor(AquinasTheme.Colors.canvas)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 16)
+                .background(AquinasTheme.Colors.lightGreen)
+                .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct HomeGlossedTermSection: View {
+    let card: GlossedTermCard
+    var onOpen: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            HomeFigmaSectionTitle("Terms You Glossed Over")
+
+            Button(action: onOpen) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(card.title)
+                        .font(AquinasTheme.Typography.uiHeading)
+                        .foregroundColor(AquinasTheme.Colors.primaryReadable)
+
+                    Text(card.definition)
+                        .font(AquinasTheme.Typography.body)
+                        .foregroundColor(AquinasTheme.Colors.paragraphText)
+                        .lineSpacing(7)
+                        .lineLimit(3)
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(AquinasTheme.Colors.canvasSecondary)
+                .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .stroke(AquinasTheme.Colors.quietBorder, lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
+
+private struct HomeYourQuoteSection: View {
+    let card: YourQuoteCard
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("QUOTE FROM YOU")
+                .font(AquinasTheme.Typography.uiLabel)
+                .foregroundColor(AquinasTheme.Colors.lightGreen)
+
+            Text("\"\(card.quoteText)\"")
+                .font(.custom("LibreBaskerville-Regular", size: 18))
+                .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                .lineSpacing(7)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private extension GlossedTermCard {
+    var asConceptDefinition: ConceptDefinition {
+        ConceptDefinition(
+            id: ConceptDefinition.stableID(forTerm: title),
+            word: title,
+            partOfSpeech: partOfSpeech,
+            pronunciation: pronunciation,
+            meaning: definition,
+            example: example,
+            context: context
+        )
     }
 }
 
@@ -592,18 +770,6 @@ private enum HomeDashboardContent {
         default:
             return "Good Evening"
         }
-    }
-
-    nonisolated static func subtitle(conversationCount: Int, insightCount: Int) -> String {
-        if conversationCount == 0 {
-            return "Begin with a question and let the study unfold from there."
-        }
-
-        if insightCount == 0 {
-            return "It seems like a good time to jump back in on your studies. You have been learning a lot recently, keep it up!"
-        }
-
-        return "It seems like a good time to jump back in on your studies. You have been learning a lot recently, keep it up!"
     }
 
     nonisolated static func todayString(date: Date = Date()) -> String {

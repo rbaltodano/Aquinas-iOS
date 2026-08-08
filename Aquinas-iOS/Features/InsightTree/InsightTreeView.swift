@@ -20,6 +20,8 @@ struct InsightTreeView: View {
     var dismissHoverRequest: Int = 0
     var createConceptRequest: Int = 0
     var restoreSelectedInsightID: UUID? = nil
+    var restoreSelectedNodeID: UUID? = nil
+    var nodeSelectionRequest: Int = 0
     var promotedInsightIDs: [UUID] = []
     var onClose: (() -> Void)?
     var onRemoveInsight:  ((ConceptDefinition) -> Void)? = nil
@@ -123,6 +125,8 @@ struct InsightTreeView: View {
         dismissHoverRequest: Int = 0,
         createConceptRequest: Int = 0,
         restoreSelectedInsightID: UUID? = nil,
+        restoreSelectedNodeID: UUID? = nil,
+        nodeSelectionRequest: Int = 0,
         promotedInsightIDs: [UUID] = [],
         onClose: (() -> Void)? = nil,
         onRemoveInsight:  ((ConceptDefinition) -> Void)? = nil,
@@ -171,6 +175,8 @@ struct InsightTreeView: View {
         self.dismissHoverRequest   = dismissHoverRequest
         self.createConceptRequest  = createConceptRequest
         self.restoreSelectedInsightID = restoreSelectedInsightID
+        self.restoreSelectedNodeID = restoreSelectedNodeID
+        self.nodeSelectionRequest  = nodeSelectionRequest
         self.promotedInsightIDs    = promotedInsightIDs
         self.onClose               = onClose
         self.onRemoveInsight       = onRemoveInsight
@@ -215,7 +221,8 @@ struct InsightTreeView: View {
             showsAllClusterInsights: conversationID == nil,
             model: model,
             embeddingProvider: embeddingProvider,
-            localSeedAnchors: initialLocalSeedAnchors
+            localSeedAnchors: initialLocalSeedAnchors,
+            midpointStoreScope: conversationID
         ))
     }
 
@@ -404,16 +411,7 @@ struct InsightTreeView: View {
                             animateIn: animateMidpointCardText,
                             linkedInsights: makeNodeLinkInsights,
                             onToggleSaved: {
-                                let wasSaved = savedConceptIDs.contains(selectedInsight.id)
                                 onToggleSavedConcept?(concept(for: selectedInsight))
-                                // Midpoint blends are synthesized on the fly and auto-bookmarked
-                                // (see placeMidpointInsight) — unlike a term saved from real
-                                // conversation content, nothing else anchors it to the tree, so
-                                // un-saving it IS "get rid of it": also remove the placed node.
-                                if wasSaved, viewModel.placedMidpointNodeIDs.contains(selectedInsight.id) {
-                                    viewModel.removePlacedMidpoint(id: selectedInsight.id)
-                                    dismissDockedInsight()
-                                }
                             },
                             onRemove: { pendingRemoveInsight = selectedInsight },
                             onFork:   { performForkInsight(selectedInsight) },
@@ -540,6 +538,27 @@ struct InsightTreeView: View {
         .onChange(of: promotedInsightIDs) { _, newValue in
             viewModel.updateInsights(insights, promotedInsightIDs: newValue)
         }
+        // A placed Midpoint is auto-bookmarked and has nothing else anchoring it to the tree, so
+        // un-saving it from ANY bookmark toggle — not just the docked card on this canvas — must
+        // remove its node too. `savedConceptIDs` is fed by whatever saved-insights store the host
+        // (global tree or a conversation) owns, so this reacts uniformly regardless of where the
+        // un-save happened (e.g. the Insight Library popup, which mutates that store directly).
+        //
+        // Must only react to an actual save -> unsave transition (present in `oldValue`, gone
+        // from `newValue`) rather than "just not currently saved" — a Midpoint's placeholder
+        // node exists and is generating for a few seconds *before* it gets auto-bookmarked, so
+        // it's legitimately absent from `savedConceptIDs` during that window. Reacting to mere
+        // absence tore down still-generating placeholders out from under their own generation
+        // task the moment anything else touched the saved-insights set.
+        .onChange(of: savedConceptIDs) { oldValue, newValue in
+            for placedID in viewModel.placedMidpointNodeIDs
+            where oldValue.contains(placedID) && !newValue.contains(placedID) {
+                viewModel.removePlacedMidpoint(id: placedID)
+                if selectedInsight?.id == placedID {
+                    dismissDockedInsight()
+                }
+            }
+        }
         .onChange(of: selectionRequest) { _, _ in
             selectHoveredCanvasTarget()
         }
@@ -554,6 +573,9 @@ struct InsightTreeView: View {
         }
         .onChange(of: restoreSelectedInsightID) { _, _ in
             restoreRequestedInsightSelection()
+        }
+        .onChange(of: nodeSelectionRequest) { _, _ in
+            restoreRequestedNodeSelection()
         }
         .onChange(of: inquireConnectionRequest) { _, _ in
             performInquireConnection()
@@ -584,6 +606,7 @@ struct InsightTreeView: View {
                 highlightInsightPair()
             }
             restoreRequestedInsightSelection()
+            restoreRequestedNodeSelection()
         }
         .task(id: conversationID) {
             enqueuePersistedTreeLoad(animateChanges: false)
@@ -646,6 +669,17 @@ struct InsightTreeView: View {
             return
         }
         showInsightCard(insight)
+    }
+
+    private func restoreRequestedNodeSelection() {
+        guard let restoreSelectedNodeID,
+              let node = viewModel.nodes.first(where: { $0.id == restoreSelectedNodeID }) else {
+            return
+        }
+        showNodeCard(node)
+        if let firstInsight = node.insights.first {
+            focusedInsightID = firstInsight.id
+        }
     }
 
     private func showInsightCard(_ insight: InsightModel, animateText: Bool = false, moveCamera: Bool = true) {

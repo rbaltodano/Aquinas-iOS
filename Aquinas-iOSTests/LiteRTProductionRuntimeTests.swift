@@ -195,6 +195,28 @@ struct LiteRTProductionRuntimeTests {
         #expect(response.keyTerms.map(\.displayText) == ["First Council of Constantinople"])
     }
 
+    @MainActor
+    @Test("Inline markers become key terms with no separate recall step")
+    func inlineMarkersBecomeKeyTerms() {
+        let raw = "Aquinas distinguishes {{essence}} from {{existence}} to explain change."
+        let (text, keyTerms) = LiteRTAquinasModel.inlineAnnotatedResponse(from: raw)
+
+        #expect(text == "Aquinas distinguishes essence from existence to explain change.")
+        #expect(keyTerms.map(\.displayText) == ["essence", "existence"])
+        #expect(keyTerms.allSatisfy { text.contains($0.displayText) })
+    }
+
+    @MainActor
+    @Test("An unterminated inline marker is dropped, not leaked into the answer")
+    func unterminatedInlineMarkerIsDropped() {
+        let raw = "Aquinas distinguishes {{essence}} from exis{{tence"
+        let (text, keyTerms) = LiteRTAquinasModel.inlineAnnotatedResponse(from: raw)
+
+        #expect(text == "Aquinas distinguishes essence from exis")
+        #expect(!text.contains("{{"))
+        #expect(keyTerms.map(\.displayText) == ["essence"])
+    }
+
     @Test("Generation guard rejects exact repetitive loops")
     func generationGuardRejectsRepetitiveLoops() {
         let sentence = "Prudence directs practical reason toward the right action in a concrete circumstance"
@@ -458,7 +480,9 @@ struct LiteRTProductionRuntimeTests {
         )
         #expect(response.thinkingSummary == fallback)
         #expect(!response.text.contains("thinking_summary"))
-        #expect(response.keyTerms.map(\.displayText) == ["First Council of Constantinople"])
+        // No heuristic fallback fills in key terms anymore — only the model's own inline
+        // {{markers}} do, and truncated/malformed JSON never went through that path.
+        #expect(response.keyTerms.isEmpty)
     }
 
     @MainActor

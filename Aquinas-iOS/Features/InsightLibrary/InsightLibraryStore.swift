@@ -64,6 +64,28 @@ enum GlobalInsightTreeStore {
     }
 }
 
+/// Which Insights the Global Insight Tree has promoted into their own Node Concept via Make Node.
+/// A per-conversation tree gets this for free through its own conversation snapshot
+/// (`InquiryConversation.promotedInsightIDs`); the Global tree has no equivalent owning snapshot,
+/// so without this a Make Node promotion reverted the moment the tree view was recreated (e.g.
+/// navigating away and back) even though the promoted Insight's saved bookmark itself persisted.
+enum GlobalInsightPromotedIDsStore {
+    private static let storeKey = "aquinas.global-insight-tree.promoted-ids.v1"
+
+    static func load() -> [UUID] {
+        guard let data = UserDefaults.standard.data(forKey: storeKey),
+              let ids = try? JSONDecoder().decode([UUID].self, from: data) else {
+            return []
+        }
+        return ids
+    }
+
+    static func save(_ ids: [UUID]) {
+        guard let data = try? JSONEncoder().encode(ids) else { return }
+        UserDefaults.standard.set(data, forKey: storeKey)
+    }
+}
+
 extension Array where Element == ConceptDefinition {
     func uniquedByWord() -> [ConceptDefinition] {
         var indexByWord: [String: Int] = [:]

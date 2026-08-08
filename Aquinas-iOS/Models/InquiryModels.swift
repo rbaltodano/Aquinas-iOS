@@ -32,6 +32,10 @@ struct ChatBranch: Identifiable, Codable, Equatable {
     var compactedThroughBlockCount: Int? = nil
     /// Invisible product context attached to special entry points such as Question of the Day.
     var hiddenPromptContext: String? = nil
+    /// The literal question text pinned as this branch's big header title (e.g. the Question of
+    /// the Day prompt), permanently — independent of the conversation's own title, which can be
+    /// renamed or auto-generated afterward without changing what's shown here.
+    var pinnedHeaderQuestion: String? = nil
     /// Persisted user-facing approach summaries for completed model responses. Optional so
     /// conversations saved before this metadata existed continue to decode.
     var responsePresentations: [ResponsePresentationMetadata]? = nil

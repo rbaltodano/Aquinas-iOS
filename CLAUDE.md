@@ -17,24 +17,43 @@ remaining implementation order.
 The live app is local-first when a verified LiteRT-LM package is available.
 `AquinasApplicationRuntime` owns one process-scoped `LiteRTAquinasRuntime`, injects the same
 runtime into `LiteRTAquinasModel` and `ModelTaskQueue`, and preserves serialized lifecycle,
-streaming, and cancellation semantics. Ordinary local conversation generates visible prose only.
-A separate short structured pass selects `key_terms`; the adapter validates exact term/excerpt
-matches before adding tappable links, and metadata failure cannot replace or leak into the answer.
-While generation is incomplete, the UI reports progress without
-presenting canned text as model reasoning. The completed public approach summary is persisted in
-the branch and remains available through **Show Thinking** after view recreation or relaunch.
-Ordinary conversation stays deterministic because sampled decoding corrupts this 4-bit
-checkpoint; structured application operations are also deterministic. Foundational and
-interesting key terms come from the validated payload, with heuristic extraction used only when
-the checkpoint fails the JSON contract, while
-direct definition requests return Insight metadata. Special actions remain neutral and use
-validated structured outputs. A non-cancellation local failure gets one local recovery attempt;
+streaming, and cancellation semantics. Ordinary local conversation is a single generation call:
+the model writes the visible prose answer and marks the foundational/clarification-worthy
+concepts inline as it writes, wrapping just that word or short term in `{{double curly braces}}`
+exactly where it occurs. `LiteRTAquinasModel.inlineAnnotatedResponse` strips those markers back
+out and turns each into a `KeyTerm`. Because the marker is removed in place — the surrounding
+prose never moves — `displayText` is always an exact substring of the final answer by
+construction, so there is no separate "recall this exactly" step for the model to get wrong the
+way a second structured JSON pass repeatedly did. That two-pass design (full prose answer, then a
+second full generation call re-reading it to produce a `key_terms` JSON array) and the
+deterministic `NLTagger`/curated-vocabulary heuristic that briefly replaced it are both retired:
+highlighting is solely the model's own in-context judgment on that single pass. An answer can
+legitimately carry zero highlighted terms — nothing forces highlights onto an answer that doesn't
+warrant any — and metadata can never replace, truncate, or leak into the visible answer, since
+stripping the markers is how the visible text is produced in the first place, not a downstream
+validation step that can fail open or closed. While generation is incomplete, the UI reports
+progress without presenting canned text as model reasoning. The completed public approach summary
+is persisted in the branch and remains available through **Show Thinking** after view recreation
+or relaunch. Ordinary conversation stays deterministic because sampled decoding corrupts this
+4-bit checkpoint; structured application operations are also deterministic. Direct definition
+requests return Insight metadata. Special actions remain neutral and use validated structured
+outputs. A non-cancellation local failure gets one local recovery attempt;
 substantial separated phrase repetition and mixed-script token corruption are rejected.
 When a repeated tail is detected, the runtime preserves the coherent prefix instead of discarding
 the entire draft. Do not restore prompt-forced word targets or automatic short-answer retries: the
 exact package entered slow rejected loops under that experiment.
 LiteRT-LM currently emits the generated text only after native decoding finishes, so generation
 has no automatic time cutoff; the Model Task Stop action remains available to the user.
+The vendored `Vendor/LiteRTLM/swift/Engine.swift`/`Conversation.swift` wrapper (not upstream
+pristine — a locally-modified SPM bump, safe to patch) runs `createConversation`, engine
+initialization, and both types' native `deinit` teardown on a dedicated, disposable `Thread`
+rather than directly on the `Engine`/`LiteRTAquinasRuntime` actor's own executor. A confirmed
+upstream deadlock (`DEADLINE_EXCEEDED` in the native library's single-worker
+`callback_thread_pool`, surfaced via live device console capture) can hang any of these calls
+indefinitely; run on the actor's executor, a hang there permanently consumes one of the app's few
+Swift Concurrency cooperative-pool threads, which can starve every other actor-isolated task in
+the app — including the generation stall watchdog that exists specifically to detect and recover
+from this exact hang. Never move this logic back onto the actor's own executor.
 The Thinking summary is an app-generated public approach description, never private model
 reasoning or chain-of-thought. It must describe the relevant concepts or checks without pretending
 to expose hidden scratch work.
@@ -60,6 +79,34 @@ physical-device loopback URL, iOS skips and clears unreachable tree-analysis job
 persisted-tree entrance gate, and displays the limited local fallback instead of staying on
 `Mapping…`. This fallback is not MiniLM parity; use a reachable Mac LAN URL during development or
 port MiniLM plus assignment/persistence on-device for full offline behavior.
+
+The on-device fallback's Node-seeding pipeline (`LocalInsightTreeSeedStore`,
+`insightTreeSeedCandidate`, `enqueueLocalInsightTreeSeedingTask`) asks the model to extract a
+turn's main subject (label + summary) unconditionally, every turn — it no longer asks the model to
+judge for itself whether that subject is "genuinely new." That self-judgment (`new_subject:
+true/false` in the same call) was tried first and found unreliable and order-dependent: comparing
+the same two subjects in one order the model correctly detected a pivot, in the reverse order on a
+fresh conversation it didn't. The "is this actually new" decision is now made deterministically by
+the caller via on-device `NLEmbedding` cosine similarity against the Node Concepts already seeded
+for that conversation (`newSubjectThreshold`, currently `0.60`) — below it counts as new and gets
+appended; at or above it, the turn is already covered and no seed is added. Quoting an Insight into
+a new conversation seeds this store from that Insight immediately (`startNewConversation`) rather
+than waiting on the first answer to generate one.
+
+Local seed Nodes are fed into `InsightTreeViewModel.makeClusteredTree` as pre-existing anchor
+clusters (`setLocalSeedAnchors`) rather than rendered through a separate `applyPersistedTree`
+snapshot. An earlier version used `applyPersistedTree` for this, which permanently switches the
+view model into backend-tree rendering mode; a saved Insight afterward would render once, then the
+next seed update (or even just reopening the tree) would silently replace it with the bare
+Node-only snapshot again, or vice versa — the two paths fought over which one owned the tree.
+Routing both through the same clustering pass means a saved Insight close enough to a seeded
+subject attaches under it like a real backend Node would, and one that isn't buds off into its own
+cluster, using the same `localMembershipThreshold` (currently `0.60`; raised from MiniLM's default
+`0.40` after on-device `NLEmbedding` was observed clustering distinct Bible/theology subjects
+together at that lower bar). `InsightTreeViewModel`'s local-seed-aware `init` reads
+`LocalInsightTreeSeedStore` synchronously at construction rather than only through the async
+`.task`-driven load, so a fresh mount doesn't render a guaranteed blank-then-populated flash before
+the seed catches up.
 
 The fine-tuned Aquinas package is 2,722,385,120 bytes with SHA-256
 `5cb26c8e29d52ecf3e2b651e590761fe593dddcab0cbcdac7dc0692605ee5569`. The production
@@ -140,6 +187,17 @@ reimplement these contracts without checking the integration document.
   retain their separate relatedness mapping.
 - Model Task and hovered Insight cards use the shared bottom-up scale/translation transition;
   switching hovered Insights replaces the card rather than swapping its text in place.
+- Removing a quoted Insight's chip from the composer (`pendingStudyTopicQuoteReturn`, despite the
+  name) returns to whichever tree it was quoted from — a Study Topic tree or the global Insight
+  Tree — with that Insight hovered, rather than just clearing the chip. `topicID == nil` on the
+  quote request routes to `onReturnToGlobalInsights`; non-nil routes to the existing
+  `onReturnToStudyTopicTree`.
+- The Home Question of the Day's source conversation is chosen deterministically
+  (`DailyQuestionSourceSelector`), not randomly: Study Topic conversations are excluded, the
+  currently active conversation is tried first, then the rest ordered by most-recently-created;
+  within each, the first branch with both a real question and a ≥80-character answer wins. Cited
+  Insights are scoped to that same chosen conversation's own concept words, matched against saved
+  Insights.
 
 ## Sibling repos (context lives outside this repo)
 
@@ -151,10 +209,13 @@ reimplement these contracts without checking the integration document.
 ## Build & verify
 
 ```sh
-xcodebuild -project Aquinas-iOS.xcodeproj -scheme Aquinas-iOS -destination 'generic/platform=iOS Simulator' build
+xcodebuild -project Aquinas-iOS.xcodeproj -scheme Aquinas-iOS -destination 'platform=iOS Simulator,name=iPhone 17' build
 ```
 
-The exact bundled fine-tuned LiteRT package supports the arm64 iOS Simulator. Launching with
+The bundled LiteRT xcframework only ships an arm64 simulator slice, so `generic/platform=iOS
+Simulator` fails to link (it also targets x86_64). Always build against a concrete arm64
+simulator destination, not the generic one. The exact bundled fine-tuned LiteRT package supports
+the arm64 iOS Simulator. Launching with
 `--litert-probe --litert-probe-auto` verifies local inference on an Apple-silicon Mac without a
 phone cable. Use simulator results for answer-quality iteration, but keep final sustained thermal,
 memory, and lifecycle checks on the base supported iPhone.
@@ -175,6 +236,21 @@ uses `BackendAquinasModel` at `127.0.0.1`; release builds ignore the flag.
 - Feature UI lives under `Aquinas-iOS/Features/<Feature>/` (Conversation, Home, InsightTree, InsightLibrary, StudyTopics, Settings, Canvas).
 
 ## Important code seams
+
+`ContentView` conditionally mounts `CurrentConversationView` only while `displayedPage ==
+.conversation`; every other page switch fully tears it down and later recreates it, so any `@State`
+that needs to survive a page switch (a pending navigation target, a "have I already handled this
+request" counter) must be owned by `ContentView` and passed down as a `@Binding`, never declared as
+local `@State` inside the conversation view itself. Two real bugs came from this: a fresh mount's
+`.onAppear` used to pick the conversation purely from what was last persisted as active, ignoring a
+pending `requestedConversationID` set before the view existed (fixed by checking it first); and
+`handledNewConversationRequest` was local `@State`, defaulting to `0` on every remount, while the
+`newConversationRequest` counter it's compared against is shared and persists for the whole app
+session — once that counter had been incremented even once, every later remount spuriously
+re-fired `startNewConversation()`, silently replacing whatever conversation had just correctly
+loaded, including one still mid-generation. The underlying generation itself is unaffected by any
+of this — it's owned by the shell-level `ModelTaskQueue`, not the view — but the completion
+handlers a torn-down instance registered can still write into now-disconnected state.
 
 - `Features/Conversation/CurrentConversation.swift` — conversation orchestration, slash-command
   execution, definition cache/queue flow, and durable tree-analysis retries.
@@ -197,3 +273,5 @@ uses `BackendAquinasModel` at `127.0.0.1`; release builds ignore the flag.
 - `Persistence/ConversationInsightMembershipStore.swift` — identifiers connecting global saved
   Insights to a conversation.
 - `Persistence/InsightTreeAnalysisQueue.swift` — identifiers-only durable response-analysis queue.
+- `Persistence/LocalInsightTreeSeedStore.swift` — on-device Node Concept seeds (label, summary,
+  `NLEmbedding` vector) per conversation, used only when the backend-owned tree is unreachable.
