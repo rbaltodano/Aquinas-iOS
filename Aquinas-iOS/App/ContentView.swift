@@ -204,6 +204,8 @@ struct ContentView: View {
     @State private var suppressGlobalTreePromptUntilExternalModelCompletion: Bool = false
     @State private var activePage: AppPage = .home
     @State private var displayedPage: AppPage = .home
+    @State private var hasAppliedStartupDestination = false
+    @State private var appLockController = AppLockController()
     @State private var isPageContentVisible: Bool = true
     @State private var pageContentOffsetY: CGFloat = 0
     @State private var pendingPageTransitionWorkItem: DispatchWorkItem? = nil
@@ -246,6 +248,13 @@ struct ContentView: View {
     @State private var requestedForkConcept: ConceptDefinition? = nil
     @AppStorage("aquinas.settings.userName") private var userName: String = ""
     @AppStorage(SettingsStorageKey.customInstructions) private var customInstructions: String = ""
+    @AppStorage(SettingsStorageKey.defaultStartScreen)
+    private var defaultStartScreen: DefaultStartScreenOption = .home
+    @AppStorage(SettingsStorageKey.appLock) private var appLockEnabled = false
+    @AppStorage(SettingsStorageKey.appLockGracePeriod)
+    private var appLockGracePeriod: AppLockGracePeriodOption = .immediately
+    @AppStorage(SettingsStorageKey.conversationTitles)
+    private var conversationTitlePolicy: ConversationTitleOption = .automatic
     @State private var globalInsightSelectionRequest: Int = 0
     /// Set when returning to the global Insight Tree after removing a quoted Insight's chip
     /// from a conversation's composer — the tree hovers/selects this Insight on appear.
@@ -356,6 +365,54 @@ struct ContentView: View {
         }
         guard activePage != page else { return }
         activePage = page
+    }
+
+    private func postConversationCompletionNotificationIfNeeded(
+        for task: ModelTaskSnapshot
+    ) {
+        guard case .userQuestion(let branchID, let responseIndex) = task.kind,
+              let conversationID = task.conversationID else {
+            return
+        }
+
+        let isViewingCompletedConversation = activePage == .conversation
+            && sideMenuActiveConversationID == conversationID
+        guard !isViewingCompletedConversation else { return }
+
+        let conversation = CurrentConversationsStore.load()?.conversations.first(where: {
+            $0.id == conversationID
+        }) ?? sideMenuConversations.first(where: { $0.id == conversationID })
+        let completedQuestion = conversation?
+            .branches
+            .first(where: { $0.id == branchID })
+            .flatMap { branch in
+                branch.activeChatBlocks
+                    .prefix(min(responseIndex, branch.activeChatBlocks.count))
+                    .reversed()
+                    .compactMap { block -> String? in
+                        guard case .user(let question, _, _) = block else { return nil }
+                        let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return trimmed.isEmpty ? nil : trimmed
+                    }
+                    .first
+                    ?? {
+                        let trimmed = branch.topQuestionText.trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        )
+                        return trimmed.isEmpty ? nil : trimmed
+                    }()
+            }
+        let fallbackTitle = conversation?.title.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        let notificationTitle = completedQuestion
+            ?? fallbackTitle.flatMap { $0.isEmpty ? nil : $0 }
+            ?? "Answer ready"
+
+        modelCompletionNotifications.post(title: notificationTitle) {
+            requestedConversationID = conversationID
+            activePage = .conversation
+        }
     }
 
     @ViewBuilder private var insightTreePage: some View {
@@ -587,6 +644,7 @@ struct ContentView: View {
             inputFont: inputFont,
             responseTextAlignment: responseTextAlignment,
             responseFont: responseFont,
+            conversationTitlePolicy: conversationTitlePolicy,
             conversationPersonality: $conversationPersonality,
             userName: userName,
             isPageVisible: activePage == .conversation,
@@ -1118,6 +1176,16 @@ struct ContentView: View {
                     .zIndex(1000)
                     .animation(.spring(response: 0.42, dampingFraction: 0.84), value: isGlobalSideMenuOpen)
 
+                if appLockEnabled,
+                   appLockController.isLocked || scenePhase != .active {
+                    AppLockGate(
+                        isAuthenticating: appLockController.isAuthenticating,
+                        errorMessage: appLockController.errorMessage,
+                        onUnlock: appLockController.lockAndAuthenticate
+                    )
+                    .zIndex(2000)
+                }
+
             }
             .ignoresSafeArea(.container, edges: .bottom)
         }
@@ -1145,9 +1213,11 @@ struct ContentView: View {
                 ProcessInfo.processInfo.thermalState.modelRuntimePressure
             )
             loadShellConversationState()
+            applyStartupDestinationIfNeeded()
             displayedPage = activePage
             isPageContentVisible = true
             pageContentOffsetY = 0
+            appLockController.prepare(isEnabled: appLockEnabled)
             let savedInsights = InsightLibraryStore.load()
             if !savedInsights.isEmpty {
                 collectedDefinitions = savedInsights
@@ -1186,7 +1256,9 @@ struct ContentView: View {
             }
         }
         .onChange(of: modelTasks.latestCompletedTask) { _, completedTask in
-            guard let completedTask, completedTask.originPage != .insights else { return }
+            guard let completedTask else { return }
+            postConversationCompletionNotificationIfNeeded(for: completedTask)
+            guard completedTask.originPage != .insights else { return }
             suppressGlobalTreePromptUntilExternalModelCompletion = false
             guard activePage == .insights else { return }
             refreshGlobalInsightTreeUpdatePrompt()
@@ -1201,8 +1273,16 @@ struct ContentView: View {
             scheduleDailyQuestionRefreshIfNeeded()
         }
         .onChange(of: scenePhase) { _, phase in
+            appLockController.scenePhaseDidChange(
+                phase,
+                isEnabled: appLockEnabled,
+                gracePeriod: appLockGracePeriod.duration
+            )
             modelTasks.setApplicationActive(phase == .active)
             scheduleDailyQuestionRefreshIfNeeded()
+        }
+        .onChange(of: appLockEnabled) { _, isEnabled in
+            appLockController.settingDidChange(isEnabled: isEnabled)
         }
         .onReceive(
             NotificationCenter.default.publisher(
@@ -1219,6 +1299,13 @@ struct ContentView: View {
             modelTasks.updateThermalPressure(
                 ProcessInfo.processInfo.thermalState.modelRuntimePressure
             )
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: .aquinasConversationStoreDidImport
+            )
+        ) { _ in
+            loadShellConversationState()
         }
         .onChange(of: collectedDefinitions) { oldValue, newValue in
             InsightLibraryStore.save(newValue)
@@ -1413,6 +1500,27 @@ struct ContentView: View {
         sideMenuCurrentTitle = activeID.flatMap { id in
             snapshot.conversations.first { $0.id == id }?.title
         } ?? snapshot.conversations.first?.title ?? "New Conversation"
+    }
+
+    private func applyStartupDestinationIfNeeded() {
+        guard !hasAppliedStartupDestination else { return }
+        hasAppliedStartupDestination = true
+
+        let action = AppStartupPolicy.resolve(
+            preference: defaultStartScreen,
+            conversationIDs: sideMenuConversations.map(\.id),
+            activeConversationID: sideMenuActiveConversationID
+        )
+        switch action {
+        case .home:
+            activePage = .home
+        case .openConversation(let conversationID):
+            requestedConversationID = conversationID
+            activePage = .conversation
+        case .newConversation:
+            newConversationRequest += 1
+            activePage = .conversation
+        }
     }
 
     private func refreshPersistedContent() {

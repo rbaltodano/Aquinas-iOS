@@ -129,6 +129,11 @@ struct ModelResponseCard: View {
         _showTitle = State(initialValue: !shouldAnimateOnAppear)
         _showResponseContent = State(initialValue: !shouldAnimateOnAppear)
         _thinkingStartedAt = State(initialValue: Date())
+        // A restored response is already fully presented. Its StreamingMessageView starts with
+        // every word visible and therefore does not run the reveal task or call `onFinish`.
+        // Treat it as finished up front so a timer/token footer from the interrupted renderer
+        // cannot survive a navigate-away / navigate-back cycle.
+        _isResponseFullyRevealed = State(initialValue: !shouldAnimateOnAppear)
     }
 
     var body: some View {

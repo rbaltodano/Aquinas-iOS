@@ -499,9 +499,6 @@ private struct ModelControlsStack<Controls: View>: View {
                         width: controlsWidth,
                         onOpen: {
                             completionNotifications.open(id: notification.id)
-                        },
-                        onDismiss: {
-                            completionNotifications.dismiss(id: notification.id)
                         }
                     )
                     .transition(.bottomDockCard)
@@ -624,47 +621,44 @@ private struct ModelCompletionNotificationPill: View {
     let title: String
     let width: CGFloat
     let onOpen: () -> Void
-    let onDismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 8) {
-            Button(action: onOpen) {
-                HStack(spacing: 8) {
-                    Image("InsightNotificationIcon")
+        Button(action: onOpen) {
+            HStack(spacing: 8) {
+                HStack(spacing: 4) {
+                    Image("QuestionNotificationIcon")
                         .renderingMode(.template)
                         .resizable()
-                        .foregroundStyle(AquinasTheme.Colors.lightGreen)
-                        .frame(width: 12, height: 12)
+                        .foregroundStyle(AquinasTheme.Colors.headingText)
+                        .frame(width: 14, height: 14)
 
                     Text(title)
                         .font(AquinasTheme.Typography.uiLabel)
-                        .foregroundStyle(AquinasTheme.Colors.lightGreen)
+                        .foregroundStyle(AquinasTheme.Colors.paragraphText)
                         .lineLimit(1)
                         .truncationMode(.tail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: 238, alignment: .leading)
 
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(AquinasTheme.Colors.paragraphText)
-                    .frame(width: 24, height: 24)
-                    .contentShape(Rectangle())
+                Spacer(minLength: 0)
+
+                Text("View", comment: "Action that opens a completed question's answer.")
+                    .font(AquinasTheme.Typography.uiLabel)
+                    .foregroundStyle(AquinasTheme.Colors.headingText)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Dismiss notification")
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .accessibilityLabel("View completed question: \(title)")
         .padding(.horizontal, 24)
-        .padding(.vertical, 16)
-        .frame(width: width)
+        .frame(width: width, height: 50)
         .background(AquinasTheme.Colors.canvasSecondary)
         .clipShape(Capsule())
-        .accessibilityElement(children: .contain)
+        .overlay {
+            Capsule()
+                .stroke(AquinasTheme.Colors.darkBrown.opacity(0.08), lineWidth: 1)
+        }
     }
 }
 

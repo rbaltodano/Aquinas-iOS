@@ -669,12 +669,7 @@ struct OpenConversationCard: View {
                 }
             }
 
-            Text(latestAnswer)
-                .font(.custom("Figtree-Regular", size: 14))
-                .foregroundColor(AquinasTheme.Colors.paragraphText)
-                .lineSpacing(5)
-                .lineLimit(2)
-                .truncationMode(.tail)
+            ConversationCardAnswerText(answer: latestAnswer)
 
             if !insights.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
@@ -734,6 +729,93 @@ struct OpenConversationCard: View {
         onAddToStudyTopic != nil ||
         onRemoveFromStudyTopic != nil ||
         onDelete != nil
+    }
+}
+
+/// Renders the short answer preview without exposing persisted `aq://` Markdown or the local
+/// model's `{{term}}` generation markers. Conversation cards are intentionally non-interactive;
+/// highlighted terms communicate the same Insight affordance while the card tap opens the full
+/// conversation.
+private struct ConversationCardAnswerText: View {
+    let answer: String
+
+    var body: some View {
+        Text(
+            ConversationCardAnswerFormatting.attributedText(
+                from: answer,
+                highlightColor: AquinasTheme.Colors.lightGreen
+            )
+        )
+        .font(.custom("Figtree-Regular", size: 14))
+        .foregroundColor(AquinasTheme.Colors.paragraphText)
+        .lineSpacing(5)
+        .lineLimit(2)
+        .truncationMode(.tail)
+    }
+}
+
+enum ConversationCardAnswerFormatting {
+    enum Segment: Equatable {
+        case plain(String)
+        case insight(String)
+    }
+
+    private static let insightMarkup = try! NSRegularExpression(
+        pattern: #"\*{0,2}\[([^\]]+)\]\(aq://[^)]+\)\*{0,2}|\*{0,2}\{\{([^{}]+)\}\}\*{0,2}"#
+    )
+
+    static func segments(from answer: String) -> [Segment] {
+        let visibleAnswer = InlineInsightMarkup.plainText(from: answer)
+        let fullRange = NSRange(visibleAnswer.startIndex..., in: visibleAnswer)
+        let matches = insightMarkup.matches(in: visibleAnswer, range: fullRange)
+        var segments: [Segment] = []
+        var cursor = visibleAnswer.startIndex
+
+        for match in matches {
+            guard let matchRange = Range(match.range(at: 0), in: visibleAnswer) else {
+                continue
+            }
+            appendPlain(String(visibleAnswer[cursor..<matchRange.lowerBound]), to: &segments)
+
+            let titleRange = match.range(at: 1).location != NSNotFound
+                ? match.range(at: 1)
+                : match.range(at: 2)
+            if let titleRange = Range(titleRange, in: visibleAnswer) {
+                segments.append(.insight(String(visibleAnswer[titleRange])))
+            }
+            cursor = matchRange.upperBound
+        }
+
+        appendPlain(String(visibleAnswer[cursor...]), to: &segments)
+        return segments
+    }
+
+    static func attributedText(from answer: String, highlightColor: Color) -> AttributedString {
+        var result = AttributedString()
+        for segment in segments(from: answer) {
+            switch segment {
+            case .plain(let text):
+                result.append(AttributedString(text))
+            case .insight(let text):
+                var highlighted = AttributedString(text)
+                highlighted.foregroundColor = highlightColor
+                highlighted.underlineStyle = .single
+                result.append(highlighted)
+            }
+        }
+        return result
+    }
+
+    private static func appendPlain(_ text: String, to segments: inout [Segment]) {
+        let cleaned = text
+            .replacingOccurrences(of: "{{", with: "")
+            .replacingOccurrences(of: "}}", with: "")
+        guard !cleaned.isEmpty else { return }
+        if case .plain(let previous) = segments.last {
+            segments[segments.count - 1] = .plain(previous + cleaned)
+        } else {
+            segments.append(.plain(cleaned))
+        }
     }
 }
 

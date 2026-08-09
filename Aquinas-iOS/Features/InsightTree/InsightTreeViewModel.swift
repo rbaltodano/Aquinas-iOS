@@ -84,14 +84,10 @@ final class InsightTreeViewModel: ObservableObject {
     /// Insight actually added or removed; everyone else's Node stays exactly where it was.
     private var insightClusterAssignments: [UUID: UUID] = [:]
     private static let insightClusterAssignmentStoreKey = "aquinas.insight-tree.insight-cluster-assignments.v1"
-    /// Minimum cosine similarity (on-device `NLEmbedding` space) for an Insight to attach to an
-    /// existing cluster/Node rather than spawning its own. Started at 0.40 (matching the
-    /// backend's default MiniLM membership threshold), but observed on-device to cluster
-    /// genuinely distinct Bible/theology subjects together anyway (e.g. Insights about the Book
-    /// of Joshua attaching under a "Council of Florence" Node) — this smaller on-device
-    /// embedding model apparently carries a higher baseline similarity across shared-domain
-    /// content than MiniLM does, so the same numeric threshold doesn't transfer.
-    private let localMembershipThreshold = 0.60
+    /// Minimum cosine similarity for an Insight to attach to an existing local Node. The bundled
+    /// provider is MiniLM, matching the backend embedding space. This value is centralized as a
+    /// calibration constant so real-conversation evaluation can change it without touching layout.
+    private let localMembershipThreshold = InsightTreeSemanticPolicy.membershipSimilarity
     /// On-device Node Concepts seeded from a conversation's questions (see
     /// `LocalInsightTreeSeedStore`), used only when the backend-owned persisted tree is
     /// unreachable. Fed into `makeClusteredTree` as pre-existing anchor clusters rather than a
@@ -1287,11 +1283,10 @@ final class InsightTreeViewModel: ObservableObject {
     /// this pair (`loadStoredPositions`/`persistPositions`) rather than replacing the value
     /// outright, or one tree's rebuild silently wipes every other tree's saved positions.
     private static func loadStoredPositions(storageKey: String) -> [String: CodablePoint] {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let positions = try? JSONDecoder().decode([String: CodablePoint].self, from: data) else {
-            return [:]
-        }
-        return positions
+        InsightTreeLocalStateStore.load(
+            [String: CodablePoint].self,
+            key: storageKey
+        ) ?? [:]
     }
 
     private func restoredPosition(for id: UUID) -> CGPoint? {
@@ -1303,16 +1298,14 @@ final class InsightTreeViewModel: ObservableObject {
         for node in nodes {
             positions[node.id.uuidString] = CodablePoint(node.position)
         }
-        if let data = try? JSONEncoder().encode(positions) {
-            UserDefaults.standard.set(data, forKey: positionStoreKey)
-        }
+        InsightTreeLocalStateStore.save(positions, key: positionStoreKey)
     }
 
     private static func loadClusterLabels(storageKey: String) -> [UUID: String] {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let stored = try? JSONDecoder().decode([String: String].self, from: data) else {
-            return [:]
-        }
+        guard let stored = InsightTreeLocalStateStore.load(
+            [String: String].self,
+            key: storageKey
+        ) else { return [:] }
         return stored.reduce(into: [:]) { result, entry in
             guard let id = UUID(uuidString: entry.key) else { return }
             result[id] = entry.value
@@ -1325,8 +1318,7 @@ final class InsightTreeViewModel: ObservableObject {
                 ($0.key.uuidString, $0.value)
             }
         )
-        guard let data = try? JSONEncoder().encode(stored) else { return }
-        UserDefaults.standard.set(data, forKey: Self.clusterLabelStoreKey)
+        InsightTreeLocalStateStore.save(stored, key: Self.clusterLabelStoreKey)
     }
 
     private func persistClusterDefinitions() {
@@ -1335,15 +1327,14 @@ final class InsightTreeViewModel: ObservableObject {
                 ($0.key.uuidString, $0.value)
             }
         )
-        guard let data = try? JSONEncoder().encode(stored) else { return }
-        UserDefaults.standard.set(data, forKey: Self.clusterDefinitionStoreKey)
+        InsightTreeLocalStateStore.save(stored, key: Self.clusterDefinitionStoreKey)
     }
 
     private static func loadUUIDMapping(storageKey: String) -> [UUID: UUID] {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let stored = try? JSONDecoder().decode([String: String].self, from: data) else {
-            return [:]
-        }
+        guard let stored = InsightTreeLocalStateStore.load(
+            [String: String].self,
+            key: storageKey
+        ) else { return [:] }
         return stored.reduce(into: [:]) { result, entry in
             guard let key = UUID(uuidString: entry.key), let value = UUID(uuidString: entry.value) else { return }
             result[key] = value
@@ -1356,8 +1347,10 @@ final class InsightTreeViewModel: ObservableObject {
                 ($0.key.uuidString, $0.value.uuidString)
             }
         )
-        guard let data = try? JSONEncoder().encode(stored) else { return }
-        UserDefaults.standard.set(data, forKey: Self.insightClusterAssignmentStoreKey)
+        InsightTreeLocalStateStore.save(
+            stored,
+            key: Self.insightClusterAssignmentStoreKey
+        )
     }
 
     /// Placed Midpoints previously lived only in memory — reopening the tree (navigating away and
@@ -1366,10 +1359,10 @@ final class InsightTreeViewModel: ObservableObject {
     /// staying a pinned node connected to its two sources. Persisting them the same way positions
     /// and cluster labels already are fixes that.
     private static func loadPlacedMidpoints(storageKey: String) -> [PlacedMidpoint] {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let stored = try? JSONDecoder().decode([CodablePlacedMidpoint].self, from: data) else {
-            return []
-        }
+        guard let stored = InsightTreeLocalStateStore.load(
+            [CodablePlacedMidpoint].self,
+            key: storageKey
+        ) else { return [] }
         return stored.map {
             PlacedMidpoint(concept: $0.concept, position: $0.position.cgPoint, sources: $0.sources)
         }
@@ -1379,15 +1372,14 @@ final class InsightTreeViewModel: ObservableObject {
         let stored = placedMidpoints.map {
             CodablePlacedMidpoint(concept: $0.concept, position: CodablePoint($0.position), sources: $0.sources)
         }
-        guard let data = try? JSONEncoder().encode(stored) else { return }
-        UserDefaults.standard.set(data, forKey: placedMidpointStoreKey)
+        InsightTreeLocalStateStore.save(stored, key: placedMidpointStoreKey)
     }
 
     private static func loadMakeNodeChildren(storageKey: String) -> [UUID: [InsightModel]] {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let stored = try? JSONDecoder().decode([String: [InsightModel]].self, from: data) else {
-            return [:]
-        }
+        guard let stored = InsightTreeLocalStateStore.load(
+            [String: [InsightModel]].self,
+            key: storageKey
+        ) else { return [:] }
         return stored.reduce(into: [:]) { result, entry in
             guard let id = UUID(uuidString: entry.key) else { return }
             result[id] = entry.value
@@ -1398,8 +1390,7 @@ final class InsightTreeViewModel: ObservableObject {
         let stored = Dictionary(
             uniqueKeysWithValues: generatedChildInsights.map { ($0.key.uuidString, $0.value) }
         )
-        guard let data = try? JSONEncoder().encode(stored) else { return }
-        UserDefaults.standard.set(data, forKey: makeNodeChildrenStoreKey)
+        InsightTreeLocalStateStore.save(stored, key: makeNodeChildrenStoreKey)
     }
 
 }

@@ -83,6 +83,36 @@ struct LiteRTProductionRuntimeTests {
         #expect(definitionTerm(in: "What is natural law?") == "natural law")
     }
 
+    @Test("Validated direct definitions render an inline Insight card")
+    func validatedDefinitionRendersInlineCard() {
+        let insight = ConceptDefinition(
+            word: "Prudence",
+            partOfSpeech: "noun",
+            pronunciation: "",
+            meaning: "Right reason applied to action.",
+            example: "",
+            context: "Virtue"
+        )
+        let response = ModelResponse(
+            text: "Prudence guides practical judgment.",
+            keyTerms: [KeyTerm(displayText: "Prudence")],
+            insight: insight
+        )
+
+        #expect(InlineInsightMarkup.insights(in: response.annotatedText) == [insight])
+        #expect(response.annotatedText.contains("[Prudence](aq://prudence)"))
+    }
+
+    @Test("Ordinary responses never render an inline Insight card")
+    func ordinaryResponseDoesNotRenderInlineCard() {
+        let response = ModelResponse(
+            text: "The council met in 381.",
+            keyTerms: [KeyTerm(displayText: "council")]
+        )
+
+        #expect(InlineInsightMarkup.insights(in: response.annotatedText).isEmpty)
+    }
+
     @MainActor
     @Test("Unrelated substantial questions start with fresh context")
     func topicShiftStartsFreshContext() {
@@ -207,14 +237,59 @@ struct LiteRTProductionRuntimeTests {
     }
 
     @MainActor
-    @Test("An unterminated inline marker is dropped, not leaked into the answer")
-    func unterminatedInlineMarkerIsDropped() {
+    @Test("An unterminated inline marker becomes plain prose without truncation")
+    func unterminatedInlineMarkerPreservesProse() {
         let raw = "Aquinas distinguishes {{essence}} from exis{{tence"
         let (text, keyTerms) = LiteRTAquinasModel.inlineAnnotatedResponse(from: raw)
 
-        #expect(text == "Aquinas distinguishes essence from exis")
+        #expect(text == "Aquinas distinguishes essence from existence")
         #expect(!text.contains("{{"))
         #expect(keyTerms.map(\.displayText) == ["essence"])
+    }
+
+    @MainActor
+    @Test("Invalid inline metadata preserves its exact inner prose")
+    func invalidInlineMarkerPreservesInnerProse() {
+        let oversizedTerm = String(repeating: "word ", count: 20).trimmingCharacters(in: .whitespaces)
+        let raw = "Before {{\(oversizedTerm)}} after."
+        let (text, keyTerms) = LiteRTAquinasModel.inlineAnnotatedResponse(from: raw)
+
+        #expect(text == "Before \(oversizedTerm) after.")
+        #expect(keyTerms.isEmpty)
+    }
+
+    @MainActor
+    @Test("Conversation card previews hide markers and retain highlighted terms")
+    func conversationCardPreviewFormatsInsightMarkup() {
+        let segments = ConversationCardAnswerFormatting.segments(
+            from: "Aquinas joins {{prudence}} to *[right reason](aq://right-reason)*."
+        )
+
+        #expect(
+            segments == [
+                .plain("Aquinas joins "),
+                .insight("prudence"),
+                .plain(" to "),
+                .insight("right reason"),
+                .plain(".")
+            ]
+        )
+    }
+
+    @MainActor
+    @Test("Conversation card previews preserve prose after a dangling marker")
+    func conversationCardPreviewPreservesDanglingMarkerText() {
+        let segments = ConversationCardAnswerFormatting.segments(
+            from: "Aquinas distinguishes {{essence}} from exis{{tence"
+        )
+
+        #expect(
+            segments == [
+                .plain("Aquinas distinguishes "),
+                .insight("essence"),
+                .plain(" from existence")
+            ]
+        )
     }
 
     @Test("Generation guard rejects exact repetitive loops")

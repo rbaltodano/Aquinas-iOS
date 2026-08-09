@@ -17,8 +17,20 @@ final class MiniLMEmbedder {
     private let tokenizer: WordPieceTokenizer
     private let sequenceLength: Int
 
-    init(modelURL: URL, vocabURL: URL, sequenceLength: Int = 128) throws {
-        self.model = try MLModel(contentsOf: modelURL)
+    init(
+        modelURL: URL,
+        vocabURL: URL,
+        sequenceLength: Int = 128,
+        computeUnits: MLComputeUnits? = nil
+    ) throws {
+        #if targetEnvironment(simulator)
+        let resolvedComputeUnits = computeUnits ?? .cpuOnly
+        #else
+        let resolvedComputeUnits = computeUnits ?? .all
+        #endif
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = resolvedComputeUnits
+        self.model = try MLModel(contentsOf: modelURL, configuration: configuration)
         self.tokenizer = try WordPieceTokenizer(
             vocabURL: vocabURL,
             maxLength: sequenceLength
@@ -57,14 +69,23 @@ final class MiniLMEmbedder {
         for index in 0..<embeddingArray.count {
             embedding[index] = embeddingArray[index].floatValue
         }
+        guard embedding.allSatisfy(\.isFinite), embedding.contains(where: { abs($0) > 0.000_001 }) else {
+            throw MiniLMEmbedderError.invalidOutput
+        }
         return embedding
     }
 }
 
 enum MiniLMEmbedderError: LocalizedError {
     case missingOutput
+    case invalidOutput
 
     var errorDescription: String? {
-        "The on-device embedding model did not return an embedding."
+        switch self {
+        case .missingOutput:
+            "The on-device embedding model did not return an embedding."
+        case .invalidOutput:
+            "The on-device embedding model returned an invalid embedding."
+        }
     }
 }

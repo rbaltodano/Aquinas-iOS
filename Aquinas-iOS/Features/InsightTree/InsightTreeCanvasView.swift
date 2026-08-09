@@ -5,6 +5,20 @@
 
 import SwiftUI
 import UIKit
+import Observation
+
+@MainActor
+@Observable
+private final class InsightTreeCanvasCameraState {
+    var scale: CGFloat = 1
+    var offset: CGSize = .zero
+    var isDragging = false
+    var lastDragEndedAt: Date = .distantPast
+    var pinchStartScale: CGFloat?
+    var pinchStartOffset: CGSize?
+    var preFocusSnapshot: InsightTreeCameraSnapshot?
+    var userMovedSincePlacement = false
+}
 
 // MARK: - Insight Tree Canvas
 
@@ -80,14 +94,8 @@ struct InsightTreeCanvasView: View {
 
     @Environment(\.scenePhase) private var scenePhase
 
-    @State private var scale: CGFloat = 1
-    @State private var offset: CGSize = .zero
+    @State private var cameraState = InsightTreeCanvasCameraState()
     @State private var selectedEdgeID: UUID?
-    @State private var isDraggingCanvas: Bool = false
-    @State private var lastCanvasDragEndedAt: Date = .distantPast
-    @State private var pinchStartScale: CGFloat?
-    @State private var pinchStartOffset: CGSize?
-    @State private var preFocusCamera: InsightTreeCameraSnapshot?
     @State private var rippleTrigger:      RippleTrigger? = nil
     @State private var selectionRipples:   [RippleTrigger] = []
     @State private var hasAppeared:        Bool = false
@@ -119,7 +127,6 @@ struct InsightTreeCanvasView: View {
     @State private var lastHandleHapticPercent: Int?
     /// Set when the user pans/zooms/taps after placing a midpoint, so the auto camera-hover
     /// stops chasing the generating insight and the user can look around freely.
-    @State private var userMovedSincePlacement: Bool = false
     @GestureState private var dragOffset:  CGSize = .zero
 
     private struct PendingMakeNodeChild: Equatable {
@@ -228,13 +235,13 @@ struct InsightTreeCanvasView: View {
     private static let depthParallaxGain: CGFloat = 0.08 // pan-offset fraction applied by depth
 
     private var activeScale: CGFloat {
-        clamp(scale, lower: 0.28, upper: 2.6)
+        clamp(cameraState.scale, lower: 0.28, upper: 2.6)
     }
 
     private var activeOffset: CGSize {
         CGSize(
-            width: offset.width + dragOffset.width,
-            height: offset.height + dragOffset.height
+            width: cameraState.offset.width + dragOffset.width,
+            height: cameraState.offset.height + dragOffset.height
         )
     }
 
@@ -283,7 +290,7 @@ struct InsightTreeCanvasView: View {
             ZStack {
                 insightTreeCanvasColor.ignoresSafeArea()
                 AnimatedDotGridBackground(
-                    settledOffset: offset,
+                    settledOffset: cameraState.offset,
                     settledScale:  activeScale,
                     dragOffset:    dragOffset,
                     ripples:       (rippleTrigger.map { [$0] } ?? []) + selectionRipples
@@ -337,7 +344,7 @@ struct InsightTreeCanvasView: View {
             .simultaneousGesture(zoomGesture(in: size))  // always available for precision zooming
             .onTapGesture {
                 selectedEdgeID = nil
-                userMovedSincePlacement = true
+                cameraState.userMovedSincePlacement = true
             }
             .onChange(of: restoreFocusedCameraRequest) { oldValue, newValue in
                 restorePreFocusCamera()
@@ -617,7 +624,7 @@ struct InsightTreeCanvasView: View {
                     return
                 }
                 if markCanvasDragIfNeeded(value.translation) {
-                    userMovedSincePlacement = true
+                    cameraState.userMovedSincePlacement = true
                     onCanvasMoved()
                 }
             }
@@ -630,15 +637,15 @@ struct InsightTreeCanvasView: View {
                     panGestureBlockedByChipDrag = false
                     return
                 }
-                offset.width += value.translation.width
-                offset.height += value.translation.height
+                cameraState.offset.width += value.translation.width
+                cameraState.offset.height += value.translation.height
 
                 if hypot(value.translation.width, value.translation.height) > 8 {
-                    lastCanvasDragEndedAt = Date()
+                    cameraState.lastDragEndedAt = Date()
                 }
 
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                    isDraggingCanvas = false
+                    cameraState.isDragging = false
                 }
             }
     }
@@ -763,37 +770,37 @@ struct InsightTreeCanvasView: View {
     private func zoomGesture(in size: CGSize) -> some Gesture {
         MagnifyGesture(minimumScaleDelta: 0.01)
             .onChanged { value in
-                if pinchStartScale == nil {
-                    pinchStartScale = scale
-                    pinchStartOffset = offset
-                    userMovedSincePlacement = true
+                if cameraState.pinchStartScale == nil {
+                    cameraState.pinchStartScale = cameraState.scale
+                    cameraState.pinchStartOffset = cameraState.offset
+                    cameraState.userMovedSincePlacement = true
                     onCanvasMoved()
                 }
 
-                let initialScale = pinchStartScale ?? scale
-                let initialOffset = pinchStartOffset ?? offset
+                let initialScale = cameraState.pinchStartScale ?? cameraState.scale
+                let initialOffset = cameraState.pinchStartOffset ?? cameraState.offset
                 let nextScale = clamp(initialScale * pow(value.magnification, 0.72), lower: 0.28, upper: 2.6)
                 let anchor = CGPoint(
                     x: value.startAnchor.x * size.width,
                     y: value.startAnchor.y * size.height
                 )
 
-                scale = nextScale
-                offset = offsetKeeping(anchor, fixedFrom: initialOffset, initialScale: initialScale, nextScale: nextScale, in: size)
+                cameraState.scale = nextScale
+                cameraState.offset = offsetKeeping(anchor, fixedFrom: initialOffset, initialScale: initialScale, nextScale: nextScale, in: size)
             }
             .onEnded { value in
-                let initialScale = pinchStartScale ?? scale
-                let initialOffset = pinchStartOffset ?? offset
+                let initialScale = cameraState.pinchStartScale ?? cameraState.scale
+                let initialOffset = cameraState.pinchStartOffset ?? cameraState.offset
                 let nextScale = clamp(initialScale * pow(value.magnification, 0.72), lower: 0.28, upper: 2.6)
                 let anchor = CGPoint(
                     x: value.startAnchor.x * size.width,
                     y: value.startAnchor.y * size.height
                 )
 
-                scale = nextScale
-                offset = offsetKeeping(anchor, fixedFrom: initialOffset, initialScale: initialScale, nextScale: nextScale, in: size)
-                pinchStartScale = nil
-                pinchStartOffset = nil
+                cameraState.scale = nextScale
+                cameraState.offset = offsetKeeping(anchor, fixedFrom: initialOffset, initialScale: initialScale, nextScale: nextScale, in: size)
+                cameraState.pinchStartScale = nil
+                cameraState.pinchStartOffset = nil
             }
     }
 
@@ -816,7 +823,7 @@ struct InsightTreeCanvasView: View {
     }
 
     private var canAcceptTap: Bool {
-        !isDraggingCanvas && Date().timeIntervalSince(lastCanvasDragEndedAt) > 0.16
+        !cameraState.isDragging && Date().timeIntervalSince(cameraState.lastDragEndedAt) > 0.16
     }
 
     /// Pans (and, if `targetScale` is supplied, simultaneously zooms) to center `worldPosition`
@@ -824,11 +831,11 @@ struct InsightTreeCanvasView: View {
     private func focusInsight(at worldPosition: CGPoint, in size: CGSize, targetScale: CGFloat? = nil) {
         rememberCameraBeforeFocusIfNeeded()
         let target = focusAnchor(in: size)
-        let nextScale = targetScale ?? scale
+        let nextScale = targetScale ?? cameraState.scale
 
         withAnimation(.spring(response: 0.58, dampingFraction: 0.64, blendDuration: 0.08)) {
-            scale = nextScale
-            offset = CGSize(
+            cameraState.scale = nextScale
+            cameraState.offset = CGSize(
                 width: target.x - size.width / 2 - (worldPosition.x * nextScale),
                 height: target.y - size.height / 2 + (worldPosition.y * nextScale)
             )
@@ -837,12 +844,12 @@ struct InsightTreeCanvasView: View {
 
     private func focusHoveredTarget(at worldPosition: CGPoint, in size: CGSize) {
         rememberCameraBeforeFocusIfNeeded()
-        let nextScale = clamp(max(scale, 1.15), lower: 0.28, upper: 2.6)
+        let nextScale = clamp(max(cameraState.scale, 1.15), lower: 0.28, upper: 2.6)
         let target = focusAnchor(in: size)
 
         withAnimation(.spring(response: 0.58, dampingFraction: 0.64, blendDuration: 0.08)) {
-            scale = nextScale
-            offset = CGSize(
+            cameraState.scale = nextScale
+            cameraState.offset = CGSize(
                 width: target.x - size.width / 2 - (worldPosition.x * nextScale),
                 height: target.y - size.height / 2 + (worldPosition.y * nextScale)
             )
@@ -850,27 +857,30 @@ struct InsightTreeCanvasView: View {
     }
 
     private func rememberCameraBeforeFocusIfNeeded() {
-        guard preFocusCamera == nil else { return }
+        guard cameraState.preFocusSnapshot == nil else { return }
 
-        preFocusCamera = InsightTreeCameraSnapshot(scale: scale, offset: offset)
+        cameraState.preFocusSnapshot = InsightTreeCameraSnapshot(
+            scale: cameraState.scale,
+            offset: cameraState.offset
+        )
     }
 
     private func restorePreFocusCamera() {
-        guard let preFocusCamera else { return }
+        guard let snapshot = cameraState.preFocusSnapshot else { return }
 
         withAnimation(.spring(response: 0.58, dampingFraction: 0.64, blendDuration: 0.08)) {
-            scale = preFocusCamera.scale
-            offset = preFocusCamera.offset
+            cameraState.scale = snapshot.scale
+            cameraState.offset = snapshot.offset
         }
 
-        self.preFocusCamera = nil
+        cameraState.preFocusSnapshot = nil
     }
 
     @discardableResult
     private func markCanvasDragIfNeeded(_ translation: CGSize) -> Bool {
         guard hypot(translation.width, translation.height) > 8 else { return false }
-        guard !isDraggingCanvas else { return false }
-        isDraggingCanvas = true
+        guard !cameraState.isDragging else { return false }
+        cameraState.isDragging = true
         return true
     }
 
@@ -1406,7 +1416,7 @@ struct InsightTreeCanvasView: View {
         guard midpointLoadingStartedAt[insightID] == nil else { return }
         midpointLoadingStartedAt[insightID] = Date().timeIntervalSinceReferenceDate
         loadingInsightIDs.insert(insightID)
-        userMovedSincePlacement = false
+        cameraState.userMovedSincePlacement = false
         markUndiscovered([insightID])
         if let position = worldPosition(forInsightID: insightID) {
             focusHoveredTarget(at: position, in: size)
@@ -1428,7 +1438,7 @@ struct InsightTreeCanvasView: View {
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 if let position = worldPosition(forInsightID: insightID) {
-                    if !userMovedSincePlacement {
+                    if !cameraState.userMovedSincePlacement {
                         focusHoveredTarget(at: position, in: size)
                     }
                     rippleTrigger = RippleTrigger(
@@ -3037,8 +3047,8 @@ struct InsightTreeCanvasView: View {
 
         rememberCameraBeforeFocusIfNeeded()
         withAnimation(.spring(response: 0.58, dampingFraction: 0.64, blendDuration: 0.08)) {
-            scale  = targetScale
-            offset = CGSize(width: -(centerX * targetScale), height: centerY * targetScale)
+            cameraState.scale = targetScale
+            cameraState.offset = CGSize(width: -(centerX * targetScale), height: centerY * targetScale)
         }
     }
 

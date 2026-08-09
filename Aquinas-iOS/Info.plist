@@ -11,6 +11,8 @@
 	</dict>
 	<key>NSCameraUsageDescription</key>
 	<string>Aquinas uses the camera so you can attach photos to your questions.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Aquinas uses Face ID to protect your conversations when App Lock is enabled.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Aquinas connects to your private local model server to answer questions and generate insights.</string>
 	<key>NSPhotoLibraryUsageDescription</key>

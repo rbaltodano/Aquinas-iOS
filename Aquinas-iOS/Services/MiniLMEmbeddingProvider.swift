@@ -4,6 +4,7 @@
 //
 
 import Foundation
+import CoreML
 
 /// The real relatedness signal for clustering Insights — on-device MiniLM
 /// (`sentence-transformers/all-MiniLM-L6-v2` via Core ML), replacing `NLEmbeddingProvider`'s Apple
@@ -29,7 +30,7 @@ struct MiniLMEmbeddingProvider: EmbeddingProvider {
     /// file `MiniLMGroundingProvider` loads for grounding retrieval, just a second Core ML
     /// instance. Small, one-time, once-per-launch cost; not worth threading a shared instance
     /// across two otherwise-unrelated provider types for this.
-    init(bundle: Bundle = .main) throws {
+    init(bundle: Bundle = .main, computeUnits: MLComputeUnits? = nil) throws {
         guard let modelURL = bundle.url(
             forResource: "MiniLM",
             withExtension: "mlmodelc",
@@ -44,7 +45,11 @@ struct MiniLMEmbeddingProvider: EmbeddingProvider {
         ) ?? bundle.url(forResource: "vocab", withExtension: "txt") else {
             throw MiniLMEmbeddingProviderError.resourceMissing("vocab.txt")
         }
-        self.embedder = try MiniLMEmbedder(modelURL: modelURL, vocabURL: vocabURL)
+        self.embedder = try MiniLMEmbedder(
+            modelURL: modelURL,
+            vocabURL: vocabURL,
+            computeUnits: computeUnits
+        )
     }
 
     func embed(_ text: String) async -> [Double]? {

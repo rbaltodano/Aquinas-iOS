@@ -5,6 +5,7 @@
 
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 // MARK: - Settings
 
@@ -113,11 +114,9 @@ private enum SettingsRoute: Hashable {
     case notifications
     case privacyAndData
     case modelBehavior
-    case researchAndCitations
     case modelActivity
     case textAndDisplay
     case conversationDefaults
-    case insightsAndDailyStudy
     case documentation
     case reportBug
 }
@@ -145,7 +144,6 @@ private struct SettingsHubView: View {
                     title: "Model",
                     rows: [
                         SettingsHubItem(title: "Model Behavior", route: .modelBehavior),
-                        SettingsHubItem(title: "Research & Citations", route: .researchAndCitations),
                         SettingsHubItem(title: "Model Activity", route: .modelActivity)
                     ],
                     onSelect: onSelect
@@ -155,8 +153,7 @@ private struct SettingsHubView: View {
                     title: "Conversations",
                     rows: [
                         SettingsHubItem(title: "Text & Display", route: .textAndDisplay),
-                        SettingsHubItem(title: "Conversation Defaults", route: .conversationDefaults),
-                        SettingsHubItem(title: "Insights & Daily Study", route: .insightsAndDailyStudy)
+                        SettingsHubItem(title: "Conversation Defaults", route: .conversationDefaults)
                     ],
                     onSelect: onSelect
                 )
@@ -245,11 +242,8 @@ private struct SettingsDestinationView: View {
         case .modelBehavior:
             ModelBehaviorSettingsView(
                 userName: $userName,
-                customInstructions: $customInstructions,
                 conversationPersonality: $conversationPersonality
             )
-        case .researchAndCitations:
-            ResearchAndCitationsSettingsView()
         case .modelActivity:
             ModelActivitySettingsView()
         case .textAndDisplay:
@@ -262,8 +256,6 @@ private struct SettingsDestinationView: View {
             )
         case .conversationDefaults:
             ConversationDefaultsSettingsView()
-        case .insightsAndDailyStudy:
-            InsightsAndDailyStudySettingsView()
         case .documentation:
             SettingsInformationView(
                 title: "Documentation",
@@ -456,35 +448,18 @@ private struct NotificationSettingsView: View {
 }
 
 private struct PrivacyAndDataSettingsView: View {
-    @AppStorage(SettingsStorageKey.conversationMemory)
-    private var conversationMemory: ConversationMemoryOption = .off
     @AppStorage(SettingsStorageKey.appLock)
     private var appLock = false
     @AppStorage(SettingsStorageKey.appLockGracePeriod)
     private var appLockGracePeriod: AppLockGracePeriodOption = .immediately
+    @State private var exportDocument: AquinasConversationDocument?
+    @State private var isExportingConversations = false
+    @State private var isImportingConversations = false
+    @State private var dataTransferError: String?
 
     var body: some View {
         SettingsDetailScaffold(title: "Privacy & Data") {
             VStack(alignment: .leading, spacing: 24) {
-                SettingsSubsection(title: "Memory") {
-                    SettingsChoiceRow(
-                        title: "Conversation Memory",
-                        selection: $conversationMemory,
-                        options: Array(ConversationMemoryOption.allCases)
-                    )
-
-                    Button {
-                    } label: {
-                        SettingsNavigationLabel(
-                            title: "Manage Memories",
-                            detail: conversationMemory == .off ? "Memory is off." : nil
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(conversationMemory == .off)
-                    .opacity(conversationMemory == .off ? 0.45 : 1)
-                }
-
                 SettingsSubsection(title: "Security") {
                     SettingsToggleRow(title: "App Lock", isOn: $appLock)
 
@@ -498,31 +473,120 @@ private struct PrivacyAndDataSettingsView: View {
                 }
 
                 SettingsSubsection(title: "Data Controls") {
-                    SettingsUnavailableActionRow(title: "Export Conversations")
+                    Button(action: exportConversations) {
+                        SettingsNavigationLabel(title: "Export Conversations")
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        isImportingConversations = true
+                    } label: {
+                        SettingsNavigationLabel(title: "Import Conversations")
+                    }
+                    .buttonStyle(.plain)
+
                     SettingsUnavailableActionRow(title: "Delete All Conversations", isDestructive: true)
                     SettingsUnavailableActionRow(title: "Delete Memories", isDestructive: true)
                     SettingsUnavailableActionRow(title: "Delete All App Data", isDestructive: true)
                 }
             }
         }
+        .fileExporter(
+            isPresented: $isExportingConversations,
+            document: exportDocument,
+            contentType: .json,
+            defaultFilename: "Aquinas Conversations"
+        ) { result in
+            if case .failure(let error) = result {
+                dataTransferError = error.localizedDescription
+            }
+            exportDocument = nil
+        }
+        .fileImporter(
+            isPresented: $isImportingConversations,
+            allowedContentTypes: [.json],
+            allowsMultipleSelection: false
+        ) { result in
+            importConversations(from: result)
+        }
+        .alert(
+            "Couldn’t Transfer Conversations",
+            isPresented: Binding(
+                get: { dataTransferError != nil },
+                set: { if !$0 { dataTransferError = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(dataTransferError ?? "Please try again.")
+        }
     }
+
+    private func exportConversations() {
+        do {
+            exportDocument = AquinasConversationDocument(
+                data: try InquiryPersistenceStore.exportData()
+            )
+            isExportingConversations = true
+        } catch {
+            dataTransferError = error.localizedDescription
+        }
+    }
+
+    private func importConversations(
+        from result: Result<[URL], any Error>
+    ) {
+        do {
+            guard let url = try result.get().first else { return }
+            let didAccess = url.startAccessingSecurityScopedResource()
+            defer {
+                if didAccess {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            let snapshot = try InquiryPersistenceStore.importData(
+                Data(contentsOf: url)
+            )
+            NotificationCenter.default.post(
+                name: .aquinasConversationStoreDidImport,
+                object: snapshot
+            )
+        } catch {
+            dataTransferError = error.localizedDescription
+        }
+    }
+}
+
+private struct AquinasConversationDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.json] }
+
+    let data: Data
+
+    init(data: Data) {
+        self.data = data
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        guard let data = configuration.file.regularFileContents else {
+            throw InquiryPersistenceError.invalidImport
+        }
+        self.data = data
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
+    }
+}
+
+extension Notification.Name {
+    static let aquinasConversationStoreDidImport = Notification.Name(
+        "aquinas.conversation-store.did-import"
+    )
 }
 
 private struct ModelBehaviorSettingsView: View {
     @Binding var userName: String
-    @Binding var customInstructions: String
     @Binding var conversationPersonality: ConversationPersonality
-
-    @AppStorage(SettingsStorageKey.conversationalInitiative)
-    private var conversationalInitiative: ConversationalInitiativeOption = .adaptive
-    @AppStorage(SettingsStorageKey.knowledgeLevel)
-    private var knowledgeLevel: KnowledgeLevelOption = .adaptive
-    @AppStorage(SettingsStorageKey.intellectualChallenge)
-    private var intellectualChallenge: IntellectualChallengeOption = .balanced
-    @AppStorage(SettingsStorageKey.theologicalFraming)
-    private var theologicalFraming: TheologicalFramingOption = .integrated
-    @AppStorage(SettingsStorageKey.responseFormat)
-    private var responseFormat: ResponseFormatOption = .adaptive
 
     var body: some View {
         SettingsDetailScaffold(title: "Model Behavior") {
@@ -547,55 +611,6 @@ private struct ModelBehaviorSettingsView: View {
                             .font(.custom("Figtree-Regular", size: 12))
                             .foregroundStyle(AquinasTheme.Colors.paragraphText)
                             .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    SettingsChoiceRow(
-                        title: "Conversational Initiative",
-                        selection: $conversationalInitiative,
-                        options: Array(ConversationalInitiativeOption.allCases)
-                    )
-                    SettingsChoiceRow(
-                        title: "Knowledge Level",
-                        selection: $knowledgeLevel,
-                        options: Array(KnowledgeLevelOption.allCases)
-                    )
-                    SettingsChoiceRow(
-                        title: "Intellectual Challenge",
-                        selection: $intellectualChallenge,
-                        options: Array(IntellectualChallengeOption.allCases)
-                    )
-                    SettingsChoiceRow(
-                        title: "Theological Framing",
-                        selection: $theologicalFraming,
-                        options: Array(TheologicalFramingOption.allCases)
-                    )
-                    SettingsChoiceRow(
-                        title: "Response Format",
-                        selection: $responseFormat,
-                        options: Array(ResponseFormatOption.allCases)
-                    )
-                }
-
-                SettingsControlCard {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Custom Instructions")
-                            .font(.custom("Figtree-Bold", size: 12))
-                            .foregroundStyle(AquinasTheme.Colors.paragraphText)
-
-                        TextField(
-                            "",
-                            text: $customInstructions,
-                            prompt: Text("Instructions apply to all conversations")
-                                .foregroundStyle(AquinasTheme.Colors.placeholderText),
-                            axis: .vertical
-                        )
-                        .font(.custom("Figtree-Regular", size: 14))
-                        .foregroundStyle(AquinasTheme.Colors.primaryReadable)
-                        .tint(AquinasTheme.Colors.darkGreen)
-                        .lineLimit(2...6)
-                        .padding(12)
-                        .background(AquinasTheme.Colors.canvas)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                 }
             }
@@ -725,7 +740,7 @@ private struct ConversationDefaultsSettingsView: View {
             SettingsControlCard {
                 SettingsChoiceRow(
                     title: "Conversation Titles",
-                    detail: "Automatic titles are created after the first answer and tree update.",
+                    detail: "Automatic creates a concise title after the first answer. First Question titles immediately. Manual waits for you to rename it.",
                     selection: $conversationTitles,
                     options: Array(ConversationTitleOption.allCases)
                 )

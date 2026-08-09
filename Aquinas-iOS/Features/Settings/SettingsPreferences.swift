@@ -113,6 +113,15 @@ enum AppLockGracePeriodOption: String, SettingsChoice {
         case .fifteenMinutes: "After 15 Minutes"
         }
     }
+
+    var duration: TimeInterval {
+        switch self {
+        case .immediately: 0
+        case .oneMinute: 60
+        case .fiveMinutes: 5 * 60
+        case .fifteenMinutes: 15 * 60
+        }
+    }
 }
 
 enum ConversationalInitiativeOption: String, SettingsChoice {
@@ -251,6 +260,37 @@ enum ConversationTitleOption: String, SettingsChoice {
         case .automatic: "Automatic"
         case .firstQuestion: "First Question"
         case .manual: "Manual"
+        }
+    }
+}
+
+enum ConversationTitlePolicy {
+    static func title(
+        for question: String,
+        option: ConversationTitleOption
+    ) -> String? {
+        let cleaned = question
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        guard !cleaned.isEmpty else { return nil }
+
+        switch option {
+        case .automatic:
+            let words = cleaned
+                .replacingOccurrences(of: "[^A-Za-z0-9'’\\s-]", with: " ", options: .regularExpression)
+                .split(whereSeparator: \.isWhitespace)
+                .prefix(5)
+                .map { String($0).capitalized }
+            return words.isEmpty ? "New Inquiry" : words.joined(separator: " ")
+        case .firstQuestion:
+            let questionWithoutTrailingPunctuation = cleaned
+                .trimmingCharacters(in: .punctuationCharacters)
+            guard questionWithoutTrailingPunctuation.count > 80 else {
+                return questionWithoutTrailingPunctuation
+            }
+            return String(questionWithoutTrailingPunctuation.prefix(79)) + "…"
+        case .manual:
+            return nil
         }
     }
 }

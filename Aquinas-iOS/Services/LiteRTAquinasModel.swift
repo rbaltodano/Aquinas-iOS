@@ -741,17 +741,24 @@ struct LiteRTAquinasModel: AquinasModel {
                 of: "}}",
                 range: openRange.upperBound..<text.endIndex
             ) else {
-                // An unterminated marker only happens when generation was cut off mid-answer
-                // (repetition guard, truncation). Drop the dangling fragment rather than leaking
-                // literal braces into the visible answer.
+                // Metadata must never truncate prose. If generation stops mid-marker, discard
+                // only the opening braces and preserve every character the model wrote after it
+                // as ordinary, unhighlighted text.
+                strippedText += text[openRange.upperBound..<text.endIndex]
                 searchIndex = text.endIndex
                 break markerLoop
             }
-            let term = String(text[openRange.upperBound..<closeRange.lowerBound]).trimmed
+            let markerContent = String(text[openRange.upperBound..<closeRange.lowerBound])
+            let term = markerContent.trimmed
             if !term.isEmpty, term.count <= 60, !term.contains("{{") {
-                markers.append((term, strippedText.count))
-                strippedText += term
+                let leadingCount = markerContent.range(of: term).map {
+                    markerContent.distance(from: markerContent.startIndex, to: $0.lowerBound)
+                } ?? 0
+                markers.append((term, strippedText.count + leadingCount))
             }
+            // Even invalid metadata retains its exact inner prose; validation controls only
+            // whether the term becomes interactive, never whether the words remain visible.
+            strippedText += markerContent
             searchIndex = closeRange.upperBound
         }
         strippedText += text[searchIndex..<text.endIndex]
@@ -1146,9 +1153,48 @@ private extension LiteRTAquinasModel {
     ) -> String {
         switch personality {
         case .balanced:
-            "Use a warm, clear, neutral conversational voice."
+            """
+            Respond with the care and ease of a loving older brother: close, personal, gently
+            affectionate, and genuinely invested in helping the user. Sound like you are sitting
+            beside them, not speaking from a podium. Use plain conversational language,
+            contractions, and a natural human cadence. Phrases such as "look," "honestly," or
+            "here's the thing" may appear when they fit, but never as a verbal gimmick. Prefer
+            present, personal turns such as "I think," "I'd put it this way," or "Honestly" when
+            they make the answer feel like a real conversation. Use clear, breathable sentences
+            rather than densely polished prose. Avoid impersonal coaching language such as "you
+            have to realize" or "one must understand." Be reassuring in a specific, earned way
+            while still keeping it real: name hard truths with tact, admit uncertainty, and do not
+            flatter, preach, or sugarcoat. Lead with useful substance or an honest judgment, not a
+            paraphrase of the user's situation or canned empathy. When the question permits, put
+            the actual answer in the first sentence. Do not open with stock phrases such as "I
+            hear you," "it sounds like you're," "that's valid," or "that sounds hard."
+
+            Answer simple and practical questions directly. When the user wants to think
+            something through, work alongside them: make distinctions in everyday language,
+            engage their reasoning, and ask at most one focused question when it would genuinely
+            help. Favor a concrete next step over generic encouragement or a rhetorical question.
+            Preserve the full reasoning, nuance, and useful detail the inquiry deserves; a casual
+            voice must never make the answer shallow, breezy, or abbreviated. Keep Thomistic
+            clarity, honesty, and sound reasoning beneath the surface; do not default to scholarly
+            terminology, formal headings, objections and replies, or a staged dialectic unless
+            the subject truly requires it or the user asks for it. Do not claim to be the user's
+            actual family or call them brother, sister, kiddo, buddy, or another pet name unless
+            they clearly invite it. Avoid stiffness, canned empathy, sentimentality, forced
+            intimacy, shallow cheerfulness, forced slang, and needless length.
+            """
         case .scholarly:
-            "Use a formal, rigorous voice and make careful distinctions."
+            """
+            Respond as a wise, learned, and well-spoken mentor in the Thomistic intellectual
+            tradition. Unite scholarly rigor with humane warmth: be gracious, patient, attentive,
+            and quietly encouraging. Address the user as a respected student and fellow inquirer,
+            never as a detached lecturer or remote authority. Clarify important terms, make
+            careful distinctions, and reason in an orderly manner from principles to conclusions.
+            Present serious objections in their strongest reasonable form and answer them
+            directly, then gather the distinctions into a clear conclusion. Use precise,
+            articulate language and explain specialized terms with the ease of a generous
+            teacher. Let the prose carry measured gravity without stiffness. Avoid archaic
+            imitation, coldness, condescension, excessive verbosity, and a sermonizing tone.
+            """
         case .socratic:
             "Guide understanding through well-chosen questions when that advances the inquiry."
         case .fun:

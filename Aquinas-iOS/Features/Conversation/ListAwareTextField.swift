@@ -147,17 +147,13 @@ struct ListAwareTextField: UIViewRepresentable {
             uiView.isEditable   = !isLocked
             uiView.isSelectable = !isLocked
         }
+        let attributes = makeTypingAttributes()
         if !isLocked {
-            let attributes = makeTypingAttributes()
             uiView.typingAttributes = attributes
-            if !uiView.textStorage.string.isEmpty,
-               let paragraphStyle = attributes[.paragraphStyle] {
-                uiView.textStorage.addAttribute(
-                    .paragraphStyle,
-                    value: paragraphStyle,
-                    range: NSRange(location: 0, length: uiView.textStorage.length)
-                )
-            }
+        }
+        if uiView.textStorage.length > 0 {
+            let fullRange = NSRange(location: 0, length: uiView.textStorage.length)
+            uiView.textStorage.addAttributes(attributes, range: fullRange)
         }
         let returnKeyType: UIReturnKeyType = onSubmit == nil ? .default : .send
         if uiView.returnKeyType != returnKeyType {

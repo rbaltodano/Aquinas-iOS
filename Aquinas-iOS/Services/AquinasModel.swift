@@ -337,10 +337,14 @@ struct ModelResponse {
                 with: replacement.markup
             )
         }
-        // In-text Insight cards are disabled for now: direct-definition intent detection isn't
-        // reliable enough yet. `insight` is still populated/generated upstream — only the
-        // rendering is turned off, so this is a one-line revert once detection improves.
-        return mutable as String
+        var result = mutable as String
+        if let insight {
+            // The local and backend generation adapters populate `insight` only after their
+            // deterministic direct-definition intent gate requires and validates one. The model
+            // supplies definition content; it does not decide whether a card should appear.
+            result = "\(InlineInsightMarkup.marker(for: insight))\n\n\(result)"
+        }
+        return result
     }
 
     private static func slugify(_ text: String) -> String {

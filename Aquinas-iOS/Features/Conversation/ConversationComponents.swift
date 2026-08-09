@@ -68,6 +68,7 @@ struct ChatThreadColumn: View {
     var inputFont: ConversationFontOption = .serif
     var responseTextAlignment: ResponseTextAlignmentOption = .center
     var responseFont: ConversationFontOption = .sans
+    var conversationTitlePolicy: ConversationTitleOption = .automatic
     var personality: ConversationPersonality = .balanced
     var loadingInsightKey: String? = nil
     var queuedInsightKeys: Set<String> = []
@@ -125,16 +126,21 @@ struct ChatThreadColumn: View {
     var onInlineInsightQuote: (ConceptDefinition) -> Void = { _ in }
     var onInlineInsightFork: (ConceptDefinition, Int) -> Void = { _, _ in }
     var onInlineInsightToggleSaved: (ConceptDefinition) -> Void = { _ in }
-    /// (question text, response index) -- the same `index` the block enumeration already uses,
-    /// so the caller can derive a stable per-turn id the same way tree-analysis does.
-    var onFlagQuote: (String, Int) -> Void = { _, _ in }
-
     private var modelResponseLineHeight: CGFloat {
         let fontName = responseFont == .sans
             ? "Figtree-Regular"
             : "LibreBaskerville-Regular"
         let font = UIFont(name: fontName, size: conversationFontSize.pointSize)
             ?? .systemFont(ofSize: conversationFontSize.pointSize)
+        return ceil(font.lineHeight + 8)
+    }
+
+    private var inputLineHeight: CGFloat {
+        let fontName = inputFont == .sans
+            ? "Figtree-Regular"
+            : "LibreBaskerville-Regular"
+        let font = UIFont(name: fontName, size: QuestionInputField.fontSize)
+            ?? .systemFont(ofSize: QuestionInputField.fontSize)
         return ceil(font.lineHeight + 8)
     }
 
@@ -145,6 +151,30 @@ struct ChatThreadColumn: View {
             }
             return branchID == branchData.id && taskResponseIndex == responseIndex
         }?.funStatusText
+    }
+
+    private func modelTask(for responseIndex: Int) -> ModelTaskSnapshot? {
+        modelTasks.allTasks.first { task in
+            guard case .userQuestion(let branchID, let taskResponseIndex) = task.kind else {
+                return false
+            }
+            return branchID == branchData.id && taskResponseIndex == responseIndex
+        }
+    }
+
+    private func isResponsePending(at responseIndex: Int) -> Bool {
+        if pendingResponseIndices.contains(responseIndex) {
+            return true
+        }
+        guard let task = modelTask(for: responseIndex) else { return false }
+        return task.phase == .current || task.phase == .upcoming
+    }
+
+    private func isResponseQueued(at responseIndex: Int) -> Bool {
+        if modelQueuedResponseIndices.contains(responseIndex) {
+            return true
+        }
+        return modelTask(for: responseIndex)?.phase == .upcoming
     }
 
     @Environment(\.colorScheme) private var colorScheme
@@ -315,21 +345,9 @@ struct ChatThreadColumn: View {
         return emptyPromptQuestion
     }
 
-    // Temporary local title generator. Replace with the model summary later.
     private func generatedTitle(from question: String) -> String {
-        let words = question
-            .replacingOccurrences(of: "?", with: "")
-            .replacingOccurrences(of: ".", with: "")
-            .replacingOccurrences(of: ",", with: "")
-            .split(separator: " ")
-            .prefix(5)
-            .map { String($0).capitalized }
-
-        guard !words.isEmpty else {
-            return "New Inquiry"
-        }
-
-        return words.joined(separator: " ")
+        ConversationTitlePolicy.title(for: question, option: .automatic)
+            ?? "New Inquiry"
     }
 
     // Temporary branch-chip title generator for response forks.
@@ -442,13 +460,12 @@ struct ChatThreadColumn: View {
                 ? response.thinkingSummary
                 : []
             responseThinkingSummaryByIndex[responseIndex] = persistedThinkingSummary
-            branchData.setResponsePresentation(
-                ResponsePresentationMetadata(
-                    responseIndex: responseIndex,
-                    showsThinking: thinkingEnabled && !persistedThinkingSummary.isEmpty,
-                    thinkingSummary: persistedThinkingSummary
-                )
+            let completedPresentation = ResponsePresentationMetadata(
+                responseIndex: responseIndex,
+                showsThinking: thinkingEnabled && !persistedThinkingSummary.isEmpty,
+                thinkingSummary: persistedThinkingSummary
             )
+            branchData.setResponsePresentation(completedPresentation)
             withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
                 branchData.activeChatBlocks[responseIndex] = .text(response.annotatedText)
                 pendingResponseIndices.remove(responseIndex)
@@ -458,7 +475,24 @@ struct ChatThreadColumn: View {
                 // cancellation. The response reserves its final height while animating.
                 branchData.showBottomInput = true
             }
+            // Model completion is functional state and must not depend on this view remaining
+            // mounted long enough to run the response card's reveal animation. Persist the title
+            // and completed response now; `onFinish` below remains visual-only.
+            finalizePendingGeneratedTitleIfNeeded()
             onResponseGenerated(responseIndex)
+            if let conversationID {
+                // This ID-addressed write does not depend on the originating view's `@State`
+                // still being mounted. A newly mounted conversation can therefore reload the
+                // completed branch even when generation began on a previous view instance.
+                var durableBranch = branchData
+                durableBranch.setResponsePresentation(completedPresentation)
+                durableBranch.activeChatBlocks[responseIndex] = .text(response.annotatedText)
+                durableBranch.showBottomInput = true
+                InquiryPersistenceStore.saveCompletedBranch(
+                    durableBranch,
+                    conversationID: conversationID
+                )
+            }
             if response.annotatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 revealGate.markStarted()
             }
@@ -678,6 +712,7 @@ struct ChatThreadColumn: View {
         // in-conversation heading and the conversation's title at creation time -- an
         // auto-generated title from the user's typed answer must not overwrite either.
         guard branchData.pinnedHeaderQuestion == nil,
+              conversationTitlePolicy == .automatic,
               branchData.generatedBranchTitle == nil,
               let pendingQuestion = pendingGeneratedTitleQuestion else { return }
         let title = generatedTitle(from: pendingQuestion)
@@ -731,8 +766,29 @@ struct ChatThreadColumn: View {
         if showsPendingUploads {
             uploadedFiles.removeAll()
         }
-        pendingGeneratedTitleQuestion = submittedQuestion
-        topFieldSubmittedWidth = QuestionInputField.measuredWidth(for: submittedQuestion)
+        switch conversationTitlePolicy {
+        case .automatic:
+            pendingGeneratedTitleQuestion = submittedQuestion
+        case .firstQuestion:
+            pendingGeneratedTitleQuestion = nil
+            if branchData.pinnedHeaderQuestion == nil,
+               branchData.generatedBranchTitle == nil,
+               let title = ConversationTitlePolicy.title(
+                for: submittedQuestion,
+                option: .firstQuestion
+               ) {
+                branchData.generatedBranchTitle = title
+                if branchData.parentBranchID == nil {
+                    onConversationTitleChange(title)
+                }
+            }
+        case .manual:
+            pendingGeneratedTitleQuestion = nil
+        }
+        topFieldSubmittedWidth = QuestionInputField.measuredWidth(
+            for: submittedQuestion,
+            fontOption: inputFont
+        )
         withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
             branchData.topQuestionSubmitted = true
         }
@@ -878,7 +934,9 @@ struct ChatThreadColumn: View {
                 submittedWidth: topFieldSubmittedWidth,
                 isEmpty: topFieldIsEmpty && !branchData.topQuestionSubmitted,
                 isFocused: isTopQuestionFocused && !branchData.topQuestionSubmitted,
-                lineHeight: modelResponseLineHeight,
+                lineHeight: inputLineHeight,
+                textAlignment: inputTextAlignment,
+                fontOption: inputFont,
                 showsChrome: false,
                 relay: topFieldRelay,
                 onFocusChange: { focused in
@@ -1019,7 +1077,9 @@ struct ChatThreadColumn: View {
                                 submittedWidth: topFieldSubmittedWidth,
                                 isEmpty: topFieldIsEmpty && !branchData.topQuestionSubmitted,
                                 isFocused: isTopQuestionFocused && !branchData.topQuestionSubmitted,
-                                lineHeight: modelResponseLineHeight,
+                                lineHeight: inputLineHeight,
+                                textAlignment: inputTextAlignment,
+                                fontOption: inputFont,
                                 placeholderColor: placeholderColor,
                                 relay: topFieldRelay,
                                 onFocusChange: { focused in
@@ -1082,9 +1142,9 @@ struct ChatThreadColumn: View {
                                 responseIndex: index,
                                 shouldAnimateOnAppear: animatedResponseIndices.contains(index),
                                 showsThinkingIntro: responseShowsThinkingIntro(at: index, text: textContent),
-                                isAwaitingResponse: pendingResponseIndices.contains(index),
+                                isAwaitingResponse: isResponsePending(at: index),
                                 isReceivingStream: streamingResponseIndices.contains(index),
-                                isQueuedForModel: modelQueuedResponseIndices.contains(index),
+                                isQueuedForModel: isResponseQueued(at: index),
                                 usesNetworkStream: false,
                                 thinkingSummary: responseThinkingSummary(at: index),
                                 funStatusText: funStatusText(for: index),
@@ -1107,13 +1167,13 @@ struct ChatThreadColumn: View {
                                     onInlineInsightFork(insight, index)
                                 },
                                 onInlineInsightToggleSaved: onInlineInsightToggleSaved,
-                                showsResponseActions: textContent != questionCanceledResponseText,
+                                showsResponseActions: !textContent.isEmpty
+                                    && textContent != questionCanceledResponseText,
                                 onRevealStart: {
                                     responseRevealGatesByIndex[index]?.markStarted()
                                 },
                                 onFinish: {
                                     animatedResponseIndices.remove(index)
-                                    finalizePendingGeneratedTitleIfNeeded()
                                     withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) { branchData.showBottomInput = true }
                                     onResponseCompleted(index)
                                 }
@@ -1162,10 +1222,15 @@ struct ChatThreadColumn: View {
                                     text: .constant(questionText),
                                     isLocked: true,
                                     isSubmitted: true,
-                                    submittedWidth: QuestionInputField.measuredWidth(for: questionText),
+                                    submittedWidth: QuestionInputField.measuredWidth(
+                                        for: questionText,
+                                        fontOption: inputFont
+                                    ),
                                     isEmpty: false,
                                     isFocused: false,
-                                    lineHeight: modelResponseLineHeight,
+                                    lineHeight: inputLineHeight,
+                                    textAlignment: inputTextAlignment,
+                                    fontOption: inputFont,
                                     showsChrome: false,
                                     relay: TextInputRelay(),
                                     onFocusChange: { _ in },
@@ -1175,13 +1240,6 @@ struct ChatThreadColumn: View {
                             .frame(maxWidth: .infinity)
                         }
                         .frame(maxWidth: .infinity)
-                        .contextMenu {
-                            Button {
-                                onFlagQuote(questionText, index)
-                            } label: {
-                                Label("Flag as a Quote Worth Remembering", systemImage: "quote.opening")
-                            }
-                        }
                     }
                 }
             }
@@ -1240,7 +1298,9 @@ struct ChatThreadColumn: View {
                                 text: $branchData.bottomQuestionText,
                                 isEmpty: bottomFieldIsEmpty,
                                 isFocused: isBottomQuestionFocused,
-                                lineHeight: modelResponseLineHeight,
+                                lineHeight: inputLineHeight,
+                                textAlignment: inputTextAlignment,
+                                fontOption: inputFont,
                                 placeholderColor: placeholderColor,
                                 showsChrome: false,
                                 relay: bottomFieldRelay,
@@ -1301,6 +1361,16 @@ struct ChatThreadColumn: View {
             topFieldIsEmpty    = branchData.topQuestionText.isEmpty
             bottomFieldIsEmpty = branchData.bottomQuestionText.isEmpty
         }
+        .onChange(of: modelTasks.latestCompletedTask) { _, completedTask in
+            guard let completedTask,
+                  case .userQuestion(let branchID, let responseIndex) = completedTask.kind,
+                  branchID == branchData.id else {
+                return
+            }
+            pendingResponseIndices.remove(responseIndex)
+            modelQueuedResponseIndices.remove(responseIndex)
+            streamingResponseIndices.remove(responseIndex)
+        }
         .onChange(of: quotedConcept) { oldValue, newValue in
             if let concept = newValue {
                 withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
@@ -1333,6 +1403,12 @@ struct ChatThreadColumn: View {
         // Slash-command picker tapped → insert the command into the focused field.
         .onChange(of: insertCommandRequest) { _, _ in
             insertCommandIntoActiveField()
+        }
+        .onDisappear {
+            // Navigating away removes the response renderer, so no reveal callback can arrive.
+            // Release only the presentation gates; the shell-owned model task keeps running and
+            // will still write its answer through `onResponseGenerated`.
+            responseRevealGatesByIndex.values.forEach { $0.markStarted() }
         }
     }
 
@@ -1465,9 +1541,15 @@ private struct QuestionInputField: View {
 
     /// Exact pixel width UIKit renders `text` at in the field's font — measure once, at submit
     /// time, to decide whether the submitted question fits on one line.
-    static func measuredWidth(for text: String) -> CGFloat {
+    static func measuredWidth(
+        for text: String,
+        fontOption: ConversationFontOption
+    ) -> CGFloat {
         guard !text.isEmpty else { return 0 }
-        let font = UIFont(name: "Figtree-Regular", size: fontSize) ?? .systemFont(ofSize: fontSize)
+        let fontName = fontOption == .sans
+            ? "Figtree-Regular"
+            : "LibreBaskerville-Regular"
+        let font = UIFont(name: fontName, size: fontSize) ?? .systemFont(ofSize: fontSize)
         let measuredSize = (text as NSString).size(withAttributes: [.font: font])
         return ceil(measuredSize.width)
     }
@@ -1480,6 +1562,8 @@ private struct QuestionInputField: View {
     let isEmpty: Bool
     let isFocused: Bool
     let lineHeight: CGFloat
+    let textAlignment: InputTextAlignmentOption
+    let fontOption: ConversationFontOption
     var placeholderColor: Color = AquinasTheme.Colors.placeholderText
     var showsChrome: Bool = true
     /// Which edge the boxed field hugs to within its available width.
@@ -1493,11 +1577,26 @@ private struct QuestionInputField: View {
     @State private var availableWidth: CGFloat = 0
 
     private var inputFont: UIFont {
-        UIFont(name: "Figtree-Regular", size: Self.fontSize) ?? .systemFont(ofSize: Self.fontSize)
+        let fontName = fontOption == .sans
+            ? "Figtree-Regular"
+            : "LibreBaskerville-Regular"
+        return UIFont(name: fontName, size: Self.fontSize) ?? .systemFont(ofSize: Self.fontSize)
     }
 
     private var placeholderFont: Font {
-        .custom("Figtree-Regular", size: Self.fontSize)
+        let fontName = fontOption == .sans
+            ? "Figtree-Regular"
+            : "LibreBaskerville-Regular"
+        return .custom(fontName, size: Self.fontSize)
+    }
+
+    private var uiTextAlignment: NSTextAlignment {
+        switch textAlignment {
+        case .center:
+            .center
+        case .left:
+            .natural
+        }
     }
 
     /// Always a concrete number (never nil/`.infinity`), so the fill→hug transition on submit is
@@ -1510,17 +1609,17 @@ private struct QuestionInputField: View {
     }
 
     private var plainQuestionEditor: some View {
-        ZStack(alignment: .center) {
+        ZStack(alignment: textAlignment.frameAlignment) {
             AnimatedQuestionPlaceholder(
                 text: placeholder,
                 font: placeholderFont,
                 color: placeholderColor,
                 isEmpty: isEmpty,
                 isFocused: isFocused,
-                emptyAlignment: .center,
-                filledAlignment: .center,
+                emptyAlignment: textAlignment.frameAlignment,
+                filledAlignment: textAlignment.frameAlignment,
                 animation: .spring(response: 0.36, dampingFraction: 0.86),
-                textAlignment: .center
+                textAlignment: textAlignment.textAlignment
             )
 
             ListAwareTextField(
@@ -1529,18 +1628,18 @@ private struct QuestionInputField: View {
                 lineHeight: lineHeight,
                 isLocked: isLocked,
                 textColor: .aquinasPrimaryReadable,
-                textAlignment: .center,
+                textAlignment: uiTextAlignment,
                 onFocusChange: onFocusChange,
                 relay: relay,
                 onTextChange: onTextChange,
                 onSubmit: onSubmit
             )
-            .frame(maxWidth: .infinity, minHeight: 22, alignment: .center)
+            .frame(maxWidth: .infinity, minHeight: 22, alignment: textAlignment.frameAlignment)
             .animation(.spring(response: 0.36, dampingFraction: 0.86), value: isEmpty)
             .animation(.spring(response: 0.36, dampingFraction: 0.86), value: isFocused)
         }
-        .frame(maxWidth: .infinity, minHeight: 22, alignment: .center)
-        .frame(maxWidth: Self.plainMaxWidth, alignment: .center)
+        .frame(maxWidth: .infinity, minHeight: 22, alignment: textAlignment.frameAlignment)
+        .frame(maxWidth: Self.plainMaxWidth, alignment: textAlignment.frameAlignment)
     }
 
     var body: some View {

@@ -80,7 +80,6 @@ protocol HomeBackendService {
     func looseThread(conversationID: UUID) async throws -> LooseThreadCard?
     func glossedTerm(conversationID: UUID) async throws -> GlossedTermCard?
     func todayInHistory(conversationID: UUID, overrideDate: String?) async throws -> TodayInHistoryCard?
-    func flagQuote(conversationID: UUID, responseID: UUID, quoteText: String) async throws
     func yourQuote(conversationID: UUID) async throws -> YourQuoteCard?
 }
 
@@ -121,17 +120,6 @@ struct BackendHomeService: HomeBackendService {
             )
         )
         return try response?.domainValue
-    }
-
-    func flagQuote(conversationID: UUID, responseID: UUID, quoteText: String) async throws {
-        let _: FlagQuoteResponse = try await request(
-            path: "home/flag-quote",
-            body: FlagQuoteRequest(
-                conversationID: conversationID.uuidString,
-                responseID: responseID.uuidString,
-                quoteText: quoteText
-            )
-        )
     }
 
     func yourQuote(conversationID: UUID) async throws -> YourQuoteCard? {
@@ -188,22 +176,6 @@ private struct TodayInHistoryRequest: Encodable {
         case conversationID = "conversation_id"
         case overrideDate = "override_date"
     }
-}
-
-private struct FlagQuoteRequest: Encodable {
-    let conversationID: String
-    let responseID: String
-    let quoteText: String
-
-    enum CodingKeys: String, CodingKey {
-        case conversationID = "conversation_id"
-        case responseID = "response_id"
-        case quoteText = "quote_text"
-    }
-}
-
-private struct FlagQuoteResponse: Decodable {
-    let status: String
 }
 
 private struct LooseThreadResponse: Decodable {
