@@ -5,6 +5,7 @@
 
 import Foundation
 import LiteRTLM
+import OSLog
 
 /// Resumes a `CheckedContinuation` at most once, whichever of two racing unstructured `Task`s
 /// gets there first. A plain `Task.isCancelled` check isn't enough here since the loser (a
@@ -67,6 +68,10 @@ actor LiteRTAquinasRuntime: ModelRuntimeDriver {
     private var generationSlotHeld = false
     private var generationWaiters: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
     private var lastTokenAt: ContinuousClock.Instant = .now
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.aquinas",
+        category: "LiteRTAquinasRuntime"
+    )
 
     private static let generationsBeforeRefresh = 4
     /// Native decoding has no built-in time cutoff (by design — see MODEL-INTEGRATION.md), so a
@@ -175,9 +180,10 @@ actor LiteRTAquinasRuntime: ModelRuntimeDriver {
             if error is CancellationError || Task.isCancelled {
                 throw CancellationError()
             }
-#if DEBUG
-            print("Aquinas local generation attempt failed: \(String(reflecting: error))")
-#endif
+            logger.error(
+                "Local generation attempt failed: \(String(reflecting: error), privacy: .public)"
+            )
+            Self.debugConsoleLog("attempt failed: \(String(reflecting: error))")
 
             // A genuine stall (the watchdog gave up waiting for any native progress at all —
             // see `racingStall`) has been observed, via device console capture, to reproduce
@@ -202,12 +208,20 @@ actor LiteRTAquinasRuntime: ModelRuntimeDriver {
                 completedGenerations += 1
                 return result
             } catch {
-#if DEBUG
-                print("Aquinas local generation retry failed: \(String(reflecting: error))")
-#endif
+                logger.error(
+                    "Local generation retry failed: \(String(reflecting: error), privacy: .public)"
+                )
+                Self.debugConsoleLog("retry failed: \(String(reflecting: error))")
                 throw error
             }
         }
+    }
+
+    nonisolated private static func debugConsoleLog(_ message: String) {
+#if DEBUG
+        guard let data = "[LiteRTAquinasRuntime] \(message)\n".data(using: .utf8) else { return }
+        try? FileHandle.standardError.write(contentsOf: data)
+#endif
     }
 
     private func acquireGenerationSlot() async throws {

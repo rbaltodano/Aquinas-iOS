@@ -12,20 +12,48 @@ import UIKit
 struct ModelResponseFooter: View {
     let copyText: String
     var responseTextAlignment: ResponseTextAlignmentOption = .left
+    var onRegenerate: (() -> Void)? = nil
+    var onBranch: (() -> Void)? = nil
 
     @State private var showsCopiedConfirmation = false
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            Button(action: copyResponse) {
-                Image(systemName: showsCopiedConfirmation ? "checkmark" : "doc.on.doc")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(AquinasTheme.Colors.responseButton)
-                    .frame(width: 14, height: 16)
-                    .contentShape(Rectangle())
+        VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 6) {
+            HStack(spacing: 8) {
+                Button(action: copyResponse) {
+                    Image(systemName: showsCopiedConfirmation ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(AquinasTheme.Colors.responseButton)
+                        .frame(width: 14, height: 16)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(showsCopiedConfirmation ? "Response copied" : "Copy response")
+
+                if let onRegenerate {
+                    Button(action: onRegenerate) {
+                        Image(systemName: "arrow.trianglehead.2.clockwise")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(AquinasTheme.Colors.responseButton)
+                            .frame(width: 14, height: 16)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Regenerate response")
+                }
+
+                if let onBranch {
+                    Button(action: onBranch) {
+                        Image(systemName: "arrow.trianglehead.branch")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(AquinasTheme.Colors.responseButton)
+                            .frame(width: 14, height: 16)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Branch conversation")
+                }
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(showsCopiedConfirmation ? "Response copied" : "Copy response")
 
             Text("AI can make mistakes, verify important details")
                 .font(.custom("Figtree-SemiBold", size: 10))

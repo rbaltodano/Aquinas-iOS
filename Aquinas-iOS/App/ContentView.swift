@@ -291,9 +291,13 @@ struct ContentView: View {
     /// Shell-owned so model work and its popup survive page navigation.
     @State private var modelTasks: ModelTaskQueue
     @State private var modelTasksPopupState = ModelTasksPopupState()
+    /// Reported up by `StudyTopicsView` so the global Model Controls bar can render its pill
+    /// while that page's own selection/canvas/confirmation state stays owned locally there.
+    @State private var studyTopicsControls = StudyTopicsPageControls()
     @State private var modelCompletionNotifications = ModelCompletionNotificationCenter()
     @State private var questionOfTheDay = HomeQuestionOfTheDayStore.loadPending()
     @State private var dailyQuestionRefreshTask: Task<Void, Never>? = nil
+    @State private var dailyQuestionGenerationRetryNotBefore = Date.distantPast
     @State private var isDailyQuestionGenerationErrorPresented: Bool = false
     @State private var homeLooseThread: LooseThreadCard? = nil
     @State private var homeTodayInHistory: TodayInHistoryCard? = nil
@@ -301,9 +305,8 @@ struct ContentView: View {
     @State private var homeYourQuote: YourQuoteCard? = nil
     @Environment(\.homeBackendService) private var homeBackendService
     @AppStorage("aquinas.settings.conversationFontSize") private var conversationFontSize: ConversationFontSizeOption = .small
-    @AppStorage("aquinas.settings.inputTextAlignment") private var inputTextAlignment: InputTextAlignmentOption = .center
+    @AppStorage(SettingsStorageKey.conversationTextAlignment) private var conversationTextAlignment: ConversationTextAlignmentOption = .center
     @AppStorage("aquinas.settings.inputFont") private var inputFont: ConversationFontOption = .serif
-    @AppStorage("aquinas.settings.responseTextAlignment") private var responseTextAlignment: ResponseTextAlignmentOption = .center
     @AppStorage("aquinas.settings.responseFont") private var responseFont: ConversationFontOption = .sans
     @AppStorage("aquinas.settings.conversationPersonality") private var conversationPersonality: ConversationPersonality = .balanced
 
@@ -314,11 +317,23 @@ struct ContentView: View {
     private let pageTransitionOffset: CGFloat = 8
 
     init() {
+        Self.migrateConversationTextAlignmentPreferenceIfNeeded()
         _modelTasks = State(initialValue: ModelTaskQueue())
     }
 
     init(modelTasks: ModelTaskQueue) {
+        Self.migrateConversationTextAlignmentPreferenceIfNeeded()
         _modelTasks = State(initialValue: modelTasks)
+    }
+
+    private static func migrateConversationTextAlignmentPreferenceIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: SettingsStorageKey.conversationTextAlignment) == nil,
+              let legacyRawValue = defaults.string(forKey: SettingsStorageKey.legacyResponseTextAlignment),
+              let legacyAlignment = ConversationTextAlignmentOption(rawValue: legacyRawValue) else {
+            return
+        }
+        defaults.set(legacyAlignment.rawValue, forKey: SettingsStorageKey.conversationTextAlignment)
     }
 
     private var rootSafeAreaColor: Color {
@@ -335,11 +350,10 @@ struct ContentView: View {
     }
 
     private var globalInsightContextWordCount: Int {
-        globalTreeInsights
+        let text = globalTreeInsights
             .flatMap { [$0.word, $0.meaning, $0.example] }
             .joined(separator: " ")
-            .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
-            .count
+        return AquinasContextBudget.estimatedTokenCount(in: text)
     }
 
     private func openModelTaskPage(_ task: ModelTaskSnapshot) {
@@ -415,6 +429,131 @@ struct ContentView: View {
         }
     }
 
+    /// The single, persistent Model Controls bar shown across every non-conversation page.
+    /// Anchored via `.safeAreaInset` outside the page-content fade/offset transition, so it stays
+    /// in place while page content animates behind it — its own content simply swaps (with an
+    /// implicit crossfade) to match `displayedPage`, mirroring the button-swap feel already used
+    /// when switching between internal conversation pages. The conversation page keeps its own
+    /// composer dock (`InquiryControlDock`), which is far more than a status/action pill and stays
+    /// owned by `CurrentConversationView`.
+    @ViewBuilder private var globalModelControlsBar: some View {
+        switch displayedPage {
+        case .home:
+            PageModelControls(
+                modelTasks: modelTasks,
+                popupState: modelTasksPopupState,
+                actionTitle: "New Conversation",
+                action: {
+                    newConversationRequest += 1
+                    activePage = .conversation
+                }
+            )
+            .background(alignment: .bottom) {
+                LinearGradient(
+                    colors: [
+                        AquinasTheme.Colors.canvas.opacity(0),
+                        AquinasTheme.Colors.canvas
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: 350)
+                .allowsHitTesting(false)
+            }
+        case .conversation:
+            EmptyView()
+        case .openConversations:
+            PageModelControls(
+                modelTasks: modelTasks,
+                popupState: modelTasksPopupState,
+                actionTitle: "New Conversation",
+                action: {
+                    newConversationRequest += 1
+                    activePage = .conversation
+                }
+            )
+        case .settings:
+            PageModelControls(
+                modelTasks: modelTasks,
+                popupState: modelTasksPopupState
+            )
+        case .insights:
+            GlobalInsightsModelControls(
+                showFilePicker: $showFilePicker,
+                showPhotoPicker: $showPhotoPicker,
+                showCamera: $showCamera,
+                selectedPersonality: $globalInsightSelectedPersonality,
+                isPersonalityMenuOpen: $globalInsightIsPersonalityMenuOpen,
+                hasCanvasHover: globalInsightHasCanvasHover,
+                hasCanvasInsightHover: globalInsightHasInsightHover,
+                hasSelectedCanvasItems: globalInsightSelectedItemCount > 0,
+                selectedCanvasItemCount: globalInsightSelectedItemCount,
+                isMidpointMode: globalInsightIsMidpointMode,
+                isCanvasInsightLoading: globalInsightIsGenerating,
+                contextWordCount: globalInsightContextWordCount,
+                modelTasks: modelTasks,
+                modelTasksPopupState: modelTasksPopupState,
+                searchText: $globalInsightSearchQuery,
+                isSearchActive: $globalInsightIsSearchActive,
+                searchResultIndex: globalInsightSearchResultIndex,
+                searchResultCount: globalInsightSearchResultCount,
+                onSelectCanvasItem: { globalInsightSelectionRequest += 1 },
+                onCreateCanvasConcept: { globalInsightCreateConceptRequest += 1 },
+                onInquireConnection: { globalInsightInquireConnectionRequest += 1 },
+                onQuoteCanvasItem: {
+                    guard globalInsightQuoteTarget != nil else { return }
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
+                        isGlobalInsightAskMode = true
+                    }
+                },
+                usesCanvasAskFlow: true,
+                isCanvasAskMode: isGlobalInsightAskMode,
+                onAskInNewConversation: askGlobalInsightInNewConversation,
+                onAskInExistingConversation: {
+                    guard let target = globalInsightQuoteTarget else { return }
+                    globalInsightExistingConversationTarget = target
+                },
+                onCancelCanvasAsk: {
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
+                        isGlobalInsightAskMode = false
+                    }
+                },
+                onMidpointConcepts: { globalInsightMidpointEnterRequest += 1 },
+                onMidpointCenter: { globalInsightMidpointCenterRequest += 1 },
+                onMidpointPlace: { globalInsightMidpointPlaceRequest += 1 },
+                onSearchPrevious: { globalInsightSearchPreviousRequest += 1 },
+                onSearchNext: { globalInsightSearchNextRequest += 1 },
+                onSearchActivated: {
+                    globalInsightsContextCardState.reset()
+                    modelTasksPopupState.reset()
+                    globalInsightDismissHoverRequest += 1
+                },
+                onClearCanvasSelection: { globalInsightClearSelectionRequest += 1 },
+                onContextWillOpen: { globalInsightDismissHoverRequest += 1 },
+                confirmationTitle: isGlobalTreeUpdatePromptVisible
+                    ? "Update Global Insights Tree?"
+                    : nil,
+                onConfirmUpdate: updateGlobalInsightTree,
+                onDeclineUpdate: dismissGlobalInsightTreeUpdate,
+                contextCard: globalInsightsContextCardState
+            )
+        case .studyTopics:
+            if studyTopicsControls.isVisible {
+                PageModelControls(
+                    modelTasks: modelTasks,
+                    popupState: modelTasksPopupState,
+                    actionTitle: studyTopicsControls.actionTitle,
+                    secondaryActionTitle: studyTopicsControls.secondaryActionTitle,
+                    secondaryAction: studyTopicsControls.secondaryAction,
+                    confirmationTitle: studyTopicsControls.confirmationTitle,
+                    onConfirm: studyTopicsControls.onConfirm,
+                    onDecline: studyTopicsControls.onDecline,
+                    action: studyTopicsControls.action
+                )
+            }
+        }
+    }
+
     @ViewBuilder private var insightTreePage: some View {
         InsightTreeView(
             insights: globalTreeInsights,
@@ -478,6 +617,19 @@ struct ContentView: View {
                     }
                 }
             },
+            onBookmarkConcepts: { concepts in
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                    for concept in concepts {
+                        if !collectedDefinitions.contains(where: { $0.id == concept.id }) {
+                            collectedDefinitions.append(concept)
+                        }
+                        if !globalTreeInsights.contains(where: { $0.id == concept.id }) {
+                            globalTreeInsights.append(concept)
+                        }
+                    }
+                }
+                GlobalInsightTreeStore.save(globalTreeInsights)
+            },
             inquireConnectionRequest: globalInsightInquireConnectionRequest,
             onInquireConnectionConcepts: { concepts in
                 guard let first = concepts.first else { return }
@@ -508,69 +660,11 @@ struct ContentView: View {
             model: aquinasModel,
             embeddingProvider: embeddingProvider
         )
-        .safeAreaInset(edge: .bottom) {
-            GlobalInsightsModelControls(
-                showFilePicker: $showFilePicker,
-                showPhotoPicker: $showPhotoPicker,
-                showCamera: $showCamera,
-                selectedPersonality: $globalInsightSelectedPersonality,
-                isPersonalityMenuOpen: $globalInsightIsPersonalityMenuOpen,
-                hasCanvasHover: globalInsightHasCanvasHover,
-                hasCanvasInsightHover: globalInsightHasInsightHover,
-                hasSelectedCanvasItems: globalInsightSelectedItemCount > 0,
-                selectedCanvasItemCount: globalInsightSelectedItemCount,
-                isMidpointMode: globalInsightIsMidpointMode,
-                isCanvasInsightLoading: globalInsightIsGenerating,
-                contextWordCount: globalInsightContextWordCount,
-                modelTasks: modelTasks,
-                modelTasksPopupState: modelTasksPopupState,
-                searchText: $globalInsightSearchQuery,
-                isSearchActive: $globalInsightIsSearchActive,
-                searchResultIndex: globalInsightSearchResultIndex,
-                searchResultCount: globalInsightSearchResultCount,
-                onSelectCanvasItem: { globalInsightSelectionRequest += 1 },
-                onCreateCanvasConcept: { globalInsightCreateConceptRequest += 1 },
-                onInquireConnection: { globalInsightInquireConnectionRequest += 1 },
-                onQuoteCanvasItem: {
-                    guard globalInsightQuoteTarget != nil else { return }
-                    withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
-                        isGlobalInsightAskMode = true
-                    }
-                },
-                usesCanvasAskFlow: true,
-                isCanvasAskMode: isGlobalInsightAskMode,
-                onAskInNewConversation: askGlobalInsightInNewConversation,
-                onAskInExistingConversation: {
-                    guard let target = globalInsightQuoteTarget else { return }
-                    globalInsightExistingConversationTarget = target
-                },
-                onCancelCanvasAsk: {
-                    withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
-                        isGlobalInsightAskMode = false
-                    }
-                },
-                onMidpointConcepts: { globalInsightMidpointEnterRequest += 1 },
-                onMidpointCenter: { globalInsightMidpointCenterRequest += 1 },
-                onMidpointPlace: { globalInsightMidpointPlaceRequest += 1 },
-                onSearchPrevious: { globalInsightSearchPreviousRequest += 1 },
-                onSearchNext: { globalInsightSearchNextRequest += 1 },
-                onSearchActivated: {
-                    globalInsightsContextCardState.reset()
-                    modelTasksPopupState.reset()
-                    globalInsightDismissHoverRequest += 1
-                },
-                onClearCanvasSelection: { globalInsightClearSelectionRequest += 1 },
-                onContextWillOpen: { globalInsightDismissHoverRequest += 1 },
-                confirmationTitle: isGlobalTreeUpdatePromptVisible
-                    ? "Update Global Insights Tree?"
-                    : nil,
-                onConfirmUpdate: updateGlobalInsightTree,
-                onDeclineUpdate: dismissGlobalInsightTreeUpdate,
-                contextCard: globalInsightsContextCardState
-            )
-        }
         .background(canvasColor)
-        .ignoresSafeArea(.container)  // edges/notch only — keyboard safe area is respected
+        // Top/side notch bleed only — keyboard safe area and the global Model Controls bar's
+        // bottom inset (applied on an ancestor container) must still be respected, or the
+        // docked Insight card renders behind the bar instead of stacking above it.
+        .ignoresSafeArea(.container, edges: [.top, .horizontal])
         .sheet(item: $globalInsightExistingConversationTarget) { insight in
             InsightConversationPickerSheet(
                 title: "Existing Conversations",
@@ -640,9 +734,8 @@ struct ContentView: View {
             insightConversationQuoteRequest: $insightConversationQuoteRequest,
             newConversationInsightQuoteRequest: $newConversationInsightQuoteRequest,
             conversationFontSize: conversationFontSize,
-            inputTextAlignment: inputTextAlignment,
+            conversationTextAlignment: conversationTextAlignment,
             inputFont: inputFont,
-            responseTextAlignment: responseTextAlignment,
             responseFont: responseFont,
             conversationTitlePolicy: conversationTitlePolicy,
             conversationPersonality: $conversationPersonality,
@@ -732,29 +825,6 @@ struct ContentView: View {
                                         Task { await refreshHomeSections() }
                                     }
                                 )
-                                .safeAreaInset(edge: .bottom) {
-                                    PageModelControls(
-                                        modelTasks: modelTasks,
-                                        popupState: modelTasksPopupState,
-                                        actionTitle: "New Conversation",
-                                        action: {
-                                            newConversationRequest += 1
-                                            activePage = .conversation
-                                        }
-                                    )
-                                    .background(alignment: .bottom) {
-                                        LinearGradient(
-                                            colors: [
-                                                AquinasTheme.Colors.canvas.opacity(0),
-                                                AquinasTheme.Colors.canvas
-                                            ],
-                                            startPoint: .top,
-                                            endPoint: .bottom
-                                        )
-                                        .frame(height: 350)
-                                        .allowsHitTesting(false)
-                                    }
-                                }
                             case .conversation:
                                 Color.clear
                                     .allowsHitTesting(false)
@@ -805,9 +875,8 @@ struct ContentView: View {
                                     userName: $userName,
                                     customInstructions: $customInstructions,
                                     conversationFontSize: $conversationFontSize,
-                                    inputTextAlignment: $inputTextAlignment,
+                                    conversationTextAlignment: $conversationTextAlignment,
                                     inputFont: $inputFont,
-                                    responseTextAlignment: $responseTextAlignment,
                                     responseFont: $responseFont,
                                     conversationPersonality: $conversationPersonality,
                                     onOpenMenu: {
@@ -818,12 +887,6 @@ struct ContentView: View {
                                     },
                                     onDetailVisibilityChange: { isSettingsDetailVisible = $0 }
                                 )
-                                .safeAreaInset(edge: .bottom) {
-                                    PageModelControls(
-                                        modelTasks: modelTasks,
-                                        popupState: modelTasksPopupState
-                                    )
-                                }
                             case .insights:
                                 insightTreePage
                             case .studyTopics:
@@ -896,7 +959,8 @@ struct ContentView: View {
                                     onRefresh: refreshPersistedContent,
                                     onDetailVisibilityChange: { isVisible in
                                         isStudyTopicDetailVisible = isVisible
-                                    }
+                                    },
+                                    onControlsChange: { studyTopicsControls = $0 }
                                 )
                             }
                         }
@@ -907,6 +971,15 @@ struct ContentView: View {
                         .offset(y: pageContentOffsetY)
                     }
                     .background(AquinasTheme.Colors.activeInquiryChrome)
+                    // Rendered here — outside the fade/offset applied to the two branches above —
+                    // so the Model Controls bar stays put and simply swaps its own content while
+                    // page transitions play, instead of animating (and briefly disappearing) with
+                    // the page itself. `.safeAreaInset` also gives every page's scroll content the
+                    // same automatic bottom clearance it always had, without hand-measuring heights.
+                    .safeAreaInset(edge: .bottom) {
+                        globalModelControlsBar
+                            .animation(.easeInOut(duration: 0.22), value: displayedPage)
+                    }
                 }
                 // ── Full-screen pull-to-open gesture ──────────────────────────
                 // Runs simultaneously with canvas/scroll gestures so it doesn't
@@ -1201,6 +1274,7 @@ struct ContentView: View {
         ) {
             Button("Cancel", role: .cancel) { }
             Button("Try Again") {
+                dailyQuestionGenerationRetryNotBefore = .distantPast
                 scheduleDailyQuestionRefreshIfNeeded(minimumDelay: 0)
             }
         } message: {
@@ -1373,7 +1447,13 @@ struct ContentView: View {
         }
 
         let eligibilityDate = HomeQuestionOfTheDayStore.nextEligibleRefreshDate()
-        let delay = max(minimumDelay, eligibilityDate.timeIntervalSinceNow)
+        let delay = max(
+            minimumDelay,
+            max(
+                eligibilityDate.timeIntervalSinceNow,
+                dailyQuestionGenerationRetryNotBefore.timeIntervalSinceNow
+            )
+        )
         dailyQuestionRefreshTask = Task { @MainActor in
             do {
                 try await Task.sleep(for: .seconds(delay))
@@ -1390,18 +1470,23 @@ struct ContentView: View {
 
             questionOfTheDay = HomeQuestionOfTheDayStore.loadPending()
             guard questionOfTheDay == nil,
-                  HomeQuestionOfTheDayStore.isEligibleForRefresh(),
-                  let source = DailyQuestionSourceSelector.select(
+                  HomeQuestionOfTheDayStore.isEligibleForRefresh() else {
+                dailyQuestionRefreshTask = nil
+                debugQuestionOfTheDayConsoleLog("refresh no longer eligible")
+                return
+            }
+            guard let source = DailyQuestionSourceSelector.select(
                       conversations: sideMenuConversations,
                       activeConversationID: sideMenuActiveConversationID,
                       savedInsights: collectedDefinitions
                   ) else {
                 dailyQuestionRefreshTask = nil
-                scheduleDailyQuestionRefreshIfNeeded()
+                debugQuestionOfTheDayConsoleLog("no eligible source conversation")
                 return
             }
 
             dailyQuestionRefreshTask = nil
+            debugQuestionOfTheDayConsoleLog("enqueuing generation")
             modelTasks.enqueue(
                 kind: .refreshQuestionOfTheDay,
                 originPage: .home,
@@ -1416,6 +1501,10 @@ struct ContentView: View {
                     )
                 } catch {
                     guard !Task.isCancelled else { return }
+                    dailyQuestionGenerationRetryNotBefore = Date().addingTimeInterval(60 * 60)
+                    debugQuestionOfTheDayConsoleLog(
+                        "model boundary failed: \(String(reflecting: error))"
+                    )
                     isDailyQuestionGenerationErrorPresented = true
                     return
                 }
@@ -1423,7 +1512,11 @@ struct ContentView: View {
                 let trimmedQuestion = draft.question.trimmingCharacters(
                     in: .whitespacesAndNewlines
                 )
-                guard !trimmedQuestion.isEmpty else { return }
+                guard HomeQuestionOfTheDay.isValidQuestionText(trimmedQuestion) else {
+                    dailyQuestionGenerationRetryNotBefore = Date().addingTimeInterval(60 * 60)
+                    isDailyQuestionGenerationErrorPresented = true
+                    return
+                }
 
                 let citedInsight = draft.citedInsightTitle.flatMap { citedTitle in
                     source.insights.first {
@@ -1442,6 +1535,7 @@ struct ContentView: View {
                     sourceConversationID: source.conversation.id,
                     sourceConversationTitle: source.conversation.title
                 )
+                dailyQuestionGenerationRetryNotBefore = .distantPast
                 HomeQuestionOfTheDayStore.save(generated)
                 withAnimation(.easeInOut(duration: 0.35)) {
                     questionOfTheDay = generated
@@ -1792,9 +1886,6 @@ private struct GlobalInsightsModelControls: View {
             onCanvasSearchPrevious: onSearchPrevious,
             onCanvasSearchNext: onSearchNext,
             onCanvasSearchActivated: onSearchActivated,
-            onModelStatusTap: {
-                globalModelStatusTap()
-            },
             confirmationTitle: confirmationTitle,
             onConfirm: onConfirmUpdate,
             onDecline: onDeclineUpdate,
@@ -1803,24 +1894,9 @@ private struct GlobalInsightsModelControls: View {
             onClearCanvasSelection: onClearCanvasSelection,
             contextWordCount: contextWordCount,
             onClearConversation: {},
-            onContextWillOpen: {
-                modelTasksPopupState.reset()
-                onContextWillOpen()
-            },
+            onContextWillOpen: onContextWillOpen,
             contextCard: contextCard
         )
-    }
-
-    private func globalModelStatusTap() {
-        contextCard.reset()
-        if !modelTasksPopupState.isOpen {
-            let generator = UIImpactFeedbackGenerator(style: .light)
-            generator.prepare()
-            generator.impactOccurred(intensity: 0.65)
-        }
-        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
-            modelTasksPopupState.isOpen.toggle()
-        }
     }
 }
 

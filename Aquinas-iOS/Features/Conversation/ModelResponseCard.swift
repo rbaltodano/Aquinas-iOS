@@ -28,6 +28,7 @@ struct ModelResponseCard: View {
     let loadingInsightKey: String?
     let queuedInsightKeys: Set<String>
     let savedInsightIDs: Set<UUID>
+    var onRegenerate: (() -> Void)? = nil
     var onDuplicateBranch: (() -> Void)? = nil
     var onInsightTap: ((String, String) -> Void)? = nil
     var onInlineInsightQuote: ((ConceptDefinition) -> Void)? = nil
@@ -88,6 +89,7 @@ struct ModelResponseCard: View {
         loadingInsightKey: String? = nil,
         queuedInsightKeys: Set<String> = [],
         savedInsightIDs: Set<UUID> = [],
+        onRegenerate: (() -> Void)? = nil,
         onDuplicateBranch: (() -> Void)? = nil,
         onInsightTap: ((String, String) -> Void)? = nil,
         onInlineInsightQuote: ((ConceptDefinition) -> Void)? = nil,
@@ -113,6 +115,7 @@ struct ModelResponseCard: View {
         self.loadingInsightKey = loadingInsightKey
         self.queuedInsightKeys = queuedInsightKeys
         self.savedInsightIDs = savedInsightIDs
+        self.onRegenerate = onRegenerate
         self.onDuplicateBranch = onDuplicateBranch
         self.onInsightTap = onInsightTap
         self.onInlineInsightQuote = onInlineInsightQuote
@@ -267,6 +270,7 @@ struct ModelResponseCard: View {
                         queuedInsightKeys: queuedInsightKeys,
                         savedInsightIDs: savedInsightIDs,
                         showsResponseActions: showsResponseActions,
+                        onRegenerate: onRegenerate,
                         onBranch: onDuplicateBranch,
                         onInsightTap: onInsightTap,
                         onInlineInsightQuote: onInlineInsightQuote,
@@ -465,7 +469,7 @@ private struct LiveThinkingProgressView: View {
     }
 
     var body: some View {
-        VStack(alignment: showsDetailedProgress ? responseTextAlignment.horizontalAlignment : .center, spacing: 8) {
+        VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 8) {
             Group {
                 if showsDetailedProgress {
                     VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 8) {
@@ -504,7 +508,7 @@ private struct LiveThinkingProgressView: View {
                             .font(font)
                             .fontWeight(.bold)
                             .modifier(QueuedWorkBreatheModifier(isQueued: true))
-                            .frame(maxWidth: .infinity, alignment: .center)
+                            .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
                             .transition(.opacity.combined(with: .scale(scale: 0.96)))
                             .accessibilityLabel("Question queued")
                     } else {
@@ -512,7 +516,7 @@ private struct LiveThinkingProgressView: View {
                             .font(font)
                             .fontWeight(.bold)
                             .modifier(ThinkingShimmer(isActive: true, color: color))
-                            .frame(maxWidth: .infinity, alignment: .center)
+                            .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
                             .transition(.opacity.combined(with: .scale(scale: 0.96)))
                             .accessibilityLabel("Thinking")
                     }

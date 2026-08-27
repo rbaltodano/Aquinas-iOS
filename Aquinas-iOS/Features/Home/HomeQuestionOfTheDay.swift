@@ -5,6 +5,13 @@
 
 import Foundation
 
+func debugQuestionOfTheDayConsoleLog(_ message: String) {
+#if DEBUG
+    guard let data = "[QuestionOfTheDay] \(message)\n".data(using: .utf8) else { return }
+    try? FileHandle.standardError.write(contentsOf: data)
+#endif
+}
+
 struct DailyQuestionDraft: Equatable {
     let question: String
     let reasonForAsking: String
@@ -45,9 +52,13 @@ struct HomeQuestionOfTheDay: Codable, Equatable, Identifiable {
     }
 
     func isPending(at date: Date = Date()) -> Bool {
-        !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        Self.isValidQuestionText(question)
             && answeredAt == nil
             && expiresAt > date
+    }
+
+    static func isValidQuestionText(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).last == "?"
     }
 
     func markingAnswered(at date: Date = Date()) -> HomeQuestionOfTheDay {
@@ -67,6 +78,9 @@ struct HomeQuestionOfTheDay: Codable, Equatable, Identifiable {
     func nextEligibleRefreshDate(
         calendar: Calendar = .current
     ) -> Date {
+        guard Self.isValidQuestionText(question) else {
+            return .distantPast
+        }
         guard let nextCalendarDay = calendar.date(
             byAdding: .day,
             value: 1,

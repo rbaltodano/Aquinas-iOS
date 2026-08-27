@@ -184,14 +184,6 @@ struct OpenConversationsView: View {
             .zIndex(10)
 
         }
-        .safeAreaInset(edge: .bottom) {
-            PageModelControls(
-                modelTasks: modelTasks,
-                popupState: modelTasksPopupState,
-                actionTitle: "New Conversation",
-                action: onNewChat
-            )
-        }
         .onAppear {
             studyTopics = StudyTopicStore.load()
         }

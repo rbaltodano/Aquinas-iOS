@@ -11,6 +11,20 @@ import UIKit
 
 private let questionCanceledResponseText = "Question canceled"
 
+enum ConversationResponseStatePolicy {
+    static func isAwaitingResponse(
+        hasResponseText: Bool,
+        isLocallyPending: Bool,
+        taskPhase: ModelTaskPhase?
+    ) -> Bool {
+        // A queue task intentionally remains current until the response begins revealing.
+        // Once text exists, treating `.current` as awaiting would prevent that reveal from
+        // starting and leave the task waiting on its own completion gate forever.
+        guard !hasResponseText else { return false }
+        return isLocallyPending || taskPhase == .current || taskPhase == .upcoming
+    }
+}
+
 /// Keeps a model task current until its response actually begins revealing in the UI.
 /// Backend completion alone is not the user-visible completion boundary.
 @MainActor
@@ -64,9 +78,8 @@ struct ChatThreadColumn: View {
     @Binding var targetSpawnResponseIndex: Int?
     var externalSubmitTrigger: Int = 0
     var conversationFontSize: ConversationFontSizeOption = .large
-    var inputTextAlignment: InputTextAlignmentOption = .center
+    var conversationTextAlignment: ConversationTextAlignmentOption = .center
     var inputFont: ConversationFontOption = .serif
-    var responseTextAlignment: ResponseTextAlignmentOption = .center
     var responseFont: ConversationFontOption = .sans
     var conversationTitlePolicy: ConversationTitleOption = .automatic
     var personality: ConversationPersonality = .balanced
@@ -162,12 +175,12 @@ struct ChatThreadColumn: View {
         }
     }
 
-    private func isResponsePending(at responseIndex: Int) -> Bool {
-        if pendingResponseIndices.contains(responseIndex) {
-            return true
-        }
-        guard let task = modelTask(for: responseIndex) else { return false }
-        return task.phase == .current || task.phase == .upcoming
+    private func isResponsePending(at responseIndex: Int, text: String) -> Bool {
+        ConversationResponseStatePolicy.isAwaitingResponse(
+            hasResponseText: !text.isEmpty,
+            isLocallyPending: pendingResponseIndices.contains(responseIndex),
+            taskPhase: modelTask(for: responseIndex)?.phase
+        )
     }
 
     private func isResponseQueued(at responseIndex: Int) -> Bool {
@@ -177,10 +190,33 @@ struct ChatThreadColumn: View {
         return modelTask(for: responseIndex)?.phase == .upcoming
     }
 
+    private func responseIdentitySuffix(at responseIndex: Int, text: String) -> String {
+        if isResponsePending(at: responseIndex, text: text) {
+            return "pending"
+        }
+        return text == questionCanceledResponseText ? "canceled" : "standard"
+    }
+
+    private func regenerateResponse(at responseIndex: Int) {
+        guard pendingResponseIndices.isEmpty,
+              !modelTasks.contains(where: { task in
+                  guard case .userQuestion(let branchID, _) = task.kind else { return false }
+                  return branchID == branchData.id
+                      && (task.phase == .current || task.phase == .upcoming)
+              }),
+              branchData.activeChatBlocks.indices.contains(responseIndex),
+              case .text(let response) = branchData.activeChatBlocks[responseIndex],
+              !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              response != questionCanceledResponseText else {
+            return
+        }
+
+        appendSimulatedResponse(replacingResponseAt: responseIndex) {}
+    }
+
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.aquinasModel) private var aquinasModel
 
-    @State private var branchHeadHeight: CGFloat = 0
     @State private var animatedResponseIndices: Set<Int> = []
     @State private var pendingResponseIndices: Set<Int> = []
     @State private var streamingResponseIndices: Set<Int> = []
@@ -202,10 +238,6 @@ struct ChatThreadColumn: View {
     @State private var bottomFieldRelay = TextInputRelay()
     /// Which question field last became focused — the target for command insertion.
     @State private var bottomFieldIsActive = false
-    /// Measured single-line width of the submitted top-question text, captured once at submit
-    /// time (not live per-keystroke) — lets `QuestionInputField` hug it afterward, if it fits on
-    /// one line. Shared by whichever top-field variant is showing (they're mutually exclusive).
-    @State private var topFieldSubmittedWidth: CGFloat = 0
     /// Manually crossfaded copy of `eyebrowDisplayText` — driven by `withAnimation` directly
     /// rather than `.id()` + `.transition()`, which doesn't reliably fire here (the Text sits
     /// inside a Button's label, and Button appears to swallow the transition on its content).
@@ -370,17 +402,26 @@ struct ChatThreadColumn: View {
 
     // Routes through BackendAquinasModel for structured prose and tappable key terms.
     private func appendSimulatedResponse(
+        replacingResponseAt replacementIndex: Int? = nil,
         connectionConcepts: [ConceptDefinition]? = nil,
         restoreQueuedQuestion: @escaping () -> Void
     ) {
-        let context = ConversationContext(
-            compactedContext: branchData.compactedContext,
-            transcript: modelTranscriptForResponse(
-                connectionConcepts: connectionConcepts
-            ),
-            personality: personality
+        let responseIndex = replacementIndex ?? branchData.activeChatBlocks.count
+        let context = modelContextForResponse(
+            endingBefore: replacementIndex,
+            connectionConcepts: connectionConcepts
         )
-        let responseIndex = branchData.activeChatBlocks.count
+        let originalResponse: String?
+        let originalPresentation: ResponsePresentationMetadata?
+        if let replacementIndex,
+           branchData.activeChatBlocks.indices.contains(replacementIndex),
+           case .text(let text) = branchData.activeChatBlocks[replacementIndex] {
+            originalResponse = text
+            originalPresentation = branchData.responsePresentation(at: replacementIndex)
+        } else {
+            originalResponse = nil
+            originalPresentation = nil
+        }
         let thinkingEnabled = showsThinkingIntro
         let revealGate = ResponseRevealGate()
 
@@ -391,9 +432,16 @@ struct ChatThreadColumn: View {
             modelQueuedResponseIndices.insert(responseIndex)
         }
         responseThinkingIntroByIndex[responseIndex] = thinkingEnabled
+        responseThinkingSummaryByIndex.removeValue(forKey: responseIndex)
+        branchData.removeResponsePresentation(at: responseIndex)
         onResponseStarted()
         withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
-            branchData.activeChatBlocks.append(.text(""))
+            if branchData.activeChatBlocks.indices.contains(responseIndex) {
+                branchData.activeChatBlocks[responseIndex] = .text("")
+            } else {
+                branchData.activeChatBlocks.append(.text(""))
+            }
+            branchData.showBottomInput = false
         }
 
         modelTasks.enqueue(
@@ -409,14 +457,42 @@ struct ChatThreadColumn: View {
                 }
             },
             onCancel: {
-                cancelResponse(
-                    at: responseIndex,
-                    restoreQueuedQuestion: restoreQueuedQuestion
-                )
+                if let originalResponse {
+                    cancelRegeneration(
+                        at: responseIndex,
+                        restoring: originalResponse,
+                        presentation: originalPresentation
+                    )
+                } else {
+                    cancelResponse(
+                        at: responseIndex,
+                        restoreQueuedQuestion: restoreQueuedQuestion
+                    )
+                }
             }
         ) {
+            var responseContext = context
+            if AquinasContextBudget.shouldCompact(context),
+               let split = AquinasContextBudget.historyAndLatestTurn(in: context) {
+                let summary = await aquinasModel.compact(split.history)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !summary.isEmpty, !Task.isCancelled {
+                    responseContext = ConversationContext(
+                        compactedContext: summary,
+                        transcript: split.latestTurn,
+                        personality: context.personality
+                    )
+                    // The latest user question remains verbatim at `responseIndex - 1`; only the
+                    // blocks before it are represented by the new checkpoint.
+                    branchData.compactedContext = summary
+                    branchData.compactedThroughBlockCount = max(
+                        branchData.compactedThroughBlockCount ?? 0,
+                        max(responseIndex - 1, 0)
+                    )
+                }
+            }
             let response = await aquinasModel.respond(
-                to: context,
+                to: responseContext,
                 thinkingEnabled: thinkingEnabled
             ) { update in
                 guard !Task.isCancelled,
@@ -501,6 +577,34 @@ struct ChatThreadColumn: View {
         }
     }
 
+    private func cancelRegeneration(
+        at responseIndex: Int,
+        restoring response: String,
+        presentation: ResponsePresentationMetadata?
+    ) {
+        responseRevealGatesByIndex.removeValue(forKey: responseIndex)
+        modelQueuedResponseIndices.remove(responseIndex)
+        pendingResponseIndices.remove(responseIndex)
+        streamingResponseIndices.remove(responseIndex)
+        animatedResponseIndices.remove(responseIndex)
+        responseThinkingIntroByIndex.removeValue(forKey: responseIndex)
+        responseThinkingSummaryByIndex.removeValue(forKey: responseIndex)
+
+        guard branchData.activeChatBlocks.indices.contains(responseIndex) else {
+            onResponseCancelled()
+            return
+        }
+
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.84)) {
+            branchData.activeChatBlocks[responseIndex] = .text(response)
+            branchData.showBottomInput = true
+        }
+        if let presentation {
+            branchData.setResponsePresentation(presentation)
+        }
+        onResponseCancelled()
+    }
+
     private func cancelResponse(
         at responseIndex: Int,
         restoreQueuedQuestion: () -> Void
@@ -562,7 +666,6 @@ struct ChatThreadColumn: View {
         uploads: [UploadedFile]
     ) {
         pendingGeneratedTitleQuestion = nil
-        topFieldSubmittedWidth = 0
         topFieldIsEmpty = question.isEmpty
         if showsPendingUploads {
             uploadedFiles = uploads
@@ -620,28 +723,36 @@ struct ChatThreadColumn: View {
         }
     }
 
-    private func modelTranscriptForResponse(
+    private func modelContextForResponse(
+        endingBefore responseIndex: Int? = nil,
         connectionConcepts: [ConceptDefinition]? = nil
-    ) -> [ChatBlock] {
+    ) -> ConversationContext {
+        let transcriptEndIndex = min(
+            responseIndex ?? branchData.activeChatBlocks.count,
+            branchData.activeChatBlocks.count
+        )
+        let storedCompactedBlockCount = min(
+            branchData.compactedThroughBlockCount ?? 0,
+            branchData.activeChatBlocks.count
+        )
+        let usesCompactedContext = branchData.compactedContext != nil
+            && transcriptEndIndex >= storedCompactedBlockCount
+        let transcriptStartIndex = usesCompactedContext ? storedCompactedBlockCount : 0
+
         var transcript: [ChatBlock] = []
         if let hiddenPromptContext = branchData.hiddenPromptContext?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !hiddenPromptContext.isEmpty {
             transcript.append(.user(hiddenPromptContext, nil, []))
         }
-        if branchData.compactedContext == nil {
+        if !usesCompactedContext {
             let topQuestion = branchData.topQuestionText.trimmingCharacters(in: .whitespacesAndNewlines)
             if branchData.topQuestionSubmitted, !topQuestion.isEmpty {
                 transcript.append(.user(topQuestion, branchData.branchContextConcept, branchData.topQuestionUploads))
             }
         }
-        let compactedBlockCount = min(
-            branchData.compactedThroughBlockCount ?? 0,
-            branchData.activeChatBlocks.count
-        )
         transcript.append(
-            contentsOf: branchData.activeChatBlocks
-                .dropFirst(compactedBlockCount)
+            contentsOf: branchData.activeChatBlocks[transcriptStartIndex..<transcriptEndIndex]
                 .filter { block in
                     guard case .text(let text) = block else { return true }
                     return text != questionCanceledResponseText
@@ -663,7 +774,11 @@ struct ChatThreadColumn: View {
                 uploads
             )
         }
-        return transcript
+        return ConversationContext(
+            compactedContext: usesCompactedContext ? branchData.compactedContext : nil,
+            transcript: transcript,
+            personality: personality
+        )
     }
 
     private func connectionInquiryPrompt(
@@ -725,21 +840,6 @@ struct ChatThreadColumn: View {
         }
     }
 
-    /// Matches the Open Conversations search bar's chrome (canvas fill, 12pt radius, the same
-    /// hairline border) — but hugs the text field's own height instead of the search bar's fixed
-    /// 52pt, since the question field grows with wrapped/multi-line text.
-    private func inputContainer<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        content()
-            .padding(.horizontal, 20)
-            .padding(.vertical, 16)
-            .background(AquinasTheme.Colors.canvas)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(AquinasTheme.Colors.sideMenuSearchBorder, lineWidth: 1)
-            )
-    }
-
     // Locks the first branch question, uploads, and context chip.
     private func submitTopQuestionIfNeeded() {
         // Flush the UITextView's live buffer into the binding synchronously.
@@ -785,10 +885,6 @@ struct ChatThreadColumn: View {
         case .manual:
             pendingGeneratedTitleQuestion = nil
         }
-        topFieldSubmittedWidth = QuestionInputField.measuredWidth(
-            for: submittedQuestion,
-            fontOption: inputFont
-        )
         withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
             branchData.topQuestionSubmitted = true
         }
@@ -846,8 +942,8 @@ struct ChatThreadColumn: View {
     }
 
     private var newConversationPromptHeader: some View {
-        VStack(alignment: .center, spacing: 48) {
-            VStack(alignment: .center, spacing: 8) {
+        VStack(alignment: conversationTextAlignment.horizontalAlignment, spacing: 48) {
+            VStack(alignment: conversationTextAlignment.horizontalAlignment, spacing: 8) {
                 Button(action: onTapEyebrow) {
                     HStack(spacing: 4) {
                         Image(systemName: "square.stack")
@@ -858,8 +954,8 @@ struct ChatThreadColumn: View {
                             .blur(radius: isEyebrowTextHidden ? 4 : 0)
                     }
                     .foregroundColor(AquinasTheme.Colors.lightGreen)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity, alignment: .center)
+                    .multilineTextAlignment(conversationTextAlignment.textAlignment)
+                    .frame(maxWidth: .infinity, alignment: conversationTextAlignment.frameAlignment)
                 }
                 .buttonStyle(.plain)
                 .onAppear { displayedEyebrowText = eyebrowDisplayText }
@@ -883,8 +979,8 @@ struct ChatThreadColumn: View {
                         .font(.custom("LibreBaskerville-Regular", size: 28))
                         .foregroundColor(AquinasTheme.Colors.headingText)
                         .lineSpacing(14)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity, alignment: .center)
+                        .multilineTextAlignment(conversationTextAlignment.textAlignment)
+                        .frame(maxWidth: .infinity, alignment: conversationTextAlignment.frameAlignment)
                         .focused($isBigTitleFocused)
                         .submitLabel(.done)
                         .onSubmit {
@@ -896,8 +992,8 @@ struct ChatThreadColumn: View {
                         .font(.custom("LibreBaskerville-Regular", size: pinnedHeaderQuestion != nil ? 18 : 28))
                         .foregroundColor(AquinasTheme.Colors.headingText)
                         .lineSpacing(14)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity, alignment: .center)
+                        .multilineTextAlignment(conversationTextAlignment.textAlignment)
+                        .frame(maxWidth: .infinity, alignment: conversationTextAlignment.frameAlignment)
                         .id(newConversationHeaderTitle)
                         .transition(.blurredTitleReplacement)
                         .onTapGesture {
@@ -915,8 +1011,8 @@ struct ChatThreadColumn: View {
                         .font(AquinasTheme.Typography.body)
                         .foregroundColor(AquinasTheme.Colors.paragraphText)
                         .lineSpacing(7)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity, alignment: .center)
+                        .multilineTextAlignment(conversationTextAlignment.textAlignment)
+                        .frame(maxWidth: .infinity, alignment: conversationTextAlignment.frameAlignment)
                 }
             }
 
@@ -930,14 +1026,10 @@ struct ChatThreadColumn: View {
                 placeholder: "Ask a question...",
                 text: $branchData.topQuestionText,
                 isLocked: branchData.topQuestionSubmitted,
-                isSubmitted: branchData.topQuestionSubmitted,
-                submittedWidth: topFieldSubmittedWidth,
                 isEmpty: topFieldIsEmpty && !branchData.topQuestionSubmitted,
-                isFocused: isTopQuestionFocused && !branchData.topQuestionSubmitted,
                 lineHeight: inputLineHeight,
-                textAlignment: inputTextAlignment,
+                textAlignment: conversationTextAlignment,
                 fontOption: inputFont,
-                showsChrome: false,
                 relay: topFieldRelay,
                 onFocusChange: { focused in
                     isTopQuestionFocused = focused
@@ -951,6 +1043,7 @@ struct ChatThreadColumn: View {
                     topFieldIsEmpty = text.isEmpty
                     onActiveInputTextChange(text)
                 },
+                onSubmit: submitTopQuestionIfNeeded,
                 onTapToFocus: {
                     guard !branchData.topQuestionSubmitted else { return }
                     bottomFieldIsActive = false
@@ -991,45 +1084,43 @@ struct ChatThreadColumn: View {
                 VStack(alignment: .center, spacing: 48) {
             // MARK: Branch Header
             // Cross, branch title, starting context chip, and the first editable/locked question.
-            Color.clear
-                .frame(height: 1)
-                .id(branchAnchor)
+            if usesNewConversationPromptHeader {
+                newConversationPromptHeader
+                    .padding(.top, 84)
+            } else {
+                VStack(spacing: 16) {
+                    Image("cross-1")
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 24, height: 24)
+                        .foregroundColor(AquinasTheme.Colors.accent)
 
-            VStack(spacing: 18) {
-                if usesNewConversationPromptHeader {
-                    newConversationPromptHeader
-                } else {
-                    VStack(spacing: 16) {
-                        Image("cross-1")
-                            .renderingMode(.template)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: 24, height: 24)
-                            .foregroundColor(AquinasTheme.Colors.accent)
-
-                        if let branchKeyword {
-                            Text(createEditorialTitle(
-                                fullText: displayBranchTitle,
-                                keyword: branchKeyword,
-                                fontSize: 34,
-                                baseColor: AquinasTheme.Colors.primaryReadable,
-                                keywordColor: AquinasTheme.Colors.linkGreen
-                            ))
-                            .multilineTextAlignment(.center)
-                            .frame(maxWidth: .infinity)
-                        } else {
-                            Text(displayBranchTitle)
-                                .font(.custom("LibreBaskerville-Regular", size: 34))
-                                .foregroundColor(AquinasTheme.Colors.primaryReadable)
-                                .multilineTextAlignment(.center)
-                                .frame(maxWidth: .infinity)
-                                .id(displayBranchTitle)
-                                .transition(.blurredTitleReplacement)
-                        }
+                    if let branchKeyword {
+                        Text(createEditorialTitle(
+                            fullText: displayBranchTitle,
+                            keyword: branchKeyword,
+                            fontSize: 34,
+                            baseColor: AquinasTheme.Colors.primaryReadable,
+                            keywordColor: AquinasTheme.Colors.linkGreen
+                        ))
+                        .multilineTextAlignment(conversationTextAlignment.textAlignment)
+                        .frame(maxWidth: .infinity, alignment: conversationTextAlignment.frameAlignment)
+                    } else {
+                        Text(displayBranchTitle)
+                            .font(.custom("LibreBaskerville-Regular", size: 34))
+                            .foregroundColor(AquinasTheme.Colors.primaryReadable)
+                            .multilineTextAlignment(conversationTextAlignment.textAlignment)
+                            .frame(maxWidth: .infinity, alignment: conversationTextAlignment.frameAlignment)
+                            .id(displayBranchTitle)
+                            .transition(.blurredTitleReplacement)
                     }
-                    .frame(maxWidth: .infinity)
                 }
+                .frame(maxWidth: .infinity)
+                .padding(.top, readingTopPadding)
+            }
 
+            VStack(spacing: 16) {
                 UploadedFileStrip(
                     files: branchData.topQuestionSubmitted ? branchData.topQuestionUploads : visibleUploads,
                     onRemove: branchData.topQuestionSubmitted ? nil : { file in
@@ -1073,12 +1164,9 @@ struct ChatThreadColumn: View {
                                 placeholder: "Ask a question...",
                                 text: $branchData.topQuestionText,
                                 isLocked: branchData.topQuestionSubmitted,
-                                isSubmitted: branchData.topQuestionSubmitted,
-                                submittedWidth: topFieldSubmittedWidth,
                                 isEmpty: topFieldIsEmpty && !branchData.topQuestionSubmitted,
-                                isFocused: isTopQuestionFocused && !branchData.topQuestionSubmitted,
                                 lineHeight: inputLineHeight,
-                                textAlignment: inputTextAlignment,
+                                textAlignment: conversationTextAlignment,
                                 fontOption: inputFont,
                                 placeholderColor: placeholderColor,
                                 relay: topFieldRelay,
@@ -1094,6 +1182,7 @@ struct ChatThreadColumn: View {
                                     topFieldIsEmpty = text.isEmpty
                                     onActiveInputTextChange(text)
                                 },
+                                onSubmit: submitTopQuestionIfNeeded,
                                 onTapToFocus: {
                                     guard !branchData.topQuestionSubmitted else { return }
                                     bottomFieldIsActive = false
@@ -1109,40 +1198,25 @@ struct ChatThreadColumn: View {
                     }
                 }
                 .id("top-input-anchor-\(branchData.id)")
-
-                if branchData.topQuestionSubmitted {
-                    ConversationSeparator()
-                        .padding(.top, 30)
-                        .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .top)))
-                }
             }
             .frame(maxWidth: .infinity)
-            .background(
-                GeometryReader { geo in
-                    Color.clear
-                        .onAppear {
-                            branchHeadHeight = geo.size.height
-                        }
-                        .onChange(of: geo.size.height) { oldValue, newValue in
-                            branchHeadHeight = newValue
-                        }
-                }
-            )
-            .padding(.top, usesNewConversationPromptHeader ? 84 : readingTopPadding)
+
+            if branchData.topQuestionSubmitted {
+                ConversationSeparator()
+                    .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .top)))
+            }
 
             // MARK: Conversation Blocks
             // Alternates between user questions and model response cards.
-            VStack(alignment: .center, spacing: 48) {
-                ForEach(Array(branchData.activeChatBlocks.enumerated()), id: \.offset) { index, block in
-                    switch block {
-                    case .text(let textContent):
-                        VStack(spacing: 16) {
-                            TrackedResponseCard(
+            ForEach(Array(branchData.activeChatBlocks.enumerated()), id: \.offset) { index, block in
+                switch block {
+                case .text(let textContent):
+                    TrackedResponseCard(
                                 textContent: textContent,
                                 responseIndex: index,
                                 shouldAnimateOnAppear: animatedResponseIndices.contains(index),
                                 showsThinkingIntro: responseShowsThinkingIntro(at: index, text: textContent),
-                                isAwaitingResponse: isResponsePending(at: index),
+                                isAwaitingResponse: isResponsePending(at: index, text: textContent),
                                 isReceivingStream: streamingResponseIndices.contains(index),
                                 isQueuedForModel: isResponseQueued(at: index),
                                 usesNetworkStream: false,
@@ -1151,13 +1225,16 @@ struct ChatThreadColumn: View {
                                 targetSpawnY: $targetSpawnY,
                                 targetSpawnResponseIndex: $targetSpawnResponseIndex,
                                 columnSpaceName: "ColumnContent-\(branchData.id)",
-                                responseTextAlignment: responseTextAlignment,
+                                responseTextAlignment: conversationTextAlignment,
                                 responseFont: responseFont,
                                 conversationFontSize: conversationFontSize,
                                 loadingInsightKey: loadingInsightKey,
                                 queuedInsightKeys: queuedInsightKeys,
                                 savedInsightIDs: savedInsightIDs,
                                 onCenterChange: onSpawnYChange,
+                                onRegenerate: {
+                                    regenerateResponse(at: index)
+                                },
                                 onDuplicateBranch: {
                                     onDuplicateResponse(textContent, index)
                                 },
@@ -1177,80 +1254,68 @@ struct ChatThreadColumn: View {
                                     withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) { branchData.showBottomInput = true }
                                     onResponseCompleted(index)
                                 }
+                    )
+                    .id(
+                        "\(branchData.id)-response-\(index)-"
+                            + responseIdentitySuffix(at: index, text: textContent)
+                    )
+                    .transition(
+                        animatedResponseIndices.contains(index)
+                        ? .opacity.combined(with: .scale(scale: 0.5))
+                        : .identity
+                    )
+
+                case .user(let questionText, let concept, let attachments):
+                    ConversationSeparator()
+
+                    VStack(spacing: 16) {
+                        UploadedFileStrip(files: attachments)
+
+                        if let concept {
+                            BranchContextChip(
+                                title: concept.word.capitalized,
+                                icon: "text.bubble.fill",
+                                isFilled: true,
+                                animatesAppearance: false,
+                                showRemove: false,
+                                onTap: { onQuotedConceptTap(concept) }
                             )
-                            .id(
-                                "\(branchData.id)-response-\(index)-"
-                                    + (textContent == questionCanceledResponseText ? "canceled" : "standard")
+                            .matchedGeometryEffect(
+                                id: quotedConceptMatchID(
+                                    concept.id,
+                                    responseIndex: index + 1
+                                ),
+                                in: quotedContextChipNamespace
                             )
                         }
-                        .transition(
-                            animatedResponseIndices.contains(index)
-                            ? .opacity.combined(with: .scale(scale: 0.5))
-                            : .identity
+
+                        // Same plain field the top question uses, locked after submission
+                        // so follow-up questions render consistently.
+                        QuestionInputField(
+                            placeholder: "",
+                            text: .constant(questionText),
+                            isLocked: true,
+                            isEmpty: false,
+                            lineHeight: inputLineHeight,
+                            textAlignment: conversationTextAlignment,
+                            fontOption: inputFont,
+                            relay: TextInputRelay(),
+                            onFocusChange: { _ in },
+                            onTextChange: { _ in }
                         )
-
-                    case .user(let questionText, let concept, let attachments):
-                        VStack(spacing: 48) {
-                            ConversationSeparator()
-
-                            VStack(spacing: 16) {
-                                UploadedFileStrip(files: attachments)
-
-                                if let concept {
-                                    BranchContextChip(
-                                        title: concept.word.capitalized,
-                                        icon: "text.bubble.fill",
-                                        isFilled: true,
-                                        animatesAppearance: false,
-                                        showRemove: false,
-                                        onTap: { onQuotedConceptTap(concept) }
-                                    )
-                                    .matchedGeometryEffect(
-                                        id: quotedConceptMatchID(
-                                            concept.id,
-                                            responseIndex: index + 1
-                                        ),
-                                        in: quotedContextChipNamespace
-                                    )
-                                }
-
-                                // Same component the top field uses post-submit (locked,
-                                // isSubmitted), not a plain Text — so a follow-up question
-                                // renders and behaves identically to the branch's first question.
-                                QuestionInputField(
-                                    placeholder: "",
-                                    text: .constant(questionText),
-                                    isLocked: true,
-                                    isSubmitted: true,
-                                    submittedWidth: QuestionInputField.measuredWidth(
-                                        for: questionText,
-                                        fontOption: inputFont
-                                    ),
-                                    isEmpty: false,
-                                    isFocused: false,
-                                    lineHeight: inputLineHeight,
-                                    textAlignment: inputTextAlignment,
-                                    fontOption: inputFont,
-                                    showsChrome: false,
-                                    relay: TextInputRelay(),
-                                    onFocusChange: { _ in },
-                                    onTextChange: { _ in }
-                                )
-                            }
-                            .frame(maxWidth: .infinity)
-                        }
-                        .frame(maxWidth: .infinity)
                     }
+                    .frame(maxWidth: .infinity)
+
+                    ConversationSeparator()
                 }
             }
 
             // MARK: Follow-up Input
             // Appears after the latest model response finishes.
             if branchData.showBottomInput {
-                VStack(spacing: 48) {
-                    ConversationSeparator()
+                ConversationSeparator()
 
-                    VStack(spacing: 16) {
+                VStack(spacing: 16) {
                         UploadedFileStrip(files: visibleUploads) { file in
                             uploadedFiles.removeAll { $0.id == file.id }
                         }
@@ -1297,12 +1362,10 @@ struct ChatThreadColumn: View {
                                 placeholder: "Ask a question...",
                                 text: $branchData.bottomQuestionText,
                                 isEmpty: bottomFieldIsEmpty,
-                                isFocused: isBottomQuestionFocused,
                                 lineHeight: inputLineHeight,
-                                textAlignment: inputTextAlignment,
+                                textAlignment: conversationTextAlignment,
                                 fontOption: inputFont,
                                 placeholderColor: placeholderColor,
-                                showsChrome: false,
                                 relay: bottomFieldRelay,
                                 onFocusChange: { focused in
                                     isBottomQuestionFocused = focused
@@ -1316,15 +1379,15 @@ struct ChatThreadColumn: View {
                                     bottomFieldIsEmpty = text.isEmpty
                                     onActiveInputTextChange(text)
                                 },
+                                onSubmit: submitBottomQuestionIfNeeded,
                                 onTapToFocus: { bottomFieldRelay.focus() }
                             )
                             .overlay(alignment: .top) {
                                 slashCommandMenuOverlay(forBottomField: true, yOffset: 72)
                             }
                         }
-                    }
-                    .frame(maxWidth: .infinity)
                 }
+                .frame(maxWidth: .infinity)
                 .id(bottomInputAnchor)
                 .frame(maxWidth: .infinity)
                 .onAppear {
@@ -1337,6 +1400,11 @@ struct ChatThreadColumn: View {
                 }
                 .transition(.move(edge: .top).combined(with: .opacity).combined(with: .scale(scale: 0.95)))
             }
+                }
+                .overlay(alignment: .top) {
+                    Color.clear
+                        .frame(width: 1, height: 1)
+                        .id(branchAnchor)
                 }
             }
         }
@@ -1446,135 +1514,27 @@ private struct ConversationSeparator: View {
     }
 }
 
-/// Reports a question field's true ambient available width, measured via an unconstrained
-/// sibling probe (see `QuestionInputField`) so the field can be given a concrete number instead
-/// of `nil`/`.infinity` — required for the fill→hug width change to actually animate on submit.
-private struct QuestionInputWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
-}
-
-/// Placeholder text for a question field, fading out once the field has focus or text. Tapping
-/// into the field also briefly swaps the placeholder for a "Type / for a list of commands" hint,
-/// which lingers a couple seconds before fading back to the normal placeholder.
-private struct AnimatedQuestionPlaceholder: View {
-    private static let commandHintText = "Type / for a list of commands"
-    private static let hintLinger: Duration = .seconds(2.5)
-
-    let text: String
-    let font: Font
-    let color: Color
-    let isEmpty: Bool
-    let isFocused: Bool
-    let emptyAlignment: Alignment
-    let filledAlignment: Alignment
-    let animation: Animation
-    var textAlignment: TextAlignment = .leading
-
-    @State private var isShowingCommandHint = false
-    @State private var hintDismissTask: Task<Void, Never>?
-
-    var body: some View {
-        ZStack {
-            Text(text)
-                .opacity(isShowingCommandHint ? 0 : 1)
-            Text(Self.commandHintText)
-                .opacity(isShowingCommandHint ? 1 : 0)
-        }
-        .font(font)
-        .foregroundColor(color)
-        .frame(
-            maxWidth: .infinity,
-            alignment: isEmpty ? emptyAlignment : filledAlignment
-        )
-        .multilineTextAlignment(textAlignment)
-        .opacity(isEmpty ? 1 : 0)
-        .allowsHitTesting(false)
-        .animation(animation, value: isEmpty)
-        .animation(.easeInOut(duration: 0.3), value: isShowingCommandHint)
-        .onChange(of: isFocused) { _, focused in
-            guard focused else { return }
-            hintDismissTask?.cancel()
-            isShowingCommandHint = true
-            hintDismissTask = Task {
-                do { try await Task.sleep(for: Self.hintLinger) } catch { return }
-                await MainActor.run { isShowingCommandHint = false }
-            }
-        }
-        .onDisappear {
-            hintDismissTask?.cancel()
-        }
-    }
-}
-
-/// Draws a magnifying glass on when it appears and off when it's removed, matching the SF Symbol
-/// "Draw On"/"Draw Off" pair on iOS 26+ (with an opacity/scale fallback on earlier versions).
-private struct QuestionInputIcon: View {
-    var body: some View {
-        let icon = Image(systemName: "magnifyingglass")
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundColor(AquinasTheme.Colors.lightGreen)
-            .frame(width: 12, height: 12)
-
-        if #available(iOS 26.0, *) {
-            // A single .drawOn transition plays forward on insertion and reverses (draws off)
-            // on removal — no separate .drawOff needed.
-            icon.transition(.symbolEffect(.drawOn))
-        } else {
-            icon.transition(.opacity.combined(with: .scale(scale: 0.7)))
-        }
-    }
-}
-
 /// The single "Ask a question" input box shared by every question field in the thread (the
 /// brand-new-conversation prompt, a forked/continuing branch's top question, and the follow-up
-/// field) — one place to change icon, chrome, sizing, or width behavior instead of three.
-///
-/// Sized to fill its ambient available width while editable. Once `isSubmitted` (for fields that
-/// stay visible, locked, after submitting — the follow-up field never sets this since it's
-/// removed from view on submit instead), it hugs the submitted question if that rendered on a
-/// single line, or holds at `maxWidth` if it wrapped to more than one line.
+/// field). It intentionally uses a plain placeholder with no extra icon, hint animation, or
+/// container chrome.
 private struct QuestionInputField: View {
-    static let maxWidth: CGFloat = 250
     static let plainMaxWidth: CGFloat = 321
     static let fontSize: CGFloat = 14
-
-    /// Exact pixel width UIKit renders `text` at in the field's font — measure once, at submit
-    /// time, to decide whether the submitted question fits on one line.
-    static func measuredWidth(
-        for text: String,
-        fontOption: ConversationFontOption
-    ) -> CGFloat {
-        guard !text.isEmpty else { return 0 }
-        let fontName = fontOption == .sans
-            ? "Figtree-Regular"
-            : "LibreBaskerville-Regular"
-        let font = UIFont(name: fontName, size: fontSize) ?? .systemFont(ofSize: fontSize)
-        let measuredSize = (text as NSString).size(withAttributes: [.font: font])
-        return ceil(measuredSize.width)
-    }
 
     let placeholder: String
     @Binding var text: String
     var isLocked: Bool = false
-    var isSubmitted: Bool = false
-    var submittedWidth: CGFloat = 0
     let isEmpty: Bool
-    let isFocused: Bool
     let lineHeight: CGFloat
     let textAlignment: InputTextAlignmentOption
     let fontOption: ConversationFontOption
     var placeholderColor: Color = AquinasTheme.Colors.placeholderText
-    var showsChrome: Bool = true
-    /// Which edge the boxed field hugs to within its available width.
-    var boxAlignment: Alignment = .leading
     let relay: TextInputRelay
     var onFocusChange: (Bool) -> Void
     var onTextChange: (String) -> Void
     var onSubmit: (() -> Void)? = nil
     var onTapToFocus: (() -> Void)? = nil
-
-    @State private var availableWidth: CGFloat = 0
 
     private var inputFont: UIFont {
         let fontName = fontOption == .sans
@@ -1599,28 +1559,16 @@ private struct QuestionInputField: View {
         }
     }
 
-    /// Always a concrete number (never nil/`.infinity`), so the fill→hug transition on submit is
-    /// a genuine numeric interpolation SwiftUI can animate.
-    private var boxWidth: CGFloat {
-        guard isSubmitted else { return availableWidth > 0 ? availableWidth : Self.maxWidth }
-        let singleLineWidth = submittedWidth + 40   // + this box's own 20×2 horizontal padding
-        guard singleLineWidth <= Self.maxWidth else { return Self.maxWidth }
-        return max(singleLineWidth, 60)
-    }
-
-    private var plainQuestionEditor: some View {
+    private var questionEditor: some View {
         ZStack(alignment: textAlignment.frameAlignment) {
-            AnimatedQuestionPlaceholder(
-                text: placeholder,
-                font: placeholderFont,
-                color: placeholderColor,
-                isEmpty: isEmpty,
-                isFocused: isFocused,
-                emptyAlignment: textAlignment.frameAlignment,
-                filledAlignment: textAlignment.frameAlignment,
-                animation: .spring(response: 0.36, dampingFraction: 0.86),
-                textAlignment: textAlignment.textAlignment
-            )
+            if isEmpty {
+                Text(placeholder)
+                    .font(placeholderFont)
+                    .foregroundStyle(placeholderColor)
+                    .multilineTextAlignment(textAlignment.textAlignment)
+                    .frame(maxWidth: .infinity, alignment: textAlignment.frameAlignment)
+                    .allowsHitTesting(false)
+            }
 
             ListAwareTextField(
                 text: $text,
@@ -1635,87 +1583,16 @@ private struct QuestionInputField: View {
                 onSubmit: onSubmit
             )
             .frame(maxWidth: .infinity, minHeight: 22, alignment: textAlignment.frameAlignment)
-            .animation(.spring(response: 0.36, dampingFraction: 0.86), value: isEmpty)
-            .animation(.spring(response: 0.36, dampingFraction: 0.86), value: isFocused)
         }
         .frame(maxWidth: .infinity, minHeight: 22, alignment: textAlignment.frameAlignment)
-        .frame(maxWidth: Self.plainMaxWidth, alignment: textAlignment.frameAlignment)
     }
 
     var body: some View {
-        ZStack(alignment: showsChrome ? boxAlignment : .center) {
-            // Invisible probe: `.frame(maxWidth: .infinity)` makes it want the full width its
-            // ambient parent can offer, which — since it's the ZStack's widest child — forces
-            // the ZStack itself to that true available width, independent of how narrow the
-            // actual box below gets once hugged. Its GeometryReader reports that true width.
-            Color.clear
-                .frame(maxWidth: .infinity, maxHeight: 0)
-                .background(
-                    GeometryReader { geo in
-                        Color.clear.preference(key: QuestionInputWidthKey.self, value: geo.size.width)
-                    }
-                )
-
-            if showsChrome {
-                HStack(spacing: 16) {
-                    if isEmpty {
-                        QuestionInputIcon()
-                    }
-
-                    ZStack(alignment: .leading) {
-                        AnimatedQuestionPlaceholder(
-                            text: placeholder,
-                            font: placeholderFont,
-                            color: placeholderColor,
-                            isEmpty: isEmpty,
-                            isFocused: isFocused,
-                            emptyAlignment: .leading,
-                            filledAlignment: .leading,
-                            animation: .spring(response: 0.36, dampingFraction: 0.86)
-                        )
-
-                        ListAwareTextField(
-                            text: $text,
-                            font: inputFont,
-                            lineHeight: lineHeight,
-                            isLocked: isLocked,
-                            textColor: .aquinasPrimaryReadable,
-                            textAlignment: .natural,
-                            onFocusChange: onFocusChange,
-                            relay: relay,
-                            onTextChange: onTextChange,
-                            onSubmit: onSubmit
-                        )
-                        .frame(maxWidth: .infinity, minHeight: 22, alignment: .leading)
-                        .animation(.spring(response: 0.36, dampingFraction: 0.86), value: isEmpty)
-                        .animation(.spring(response: 0.36, dampingFraction: 0.86), value: isFocused)
-                    }
-                }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 16)
-                .background(AquinasTheme.Colors.canvas)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(AquinasTheme.Colors.sideMenuSearchBorder, lineWidth: 1)
-                )
-                .frame(width: boxWidth, alignment: .leading)
-            } else {
-                plainQuestionEditor
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .center)
-        .onPreferenceChange(QuestionInputWidthKey.self) { width in
-            guard width.isFinite,
-                  width > 0,
-                  abs(availableWidth - width) > 0.5 else {
-                return
-            }
-            availableWidth = width
-        }
-        .animation(.spring(response: 0.32, dampingFraction: 0.82), value: boxWidth)
-        .contentShape(Rectangle())
-        .onTapGesture { onTapToFocus?() }
+        questionEditor
+            .frame(maxWidth: Self.plainMaxWidth, alignment: textAlignment.frameAlignment)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .contentShape(Rectangle())
+            .onTapGesture { onTapToFocus?() }
     }
 }
 
@@ -1743,6 +1620,7 @@ struct TrackedResponseCard: View {
     let queuedInsightKeys: Set<String>
     let savedInsightIDs: Set<UUID>
     var onCenterChange: (Int, CGFloat) -> Void = { _, _ in }
+    var onRegenerate: () -> Void = {}
     var onDuplicateBranch: () -> Void = {}
     var onInsightTap: (String, String) -> Void = { _, _ in }
     var onInlineInsightQuote: (ConceptDefinition) -> Void = { _ in }
@@ -1785,6 +1663,7 @@ struct TrackedResponseCard: View {
             loadingInsightKey: loadingInsightKey,
             queuedInsightKeys: queuedInsightKeys,
             savedInsightIDs: savedInsightIDs,
+            onRegenerate: onRegenerate,
             onDuplicateBranch: onDuplicateBranch,
             onInsightTap: onInsightTap,
             onInlineInsightQuote: onInlineInsightQuote,

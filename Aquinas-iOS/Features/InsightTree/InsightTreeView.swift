@@ -34,6 +34,7 @@ struct InsightTreeView: View {
     var onPromotedInsightIDsChange: (([UUID]) -> Void)? = nil
     var savedConceptIDs: Set<UUID> = []
     var onToggleSavedConcept: ((ConceptDefinition) -> Void)? = nil
+    var onBookmarkConcepts: (([ConceptDefinition]) -> Void)? = nil
     var inquireConnectionRequest: Int = 0
     var onInquireConnectionConcepts: (([ConceptDefinition]) -> Void)? = nil
     var midpointEnterRequest: Int = 0
@@ -60,6 +61,7 @@ struct InsightTreeView: View {
     let model: AquinasModel
     let embeddingProvider: EmbeddingProvider
     let insightTreeService: InsightTreeService
+    let reconcilesPersistedSavedInsights: Bool
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -91,6 +93,7 @@ struct InsightTreeView: View {
     @State private var undoInsight: ConceptDefinition? = nil
     @State private var undoTask: Task<Void, Never>? = nil
     @State private var pendingRemoveInsight: InsightModel? = nil
+    @State private var pendingUnbookmarkMakeNode: NodeModel? = nil
     @State private var questionBarContextInsight: InsightModel? = nil
     @State private var questionBarKeyboardActive: Bool = false
     @State private var cardShouldHide: Bool = false
@@ -139,6 +142,7 @@ struct InsightTreeView: View {
         onPromotedInsightIDsChange: (([UUID]) -> Void)? = nil,
         savedConceptIDs: Set<UUID> = [],
         onToggleSavedConcept: ((ConceptDefinition) -> Void)? = nil,
+        onBookmarkConcepts: (([ConceptDefinition]) -> Void)? = nil,
         inquireConnectionRequest: Int = 0,
         onInquireConnectionConcepts: (([ConceptDefinition]) -> Void)? = nil,
         midpointEnterRequest: Int = 0,
@@ -162,13 +166,15 @@ struct InsightTreeView: View {
         modelTaskOriginPage: ModelTaskOriginPage = .insights,
         model: AquinasModel = MockAquinasModel(),
         embeddingProvider: EmbeddingProvider = NLEmbeddingProvider(),
-        insightTreeService: InsightTreeService = BackendInsightTreeService()
+        insightTreeService: InsightTreeService = BackendInsightTreeService(),
+        reconcilesPersistedSavedInsights: Bool = false
     ) {
         self.insights              = insights
         self.conversationID        = conversationID
         self.model                 = model
         self.embeddingProvider     = embeddingProvider
         self.insightTreeService    = insightTreeService
+        self.reconcilesPersistedSavedInsights = reconcilesPersistedSavedInsights
         self.selectionRequest      = selectionRequest
         self.persistedTreeRefreshRequest = persistedTreeRefreshRequest
         self.clearSelectionRequest = clearSelectionRequest
@@ -189,6 +195,7 @@ struct InsightTreeView: View {
         self.onPromotedInsightIDsChange    = onPromotedInsightIDsChange
         self.savedConceptIDs               = savedConceptIDs
         self.onToggleSavedConcept          = onToggleSavedConcept
+        self.onBookmarkConcepts            = onBookmarkConcepts
         self.inquireConnectionRequest      = inquireConnectionRequest
         self.onInquireConnectionConcepts   = onInquireConnectionConcepts
         self.midpointEnterRequest          = midpointEnterRequest
@@ -426,11 +433,18 @@ struct InsightTreeView: View {
                         .transition(.bottomDockCard)
                         .padding(.horizontal, 10)
                     } else if let selectedNode {
+                        let makeNodeSourceID = viewModel.promotedSourceInsightID(
+                            forNodeID: selectedNode.id
+                        )
                         DockedNodeTreeCard(
                             node: selectedNode,
+                            isSaved: makeNodeSourceID.map(savedConceptIDs.contains) ?? false,
                             onSelectInsight: { insight in
                                 focusedInsightID = insight.id
                                 showInsightCard(insight)
+                            },
+                            onToggleSaved: makeNodeSourceID == nil ? nil : {
+                                toggleMakeNodeBookmark(selectedNode)
                             },
                             onFork: { performForkNode(selectedNode) }
                         )
@@ -558,6 +572,13 @@ struct InsightTreeView: View {
                     dismissDockedInsight()
                 }
             }
+            for childID in viewModel.generatedMakeNodeChildIDs
+            where oldValue.contains(childID) && !newValue.contains(childID) {
+                viewModel.removeMakeNodeChild(id: childID)
+                if selectedInsight?.id == childID {
+                    dismissDockedInsight()
+                }
+            }
         }
         .onChange(of: selectionRequest) { _, _ in
             selectHoveredCanvasTarget()
@@ -633,6 +654,19 @@ struct InsightTreeView: View {
             }
         } message: {
             Text("This insight will be removed from this conversation’s tree. Its global bookmark is unchanged.")
+        }
+        .alert("Unbookmark attached Insights?", isPresented: Binding(
+            get: { pendingUnbookmarkMakeNode != nil },
+            set: { if !$0 { pendingUnbookmarkMakeNode = nil } }
+        )) {
+            Button("No") {
+                resolveMakeNodeUnbookmark(removingAttachedInsights: false)
+            }
+            Button("Yes", role: .destructive) {
+                resolveMakeNodeUnbookmark(removingAttachedInsights: true)
+            }
+        } message: {
+            Text("Would you also like to unbookmark the Insights attached to this node?")
         }
         .alert(
             "Couldn’t complete that model action",
@@ -1132,6 +1166,7 @@ struct InsightTreeView: View {
                     try await viewModel.generateReservedMakeNodeChildren(
                         for: selectedInsight
                     )
+                    bookmarkMakeNodeOutput(for: insightID)
                 } catch {
                     guard !Task.isCancelled else { return }
                     cancelGeneration()
@@ -1153,6 +1188,7 @@ struct InsightTreeView: View {
                 try await viewModel.generateReservedMakeNodeChildren(
                     for: selectedInsight
                 )
+                bookmarkMakeNodeOutput(for: insightID)
             } catch {
                 guard !Task.isCancelled else { return }
                 cancelGeneration()
@@ -1161,6 +1197,53 @@ struct InsightTreeView: View {
                 }
             }
         }
+    }
+
+    private func bookmarkMakeNodeOutput(for insightID: UUID) {
+        let concepts = viewModel.makeNodeBookmarkConcepts(for: insightID)
+        guard !concepts.isEmpty else { return }
+        if let onBookmarkConcepts {
+            onBookmarkConcepts(concepts)
+        } else {
+            for concept in concepts where !savedConceptIDs.contains(concept.id) {
+                onToggleSavedConcept?(concept)
+            }
+        }
+    }
+
+    private func toggleMakeNodeBookmark(_ node: NodeModel) {
+        guard let sourceID = viewModel.promotedSourceInsightID(forNodeID: node.id),
+              let nodeConcept = viewModel.makeNodeBookmarkConcepts(for: sourceID).first else {
+            return
+        }
+        if savedConceptIDs.contains(sourceID) {
+            pendingUnbookmarkMakeNode = node
+        } else if let onBookmarkConcepts {
+            onBookmarkConcepts([nodeConcept])
+        } else {
+            onToggleSavedConcept?(nodeConcept)
+        }
+    }
+
+    private func resolveMakeNodeUnbookmark(removingAttachedInsights: Bool) {
+        guard let node = pendingUnbookmarkMakeNode,
+              let sourceID = viewModel.promotedSourceInsightID(forNodeID: node.id) else {
+            pendingUnbookmarkMakeNode = nil
+            return
+        }
+        let bookmarks = viewModel.makeNodeBookmarkConcepts(for: sourceID)
+        viewModel.removeMakeNode(
+            for: sourceID,
+            keepingChildren: !removingAttachedInsights
+        )
+        onPromotedInsightIDsChange?(promotedInsightIDs.filter { $0 != sourceID })
+
+        let conceptsToRemove = removingAttachedInsights ? bookmarks : Array(bookmarks.prefix(1))
+        for concept in conceptsToRemove where savedConceptIDs.contains(concept.id) {
+            onToggleSavedConcept?(concept)
+        }
+        pendingUnbookmarkMakeNode = nil
+        dismissDockedInsight()
     }
 
     private func presentModelActionError(retry: @escaping () -> Void) {
@@ -1491,6 +1574,29 @@ struct InsightTreeView: View {
             guard !Task.isCancelled,
                   loadGeneration == persistedTreeLoadGeneration else { return }
 
+            if reconcilesPersistedSavedInsights {
+                let staleInsightIDs = Set(
+                    tree.nodes
+                        .flatMap(\.insights)
+                        .filter {
+                            $0.sourceType == "saved_definition"
+                                && !savedConceptIDs.contains($0.id)
+                        }
+                        .map(\.id)
+                )
+                for insightID in staleInsightIDs {
+                    try await insightTreeService.remove(
+                        insightID: insightID,
+                        from: conversationID
+                    )
+                }
+                if !staleInsightIDs.isEmpty {
+                    tree = try await insightTreeService.tree(for: conversationID)
+                    guard !Task.isCancelled,
+                          loadGeneration == persistedTreeLoadGeneration else { return }
+                }
+            }
+
             var didRepairNodeLabel = false
             for node in tree.nodes where node.needsGeneratedLabel {
                 let descriptions = node.insights.map {
@@ -1615,13 +1721,16 @@ struct InsightTreeView: View {
             return
         }
         guard !modelTasks.contains(where: {
-            $0.kind == .refreshInsightTree && $0.phase != .completed
+            $0.kind == .refreshInsightTree
+                && $0.conversationID == conversationID
+                && $0.phase != .completed
         }) else {
             return
         }
         modelTasks.enqueue(
             kind: .refreshInsightTree,
             originPage: modelTaskOriginPage,
+            conversationID: conversationID,
             priority: .background
         ) {
             await loadPersistedTree(animateChanges: animateChanges)

@@ -7,8 +7,8 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-/// Full context capacity of the deployed Gemma 4 E2B checkpoint.
-let aquinasContextWindowLimit = 131_072
+/// Full shared input-and-output KV-cache of the deployed Gemma 4 E2B LiteRT checkpoint.
+let aquinasContextWindowLimit = AquinasContextBudget.totalTokenLimit
 
 private struct OpenModelTaskPageActionKey: EnvironmentKey {
     static let defaultValue: (ModelTaskSnapshot) -> Void = { _ in }
@@ -21,9 +21,15 @@ extension EnvironmentValues {
     }
 }
 
+enum ModelCompletionNotificationKind {
+    case question
+    case insightDefinition
+}
+
 struct ModelCompletionNotification: Identifiable {
     let id = UUID()
     let title: String
+    let kind: ModelCompletionNotificationKind
     let openAction: @MainActor () -> Void
 }
 
@@ -34,12 +40,14 @@ final class ModelCompletionNotificationCenter {
 
     func post(
         title: String,
+        kind: ModelCompletionNotificationKind = .question,
         openAction: @escaping @MainActor () -> Void
     ) {
         withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
             notifications.insert(
                 ModelCompletionNotification(
                     title: title,
+                    kind: kind,
                     openAction: openAction
                 ),
                 at: 0
@@ -119,12 +127,15 @@ private struct ContextControlsStackCard: View {
     let contextCard: ContextCardState
     let wordCount: Int
     var wordLimit: Int = aquinasContextWindowLimit
+    var canCompact: Bool = false
+    var onCompactContext: () async -> Bool = { false }
     var onClearConversation: () -> Void = {}
 
     var body: some View {
         ContextUsageCard(
             wordCount: wordCount,
             wordLimit: wordLimit,
+            canCompact: canCompact,
             isCompacting: contextCard.isCompacting,
             isCompactionComplete: contextCard.isCompactionComplete,
             onCompact: beginContextCompaction,
@@ -160,7 +171,7 @@ private struct ContextControlsStackCard: View {
     }
 
     private func beginContextCompaction() {
-        guard !contextCard.isCompacting else { return }
+        guard canCompact, !contextCard.isCompacting else { return }
         UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.65)
         withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
             contextCard.isCompacting = true
@@ -168,7 +179,16 @@ private struct ContextControlsStackCard: View {
         }
         contextCard.compactTask?.cancel()
         contextCard.compactTask = Task {
-            do { try await Task.sleep(for: .seconds(4)) } catch { return }
+            let didCompact = await onCompactContext()
+            guard !Task.isCancelled else { return }
+            guard didCompact else {
+                await MainActor.run {
+                    withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                        contextCard.isCompacting = false
+                    }
+                }
+                return
+            }
             await MainActor.run {
                 playContextCompactedHaptics()
                 withAnimation(.easeInOut(duration: 0.18)) {
@@ -447,6 +467,8 @@ private struct ModelControlsStack<Controls: View>: View {
     let contextCard: ContextCardState?
     let contextWordCount: Int
     let contextWordLimit: Int
+    let canCompactContext: Bool
+    let onCompactContext: () async -> Bool
     let onClearConversation: () -> Void
     let modelTasksPopupState: ModelTasksPopupState?
     let modelTasks: ModelTaskQueue?
@@ -463,6 +485,8 @@ private struct ModelControlsStack<Controls: View>: View {
         contextCard: ContextCardState? = nil,
         contextWordCount: Int = 0,
         contextWordLimit: Int = aquinasContextWindowLimit,
+        canCompactContext: Bool = false,
+        onCompactContext: @escaping () async -> Bool = { false },
         onClearConversation: @escaping () -> Void = {},
         modelTasksPopupState: ModelTasksPopupState? = nil,
         modelTasks: ModelTaskQueue? = nil,
@@ -476,6 +500,8 @@ private struct ModelControlsStack<Controls: View>: View {
         self.contextCard = contextCard
         self.contextWordCount = contextWordCount
         self.contextWordLimit = contextWordLimit
+        self.canCompactContext = canCompactContext
+        self.onCompactContext = onCompactContext
         self.onClearConversation = onClearConversation
         self.modelTasksPopupState = modelTasksPopupState
         self.modelTasks = modelTasks
@@ -496,6 +522,7 @@ private struct ModelControlsStack<Controls: View>: View {
                 ForEach(completionNotifications.notifications) { notification in
                     ModelCompletionNotificationPill(
                         title: notification.title,
+                        kind: notification.kind,
                         width: controlsWidth,
                         onOpen: {
                             completionNotifications.open(id: notification.id)
@@ -520,6 +547,8 @@ private struct ModelControlsStack<Controls: View>: View {
                     contextCard: contextCard,
                     wordCount: contextWordCount,
                     wordLimit: contextWordLimit,
+                    canCompact: canCompactContext,
+                    onCompactContext: onCompactContext,
                     onClearConversation: onClearConversation
                 )
             } else if let modelTasksPopupState,
@@ -619,22 +648,53 @@ private struct ModelControlsWidthPreferenceKey: PreferenceKey {
 
 private struct ModelCompletionNotificationPill: View {
     let title: String
+    let kind: ModelCompletionNotificationKind
     let width: CGFloat
     let onOpen: () -> Void
+
+    private var iconName: String {
+        switch kind {
+        case .question: "QuestionNotificationIcon"
+        case .insightDefinition: "InsightNotificationIcon"
+        }
+    }
+
+    private var iconColor: Color {
+        switch kind {
+        case .question: AquinasTheme.Colors.headingText
+        case .insightDefinition: AquinasTheme.Colors.lightGreen
+        }
+    }
+
+    private var titleColor: Color {
+        switch kind {
+        case .question: AquinasTheme.Colors.paragraphText
+        case .insightDefinition: AquinasTheme.Colors.lightGreen
+        }
+    }
+
+    private var accessibilityDescription: String {
+        switch kind {
+        case .question:
+            String(localized: "View completed question: \(title)")
+        case .insightDefinition:
+            String(localized: "View completed Insight Definition: \(title)")
+        }
+    }
 
     var body: some View {
         Button(action: onOpen) {
             HStack(spacing: 8) {
                 HStack(spacing: 4) {
-                    Image("QuestionNotificationIcon")
+                    Image(iconName)
                         .renderingMode(.template)
                         .resizable()
-                        .foregroundStyle(AquinasTheme.Colors.headingText)
+                        .foregroundStyle(iconColor)
                         .frame(width: 14, height: 14)
 
                     Text(title)
                         .font(AquinasTheme.Typography.uiLabel)
-                        .foregroundStyle(AquinasTheme.Colors.paragraphText)
+                        .foregroundStyle(titleColor)
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
@@ -642,15 +702,15 @@ private struct ModelCompletionNotificationPill: View {
 
                 Spacer(minLength: 0)
 
-                Text("View", comment: "Action that opens a completed question's answer.")
+                Text("View", comment: "Action that opens completed model content.")
                     .font(AquinasTheme.Typography.uiLabel)
-                    .foregroundStyle(AquinasTheme.Colors.headingText)
+                    .foregroundStyle(iconColor)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("View completed question: \(title)")
+        .accessibilityLabel(accessibilityDescription)
         .padding(.horizontal, 24)
         .frame(width: width, height: 50)
         .background(AquinasTheme.Colors.canvasSecondary)
@@ -684,6 +744,7 @@ private struct ScrollToBottomStackButton: View {
 struct ModelStatusButton: View {
     let modelTasks: ModelTaskQueue
     let action: () -> Void
+    var controlIsPressed: Binding<Bool> = .constant(false)
     @AppStorage(SettingsStorageKey.modelActivityDisplay)
     private var activityDisplay: ModelActivityDisplayOption = .detailed
 
@@ -779,7 +840,7 @@ struct ModelStatusButton: View {
             .animation(.spring(response: 0.32, dampingFraction: 0.82), value: totalTaskCount)
             .animation(.spring(response: 0.32, dampingFraction: 0.82), value: currentTaskNumber)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(FloatingControlButtonStyle(isPressed: controlIsPressed))
         .accessibilityLabel(accessibilityStatus)
     }
 
@@ -793,6 +854,37 @@ struct ModelStatusButton: View {
         )
     }
 
+}
+
+private struct FloatingControlPressFeedback: ViewModifier {
+    let isButtonPressed: Bool
+    @GestureState private var isPressed = false
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(isPressed || isButtonPressed ? 1.05 : 1)
+            .animation(
+                .spring(response: 0.22, dampingFraction: 0.72),
+                value: isPressed || isButtonPressed
+            )
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 0)
+                    .updating($isPressed) { _, isPressed, _ in
+                        isPressed = true
+                    }
+            )
+    }
+}
+
+private struct FloatingControlButtonStyle: ButtonStyle {
+    @Binding var isPressed: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .onChange(of: configuration.isPressed) { _, newValue in
+                isPressed = newValue
+            }
+    }
 }
 
 private struct ModelTaskCounter: View {
@@ -835,6 +927,7 @@ struct PageModelControls: View {
     var action: () -> Void = {}
 
     @State private var controlScale: CGFloat = 1
+    @State private var isControlButtonPressed = false
     @AppStorage(SettingsStorageKey.modelActivityDisplay)
     private var activityDisplay: ModelActivityDisplayOption = .detailed
 
@@ -869,7 +962,8 @@ struct PageModelControls: View {
                     if showsModelStatus {
                         ModelStatusButton(
                             modelTasks: modelTasks,
-                            action: toggleModelTasksPopup
+                            action: toggleModelTasksPopup,
+                            controlIsPressed: $isControlButtonPressed
                         )
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                     }
@@ -877,6 +971,7 @@ struct PageModelControls: View {
                     if let actionTitle {
                         PageModelControlActionButton(
                             title: actionTitle,
+                            controlIsPressed: $isControlButtonPressed,
                             action: action
                         )
                     }
@@ -884,6 +979,7 @@ struct PageModelControls: View {
                     if let secondaryActionTitle {
                         PageModelControlActionButton(
                             title: secondaryActionTitle,
+                            controlIsPressed: $isControlButtonPressed,
                             action: secondaryAction
                         )
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
@@ -896,6 +992,7 @@ struct PageModelControls: View {
                 .clipShape(Capsule())
                 .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
                 .scaleEffect(controlScale)
+                .modifier(FloatingControlPressFeedback(isButtonPressed: isControlButtonPressed))
                 .transition(.scale(scale: 0.4).combined(with: .opacity))
                 .animation(.spring(response: 0.38, dampingFraction: 0.78), value: controlLayoutKey)
             }
@@ -939,6 +1036,7 @@ struct PageModelControls: View {
 
 private struct PageModelControlActionButton: View {
     let title: String
+    @Binding var controlIsPressed: Bool
     let action: () -> Void
 
     var body: some View {
@@ -956,7 +1054,7 @@ private struct PageModelControlActionButton: View {
             .frame(minHeight: 21)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(FloatingControlButtonStyle(isPressed: $controlIsPressed))
         .accessibilityLabel(title)
     }
 }
@@ -1014,6 +1112,8 @@ struct InquiryControlDock: View {
     var onClearCanvasSelection: () -> Void = {}
     var contextWordCount: Int = 0
     var contextWordLimit: Int = aquinasContextWindowLimit
+    var canCompactContext: Bool = false
+    var onCompactContext: () async -> Bool = { false }
     var onClearConversation: () -> Void = {}
     var onContextWillOpen: () -> Void = {}
     /// Owned by the hosting screen so Context state survives control-layout changes.
@@ -1022,6 +1122,7 @@ struct InquiryControlDock: View {
     @State private var canvasActionDrawID = UUID()
     @State private var isScrollButtonVisible = false
     @State private var controlScale: CGFloat = 1
+    @State private var isControlButtonPressed = false
     @State private var addFlashOpacity: CGFloat = 1
     @AppStorage(SettingsStorageKey.modelActivityDisplay)
     private var activityDisplay: ModelActivityDisplayOption = .detailed
@@ -1147,6 +1248,8 @@ struct InquiryControlDock: View {
             contextCard: contextCard,
             contextWordCount: contextWordCount,
             contextWordLimit: contextWordLimit,
+            canCompactContext: canCompactContext,
+            onCompactContext: onCompactContext,
             onClearConversation: onClearConversation,
             modelTasksPopupState: modelTasksPopupState,
             modelTasks: modelTasks,
@@ -1169,7 +1272,8 @@ struct InquiryControlDock: View {
                 if showsModelStatusControl, let modelTasks {
                     ModelStatusButton(
                         modelTasks: modelTasks,
-                        action: handleModelStatusTap
+                        action: handleModelStatusTap,
+                        controlIsPressed: $isControlButtonPressed
                     )
                     .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
@@ -1264,6 +1368,7 @@ struct InquiryControlDock: View {
                 .clipShape(Capsule())
                 .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
                 .scaleEffect(controlScale)
+                .modifier(FloatingControlPressFeedback(isButtonPressed: isControlButtonPressed))
                 .animation(.spring(response: 0.38, dampingFraction: 0.78), value: controlLayoutKey)
                 .opacity(canvasSearchIsActive ? 0 : 1)
                 .allowsHitTesting(!canvasSearchIsActive)
@@ -1347,7 +1452,7 @@ struct InquiryControlDock: View {
             .frame(minHeight: 21)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(FloatingControlButtonStyle(isPressed: $isControlButtonPressed))
         .accessibilityLabel("Search Insights")
     }
 
@@ -1359,7 +1464,7 @@ struct InquiryControlDock: View {
                         .font(.system(size: 14, weight: .regular))
                         .foregroundColor(AquinasTheme.Colors.placeholderText)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(FloatingControlButtonStyle(isPressed: $isControlButtonPressed))
                 .accessibilityLabel("Close Insight search")
 
                 TextField(
@@ -1400,7 +1505,7 @@ struct InquiryControlDock: View {
                 .disabled(canvasSearchResultCount == 0)
                 .accessibilityLabel("Next search result")
             }
-            .buttonStyle(.plain)
+            .buttonStyle(FloatingControlButtonStyle(isPressed: $isControlButtonPressed))
             .foregroundColor(AquinasTheme.Colors.placeholderText)
         }
         .padding(.horizontal, 32)
@@ -1409,6 +1514,7 @@ struct InquiryControlDock: View {
         .background(AquinasTheme.Colors.canvasSecondary)
         .clipShape(Capsule())
         .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
+        .modifier(FloatingControlPressFeedback(isButtonPressed: isControlButtonPressed))
     }
 
     private var searchResultFraction: String {
@@ -1467,22 +1573,27 @@ struct InquiryControlDock: View {
                 .frame(width: 16, height: 16)
         }
         .menuStyle(.button)
-        .buttonStyle(.plain)
+        .buttonStyle(FloatingControlButtonStyle(isPressed: $isControlButtonPressed))
     }
 
     private var contextButton: some View {
         Button {
-            if !contextCard.isCompacting {
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.7)
-                contextCard.dragY = 0
-                if !contextCard.isOpen {
-                    modelTasksPopupState?.reset()
-                    onContextWillOpen()
-                }
+            guard !contextCard.isCompacting else { return }
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.7)
+            contextCard.dragY = 0
+            if contextCard.isOpen {
                 withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
-                    contextCard.isOpen.toggle()
+                    contextCard.isOpen = false
                 }
+                return
             }
+            let otherWasOpen = modelTasksPopupState?.isOpen == true
+            onContextWillOpen()
+            switchPopups(
+                otherIsOpen: otherWasOpen,
+                closeOther: { modelTasksPopupState?.isOpen = false },
+                openThis: { contextCard.isOpen = true }
+            )
         } label: {
             let contextColor = AquinasTheme.Colors.paragraphText.opacity(0.75)
             HStack(spacing: 8) {
@@ -1491,14 +1602,53 @@ struct InquiryControlDock: View {
             .frame(height: 16, alignment: .center)
             .foregroundColor(contextColor)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(FloatingControlButtonStyle(isPressed: $isControlButtonPressed))
         .accessibilityLabel("Conversation context")
     }
 
     private func handleModelStatusTap() {
-        guard !contextCard.isCompacting else { return }
-        contextCard.reset()
+        guard !contextCard.isCompacting, let modelTasksPopupState else { return }
+        if modelTasksPopupState.isOpen {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                modelTasksPopupState.isOpen = false
+            }
+            return
+        }
+        let otherWasOpen = contextCard.isOpen
+        let generator = UIImpactFeedbackGenerator(style: .light)
+        generator.prepare()
+        generator.impactOccurred(intensity: 0.65)
         onModelStatusTap()
+        switchPopups(
+            otherIsOpen: otherWasOpen,
+            closeOther: { contextCard.reset() },
+            openThis: { modelTasksPopupState.isOpen = true }
+        )
+    }
+
+    /// Coordinates switching between the Context card and the Model Tasks popup: if the other one
+    /// is currently open, its exit animation is allowed to fully finish before this one's entrance
+    /// animation begins — the same sequential out-then-in feel used for the Insight Tree's docked
+    /// cards — rather than cross-fading both at once.
+    private func switchPopups(
+        otherIsOpen: Bool,
+        closeOther: @escaping () -> Void,
+        openThis: @escaping () -> Void
+    ) {
+        guard otherIsOpen else {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                openThis()
+            }
+            return
+        }
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+            closeOther()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.34) {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                openThis()
+            }
+        }
     }
 
     private var contextProgress: CGFloat {
@@ -1526,7 +1676,7 @@ struct InquiryControlDock: View {
             .frame(height: 16, alignment: .center)
             .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(FloatingControlButtonStyle(isPressed: $isControlButtonPressed))
     }
 
     private var selectCanvasActionButton: some View {
@@ -1539,7 +1689,7 @@ struct InquiryControlDock: View {
             .frame(height: 16, alignment: .center)
             .foregroundColor(selectedCanvasItemCount >= 1 ? AquinasTheme.Colors.lightGreen : AquinasTheme.Colors.paragraphText.opacity(0.75))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(FloatingControlButtonStyle(isPressed: $isControlButtonPressed))
     }
 
     private var clearCanvasSelectionButton: some View {
@@ -1549,7 +1699,7 @@ struct InquiryControlDock: View {
                 .frame(width: 16, height: 16)
                 .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(FloatingControlButtonStyle(isPressed: $isControlButtonPressed))
         .accessibilityLabel("Cancel current selection")
     }
 
@@ -1560,7 +1710,7 @@ struct InquiryControlDock: View {
                 .frame(width: 16, height: 16)
                 .foregroundColor(AquinasTheme.Colors.paragraphText.opacity(0.75))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(FloatingControlButtonStyle(isPressed: $isControlButtonPressed))
         .accessibilityLabel("Cancel Ask")
     }
 
@@ -1591,7 +1741,7 @@ struct InquiryControlDock: View {
                 .foregroundColor(AquinasTheme.Colors.lightGreen)
                 .frame(width: 16, height: 16)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(FloatingControlButtonStyle(isPressed: $isControlButtonPressed))
     }
 
 }
@@ -1665,6 +1815,7 @@ private struct ContextUsageCard: View {
 
     let wordCount: Int
     let wordLimit: Int
+    let canCompact: Bool
     let isCompacting: Bool
     let isCompactionComplete: Bool
     var onCompact: () -> Void
@@ -1728,7 +1879,7 @@ private struct ContextUsageCard: View {
                                 .font(.custom("Figtree-Bold", size: 18))
                                 .foregroundColor(AquinasTheme.Colors.headingText)
                             Spacer()
-                            Text("\(formatted(wordCount)) / \(formatted(wordLimit))")
+                            Text("\(formatted(wordCount)) / \(formatted(wordLimit)) tokens")
                                 .font(.custom("Figtree-Bold", size: 14))
                                 .monospacedDigit()
                         }
@@ -1750,6 +1901,8 @@ private struct ContextUsageCard: View {
 
                     HStack {
                         Button("Compact", action: onCompact)
+                            .disabled(!canCompact)
+                            .opacity(canCompact ? 1 : 0.35)
                         Spacer()
                         Button("Clear") { showClearConfirmation = true }
                     }
@@ -1768,7 +1921,6 @@ private struct ContextUsageCard: View {
             RoundedRectangle(cornerRadius: isCompacting ? 22 : 36, style: .continuous)
                 .stroke(AquinasTheme.Colors.darkBrown.opacity(0.08), lineWidth: 1)
         )
-        .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 16)
         .scaleEffect(hasAppeared ? 1 : 0.35, anchor: .bottom)
         .opacity(hasAppeared ? 1 : 0)
         .animation(.spring(response: 0.42, dampingFraction: 0.86), value: isCompacting)

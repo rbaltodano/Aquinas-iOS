@@ -101,6 +101,12 @@ struct InsightTreeCanvasView: View {
     @State private var hasAppeared:        Bool = false
     @State private var revealedInsightIDs: Set<UUID> = []
     @State private var revealedNodeIDs: Set<UUID> = []
+    /// Stable topology baselines for live (non-persisted) trees. Reveal state is deliberately
+    /// separate: an Insight can already belong to the tree while remaining hidden during its
+    /// camera/reveal sequence, so using `revealedInsightIDs` to detect additions can replay an
+    /// entrance whenever an unrelated node update arrives mid-animation.
+    @State private var observedLiveInsightIDs: Set<UUID> = []
+    @State private var observedLiveNodeIDs: Set<UUID> = []
     /// Insights the user hasn't opened yet — they show a blue "new" dot until first hovered.
     @State private var undiscoveredInsightIDs: Set<UUID> = []
     /// New Node Concepts keep their own discovery state and clear it when first opened.
@@ -367,6 +373,8 @@ struct InsightTreeCanvasView: View {
                 undiscoveredInsightIDs = loadUndiscoveredInsightIDs()
                 undiscoveredNodeIDs = loadUndiscoveredNodeIDs()
                 revealedNodeIDs = Set(nodes.map(\.id))
+                observedLiveInsightIDs = visibleInsightIDs(in: nodes)
+                observedLiveNodeIDs = Set(nodes.map(\.id))
                 if defersEntranceUntilPersistedTree {
                     // Show the fallback tree without moving the camera or marking it as the
                     // persisted baseline. A completed backend load will do both.
@@ -426,34 +434,59 @@ struct InsightTreeCanvasView: View {
                 // they start as a flashing icon at the node center, splay out to their orbit
                 // staggered by 0.15s each, then once "loaded" the title blurs up.
                 guard hasAppeared else { return }
+                let currentInsightIDs = visibleInsightIDs(in: newNodes)
+                let currentNodeIDs = Set(newNodes.map(\.id))
+                let addedLiveInsightIDs = currentInsightIDs.subtracting(observedLiveInsightIDs)
+                let addedLiveNodeIDs = currentNodeIDs.subtracting(observedLiveNodeIDs)
                 if !defersEntranceUntilPersistedTree {
-                    let newNodeIDs = Set(newNodes.map(\.id)).subtracting(revealedNodeIDs)
-                    if !newNodeIDs.isEmpty {
-                        withAnimation(.easeOut(duration: 0.22)) {
-                            revealedNodeIDs.formUnion(newNodeIDs)
-                        }
-                    }
+                    observedLiveInsightIDs = currentInsightIDs
+                    observedLiveNodeIDs = currentNodeIDs
                 }
                 let known = revealedInsightIDs.union(loadingInsightIDs)
                 var newOnes: [(id: UUID, orbitIndex: Int)] = []
-                var plainNewIDs: [UUID] = []
+                var plainNewInsights: [InsightModel] = []
                 var placedMidpointID: UUID? = nil
                 for node in newNodes {
-                    for (i, insight) in canvasInsights(for: node).enumerated() where !known.contains(insight.id) {
+                    for (i, insight) in canvasInsights(for: node).enumerated()
+                    where defersEntranceUntilPersistedTree
+                        ? !known.contains(insight.id)
+                        : addedLiveInsightIDs.contains(insight.id) {
                         if insight.id == midpointPlacedInsightID {
                             placedMidpointID = insight.id     // just-placed midpoint → simulated load + hover
                         } else if makeNodeChildIDs.contains(insight.id) {
                             newOnes.append((insight.id, i))   // Make Node child → loading mask + splay
                         } else {
-                            plainNewIDs.append(insight.id)     // everything else → normal blur/transform pop-in
+                            plainNewInsights.append(insight)   // accepted Global Insights → camera tour + reveal
                         }
                     }
                 }
 
-                // Other new insights just appear with the standard blur + transform reveal.
-                if !plainNewIDs.isEmpty && !defersEntranceUntilPersistedTree {
-                    withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
-                        for id in plainNewIDs { revealedInsightIDs.insert(id) }
+                // Newly accepted Global Insights use the same staged camera/reveal sequence as
+                // persisted tree updates. Waiting one layout beat lets their simulated positions
+                // settle before the camera pans to them.
+                if !plainNewInsights.isEmpty && !defersEntranceUntilPersistedTree {
+                    entranceTask?.cancel()
+                    let plainNewIDs = Set(plainNewInsights.map(\.id))
+                    markUndiscovered(Array(plainNewIDs))
+                    markNodesUndiscovered(Array(addedLiveNodeIDs))
+                    reportUndiscoveredInsightCount()
+                    entranceTask = Task {
+                        await Task.yield()
+                        try? await Task.sleep(for: .milliseconds(50))
+                        guard !Task.isCancelled else { return }
+                        await runPersistedUpdateSequence(
+                            newInsights: plainNewInsights,
+                            newNodeIDs: addedLiveNodeIDs,
+                            in: size
+                        )
+                        guard !Task.isCancelled else { return }
+                        saveAllInsightIDsAsSeen()
+                    }
+                } else if !addedLiveNodeIDs.isEmpty && !defersEntranceUntilPersistedTree {
+                    // Make Node and other node-only additions own their Insight animation below,
+                    // but their parent concept still needs to become visible immediately.
+                    withAnimation(.easeOut(duration: 0.22)) {
+                        revealedNodeIDs.formUnion(addedLiveNodeIDs)
                     }
                 }
 
@@ -3061,7 +3094,7 @@ struct InsightTreeCanvasView: View {
         // All non-new insights animate in with the standard 0.25 s stagger.
         try? await Task.sleep(nanoseconds: 250_000_000)
         guard !Task.isCancelled else { return }
-        revealedInsightIDs = nonNewIDs.isEmpty ? allIDs : nonNewIDs
+        revealedInsightIDs = nonNewIDs
 
         if newInsights.isEmpty {
             // Nothing new — reveal everything at the stagger point and we're done.
@@ -3080,7 +3113,9 @@ struct InsightTreeCanvasView: View {
                 zoomToInsight(insight, in: size)
                 try? await Task.sleep(nanoseconds: 950_000_000)   // spring settle ~0.95 s
                 guard !Task.isCancelled else { return }
-                revealedInsightIDs.insert(insight.id)
+                _ = withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
+                    revealedInsightIDs.insert(insight.id)
+                }
                 // Fire a ripple from this insight's world position as it springs in.
                 if let worldPos = worldPosition(forInsightID: insight.id) {
                     rippleTrigger = RippleTrigger(worldOrigin: worldPos,
@@ -3094,7 +3129,9 @@ struct InsightTreeCanvasView: View {
             zoomToFitInsights(newInsights, in: size)
             try? await Task.sleep(nanoseconds: 1_100_000_000)
             guard !Task.isCancelled else { return }
-            for id in newIDs { revealedInsightIDs.insert(id) }
+            withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
+                revealedInsightIDs.formUnion(newIDs)
+            }
             // Single ripple at the centroid of all new insights.
             let positions = newInsights.compactMap { worldPosition(forInsightID: $0.id) }
             if !positions.isEmpty {

@@ -63,6 +63,36 @@ struct LiteRTAquinasModel: AquinasModel {
         sanitizedVisibleText(raw)
     }
 
+    static func questionOfTheDayQuestion(from raw: String) -> String? {
+        let cleaned = sanitizedVisibleText(raw)
+            .replacingOccurrences(of: "```", with: "")
+            .trimmed
+        for rawLine in cleaned.split(whereSeparator: \Character.isNewline).reversed() {
+            var line = String(rawLine).trimmed
+            for prefix in ["Question of the Day:", "Question:"] where line.hasPrefix(prefix) {
+                line = String(line.dropFirst(prefix.count)).trimmed
+            }
+            line = line.trimmingCharacters(
+                in: CharacterSet(charactersIn: "-*#>\"“” ")
+            )
+            if line.last != "?" {
+                let normalized = line.lowercased()
+                let interrogativePrefixes = [
+                    "how ", "why ", "what ", "when ", "where ", "who ", "which ",
+                    "can ", "could ", "would ", "should ", "is ", "are ", "do ",
+                    "does ", "did "
+                ]
+                guard interrogativePrefixes.contains(where: normalized.hasPrefix) else {
+                    continue
+                }
+                line = line.trimmingCharacters(in: CharacterSet(charactersIn: ".! ")) + "?"
+            }
+            guard (12...320).contains(line.count) else { continue }
+            return line
+        }
+        return nil
+    }
+
     static func approachSummary(
         for context: ConversationContext
     ) -> [String] {
@@ -98,6 +128,14 @@ struct LiteRTAquinasModel: AquinasModel {
             references: references,
             thinkingEnabled: thinkingEnabled
         )
+    }
+
+    static func requiresFactualAccuracyAudit(_ question: String) -> Bool {
+        factualAccuracyAuditNeeded(for: question)
+    }
+
+    static func isAuditMetaCommentary(_ text: String) -> Bool {
+        looksLikeAuditMetaCommentary(text)
     }
 
     func respond(to context: ConversationContext) async -> ModelResponse {
@@ -198,6 +236,27 @@ struct LiteRTAquinasModel: AquinasModel {
             var (responseText, keyTerms) = Self.inlineAnnotatedResponse(
                 from: Self.plainConversationText(from: raw)
             )
+            if Self.looksLikeAuditMetaCommentary(responseText) {
+                // The first draft itself turned into confused meta-commentary about the
+                // question (e.g. misreading a number and asking the user to clarify) rather
+                // than answering — recover once with an explicit anti-hedging instruction.
+                raw = try await runtime.generate(
+                    systemInstruction: systemInstruction + """
+
+                    The previous draft expressed confusion about the question or asked the user
+                    to clarify it instead of answering. Answer this question directly now. Do not
+                    describe any uncertainty about what was asked — only state uncertainty, if
+                    any, about a specific fact within the answer itself.
+                    """,
+                    initialMessages: request.history,
+                    message: request.latest,
+                    sampling: .conversation.retryVariant
+                )
+                try Task.checkCancellation()
+                (responseText, keyTerms) = Self.inlineAnnotatedResponse(
+                    from: Self.plainConversationText(from: raw)
+                )
+            }
             if Self.duplicatesEarlierAnswer(
                 responseText,
                 in: context.transcript
@@ -241,6 +300,30 @@ struct LiteRTAquinasModel: AquinasModel {
                 (responseText, keyTerms) = Self.inlineAnnotatedResponse(
                     from: Self.plainConversationText(from: raw)
                 )
+            }
+            if Self.factualAccuracyAuditNeeded(for: latestQuestion) {
+                do {
+                    let audited = try await accuracyAuditedResponse(
+                        question: latestQuestion,
+                        draft: Self.plainConversationText(from: raw),
+                        references: groundingReferences,
+                        personality: context.personality
+                    )
+                    try Task.checkCancellation()
+                    let parsedAudit = Self.inlineAnnotatedResponse(
+                        from: Self.plainConversationText(from: audited)
+                    )
+                    if !parsedAudit.text.isEmpty,
+                       !Self.looksLikeAuditMetaCommentary(parsedAudit.text) {
+                        responseText = parsedAudit.text
+                        keyTerms = parsedAudit.keyTerms
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    // A failed audit must not discard an otherwise complete answer. Runtime
+                    // failures still retain the first draft; successful audits replace it.
+                }
             }
             guard !responseText.isEmpty,
                   !Self.duplicatesEarlierAnswer(
@@ -575,35 +658,47 @@ struct LiteRTAquinasModel: AquinasModel {
         let relevantInsights = insights.prefix(4).map {
             DefinitionSource(title: $0.word, definition: $0.semanticDefinition)
         }
+        // Unlike ordinary conversation (turn-by-turn `Message` history handed to the native
+        // engine), this task flattens the whole source transcript into one text block inside the
+        // prompt. The selected conversation can span many turns, and with the 4,096-token engine
+        // context window shared across prompt + completion, an unbounded transcript here risks
+        // overflow or truncation, which reliably fails JSON decoding below with no on-device
+        // retry. Keep only the most recent portion — still enough to ground a follow-up question.
+        let boundedTranscript = Self.tailBounded(
+            Self.plainTranscript(context.transcript),
+            maxCharacters: 3_000
+        )
         let prompt = """
         <TASK:QUESTION_OF_THE_DAY>
         Ask one concise, specific, open-ended question grounded in the recent inquiry. It should
         invite reflection or a meaningful next step, not quiz recall, assume agreement, or repeat
         a question already answered. Use an Insight only when its actual definition contributes.
-        Return JSON only:
-        {"question":"...","reason_for_asking":"...","cited_insight_title":null}
+        Return only the question itself on one line, with no label or explanation. End it with a
+        question mark.
 
         Conversation title: \(conversationTitle)
         Recent conversation:
-        \(Self.plainTranscript(context.transcript))
+        \(boundedTranscript)
         Relevant Insights:
         \(Self.jsonString(relevantInsights))
         </TASK:QUESTION_OF_THE_DAY>
         """
         do {
             let raw = try await generateStructured(prompt)
-            let response: DailyQuestionPayload = try Self.decodeJSON(raw)
-            guard !response.question.trimmed.isEmpty,
-                  !response.reasonForAsking.trimmed.isEmpty else {
+            Self.debugQuestionOfTheDayLog("runtime returned \(raw.count) characters")
+            guard let question = Self.questionOfTheDayQuestion(from: raw),
+                  HomeQuestionOfTheDay.isValidQuestionText(question) else {
                 throw AquinasModelActionError.invalidResponse
             }
+            Self.debugQuestionOfTheDayLog("validated generated question")
             return DailyQuestionDraft(
-                question: response.question.trimmed,
-                reasonForAsking: response.reasonForAsking.trimmed,
-                citedInsightTitle: response.citedInsightTitle?.trimmed.nilIfEmpty
+                question: question,
+                reasonForAsking: "A follow-up to your recent inquiry.",
+                citedInsightTitle: nil
             )
         } catch {
             if Task.isCancelled { throw CancellationError() }
+            Self.debugQuestionOfTheDayLog("generation failed: \(String(reflecting: error))")
             guard canUseBackendFallback else { throw error }
             return try await fallback.generateQuestionOfTheDay(
                 from: context,
@@ -611,6 +706,10 @@ struct LiteRTAquinasModel: AquinasModel {
                 insights: insights
             )
         }
+    }
+
+    private static func debugQuestionOfTheDayLog(_ message: String) {
+        debugQuestionOfTheDayConsoleLog(message)
     }
 
     private func generateDefinition(
@@ -791,7 +890,7 @@ struct LiteRTAquinasModel: AquinasModel {
             )
         }
 
-        return (strippedText, Array(keyTerms.prefix(8)))
+        return (strippedText, Array(keyTerms.prefix(12)))
     }
 
     private func generateStructured(_ prompt: String) async throws -> String {
@@ -799,6 +898,64 @@ struct LiteRTAquinasModel: AquinasModel {
             systemInstruction: Self.neutralStructuredSystem,
             message: Message(prompt),
             sampling: .structured
+        )
+    }
+
+    private func accuracyAuditedResponse(
+        question: String,
+        draft: String,
+        references: [AquinasGroundingReference],
+        personality: ConversationPersonality
+    ) async throws -> String {
+        let evidence = references.isEmpty
+            ? "(no trusted reference passage was retrieved)"
+            : references.map(\.promptText).joined(separator: "\n\n")
+        let prompt = """
+        <TASK:FACTUAL_ACCURACY_AUDIT>
+        Act as a skeptical final editor. Return the complete answer only, never an audit report.
+
+        User question:
+        \(question)
+
+        Draft answer:
+        \(draft)
+
+        Trusted reference passages retrieved by semantic similarity; some may be irrelevant:
+        \(evidence)
+
+        Check every concrete name, date, number, authorship claim, quotation, causal assertion,
+        and statement that one work or person teaches something. Correct any contradiction with a
+        genuinely relevant passage. Do not force an irrelevant passage into the answer. Do not
+        introduce a new precise fact merely to make the answer sound stronger. When a decisive
+        detail cannot be established and you are not genuinely confident from well-established
+        general knowledge, say what is uncertain instead of guessing — but say it inside the
+        answer itself, in the same voice, addressed to the user's actual question. Also check
+        that the answer addresses the exact question, respects negation, keeps similarly named
+        people and works distinct, and does not overstate a disputed conclusion.
+
+        Never address the user about the draft, the audit, or a discrepancy you found (for
+        example: "there has been a mistake", "the draft answer refers to", "please clarify which
+        ..."). Silently fix any error you find and hand back the corrected answer as if it were
+        your first and only response — the user must never see any sign that a draft or a review
+        step existed.
+
+        If the draft is accurate, preserve its substance, warmth, and level of detail. If it needs
+        correction, rewrite only as much as necessary and keep the same personable voice:
+        \(Self.accuracyAuditVoiceInstruction(personality))
+
+        Preserve every still-useful {{double-curly}} Insight annotation from the draft. If a
+        correction changes or removes one, apply this same annotation policy to the final answer:
+
+        \(Self.insightAnnotationInstruction)
+
+        Return only polished natural prose with no preamble, verdict, confidence score, XML, or
+        markdown fence.
+        </TASK:FACTUAL_ACCURACY_AUDIT>
+        """
+        return try await runtime.generate(
+            systemInstruction: Self.neutralStructuredSystem,
+            message: Message(prompt),
+            sampling: .conversation
         )
     }
 }
@@ -815,6 +972,76 @@ private extension LiteRTAquinasModel {
     Return only the requested JSON or prose, with no markdown fence, preamble, persona, or hidden
     reasoning. Be precise, concise, and honest about what the supplied context supports.
     """
+
+    static let insightAnnotationInstruction = """
+    Annotate subjects with roughly the editorial frequency of useful links in a good Wikipedia
+    article. Wrap the first meaningful occurrence of a link-worthy subject in double curly braces
+    exactly where it appears. Link-worthy subjects include named people, places, peoples,
+    institutions, organizations, works, historical events and periods, schools of thought,
+    doctrines, scientific or technical concepts, species and natural phenomena, laws, methods,
+    and specialized terms a curious reader might reasonably open to learn more.
+
+    Treat links as useful paths for exploration, not merely definitions required to understand the
+    sentence. Do not omit a notable subject just because it is familiar, appears in an example, or
+    is adjacent rather than central to the answer. Cover the concepts carrying the central claim
+    first, then scan each paragraph for newly introduced article-worthy subjects. A short
+    substantive answer will often have three to five markers; a concept-rich or multi-paragraph
+    answer will often have six to ten, and may have as many as twelve when the prose genuinely
+    introduces that many distinct subjects. Zero is for truly conversational or trivial replies.
+
+    Prefer the complete recognizable name or precise multiword concept over a generic fragment:
+    mark {{First Council of Nicaea}}, not merely {{council}}; {{natural selection}}, not merely
+    {{selection}}. Do not create jargon, mark ordinary connective language, link every incidental
+    proper noun, repeat the same subject, or force a quota when the prose contains fewer useful
+    subjects. Every marker must open with {{ and close with }} around only one word or short term,
+    never span a sentence, and never be nested.
+    """
+
+    static func factualAccuracyAuditNeeded(for question: String) -> Bool {
+        let normalized = question
+            .folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return false }
+
+        let personalOrCreativePrefixes = [
+            "help me write", "write me", "rewrite", "brainstorm", "imagine", "roleplay",
+            "i feel", "i'm feeling", "i am feeling", "should i", "what should i do"
+        ]
+        if personalOrCreativePrefixes.contains(where: normalized.hasPrefix) {
+            return false
+        }
+
+        // Deliberately not gated on generic question prefixes ("who ", "what ", "tell me
+        // about", etc.) — those match nearly every real user question, forcing a second full
+        // generation pass (accuracyAuditedResponse) on almost every turn. The audit is reserved
+        // for questions that actually name an attribution/date/citation-sensitive term, where a
+        // second look genuinely earns its cost.
+        let factualTerms = [
+            "author", "authorship", "wrote", "written by", "date", "year", "century",
+            "history", "historical", "council", "pope", "saint", "scientific", "study",
+            "evidence", "source", "quotation", "quote", "according to", "how many"
+        ]
+        return factualTerms.contains(where: normalized.contains)
+    }
+
+    static func accuracyAuditVoiceInstruction(
+        _ personality: ConversationPersonality
+    ) -> String {
+        switch personality {
+        case .balanced:
+            "Warm, casual, articulate, and personal—like a loving older mentor."
+        case .scholarly:
+            "Learned, orderly, humane, and warmly Thomistic without sounding archaic."
+        case .socratic:
+            "Clear and gently Socratic where a question genuinely helps understanding."
+        case .fun:
+            "Casual, lively, and slightly eccentric without sacrificing precision."
+        }
+    }
 
     static func conversationSystemInstruction(
         context: ConversationContext,
@@ -852,8 +1079,14 @@ private extension LiteRTAquinasModel {
 
         Track named people, works, and claims exactly. Pay special attention to negation. Never
         replace the work the user asked about with a related person's other writings. For
-        authorship, date, source, and attribution questions, do not guess; say that the evidence
-        or authorship is uncertain when that is the accurate conclusion.
+        authorship, date, source, and attribution questions specifically, do not guess; say that
+        the evidence or authorship is uncertain when that is the accurate conclusion.
+
+        Never express confusion about the user's own question or ask them to clarify it when it is
+        an ordinary, understandable question — answer it directly. If a specific fact within your
+        answer is genuinely uncertain, say so briefly inside the answer itself, in the same voice;
+        do not turn the reply into a question back to the user or a description of what you're
+        unsure about instead of an answer.
 
         \(explicitCorrection.map {
             "The latest question disputes whether \($0.author) wrote “\($0.subject)”. Determine whether that correction is accurate rather than assuming either side. Answer the disputed attribution directly and do not drift into discussing \($0.author)'s other writings."
@@ -868,20 +1101,12 @@ private extension LiteRTAquinasModel {
         } ?? "")
 
         Return only the complete answer as natural prose. Do not return JSON, XML, metadata, a
-        separate key-term list, or a thinking summary. Never echo control markup.
+        separate key-term list, or a thinking summary. Never echo input control markup. The
+        requested double-curly Insight markers are the sole output-markup exception.
 
-        As you write, mark the foundational concepts a reader would most need to understand, or
-        would most benefit from exploring further, by wrapping just that word or short term in
-        double curly braces exactly where it occurs — for example "Aquinas distinguishes
-        {{essence}} from {{existence}}." Prefer marking single words or short terms over long
-        descriptive phrases. Mark terms the argument actually depends on, named
-        doctrines/works/councils, and concepts worth further exploration — err toward marking a
-        genuinely relevant term rather than skipping it; a substantive multi-paragraph answer
-        typically has five to eight such terms, a shorter answer fewer, and a purely
-        conversational reply none. Do not mark generic or connective words, and do not mark the
-        same concept twice. Every marker must open with {{ and close with }} around only that
-        term, never spanning a whole sentence, and never nested. Finish the answer before
-        stopping.
+        \(insightAnnotationInstruction)
+
+        Finish the complete answer before stopping.
         """
     }
 
@@ -998,7 +1223,7 @@ private extension LiteRTAquinasModel {
         in response: String
     ) -> [KeyTerm] {
         var canonicalTerms = Set<String>()
-        return payloads.prefix(8).compactMap { payload in
+        return payloads.prefix(12).compactMap { payload in
             let displayText = payload.displayText.trimmed
             let canonicalTerm = payload.canonicalTerm.trimmed
             let contextExcerpt = payload.contextExcerpt.trimmed
@@ -1027,7 +1252,7 @@ private extension LiteRTAquinasModel {
                 contextExcerpt: contextExcerpt
             )
         }
-        .prefix(5)
+        .prefix(12)
         .map { $0 }
     }
 
@@ -1148,39 +1373,75 @@ private extension LiteRTAquinasModel {
         ) != nil
     }
 
+    // Detects the accuracyAuditedResponse failure mode where the model, instead of silently
+    // correcting a draft and returning a normal answer, describes the discrepancy it found
+    // (e.g. "there has been a mistake... the draft answer refers to..."). That text must never
+    // reach the user; the caller falls back to the original draft when this matches.
+    static func looksLikeAuditMetaCommentary(_ text: String) -> Bool {
+        let normalized = text
+            .folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+            .lowercased()
+        let metaPhrases = [
+            "there has been a mistake", "there seems to be a mistake",
+            "there appears to be a mistake", "the draft answer", "the draft response",
+            "in the draft", "please clarify which", "please clarify what",
+            "could you clarify which", "which book or work", "to give you an accurate",
+            "i cannot give you an accurate", "i can't give you an accurate",
+            "the question you asked", "as an ai", "as a language model"
+        ]
+        return metaPhrases.contains { normalized.contains($0) }
+    }
+
     static func personalityInstruction(
         _ personality: ConversationPersonality
     ) -> String {
         switch personality {
         case .balanced:
             """
-            Respond with the care and ease of a loving older brother: close, personal, gently
-            affectionate, and genuinely invested in helping the user. Sound like you are sitting
-            beside them, not speaking from a podium. Use plain conversational language,
-            contractions, and a natural human cadence. Phrases such as "look," "honestly," or
-            "here's the thing" may appear when they fit, but never as a verbal gimmick. Prefer
-            present, personal turns such as "I think," "I'd put it this way," or "Honestly" when
-            they make the answer feel like a real conversation. Use clear, breathable sentences
-            rather than densely polished prose. Avoid impersonal coaching language such as "you
-            have to realize" or "one must understand." Be reassuring in a specific, earned way
-            while still keeping it real: name hard truths with tact, admit uncertainty, and do not
-            flatter, preach, or sugarcoat. Lead with useful substance or an honest judgment, not a
-            paraphrase of the user's situation or canned empathy. When the question permits, put
-            the actual answer in the first sentence. Do not open with stock phrases such as "I
-            hear you," "it sounds like you're," "that's valid," or "that sounds hard."
+            Speak with the intellectual depth and habits of Aquinas in relaxed contemporary
+            language. Think about what a thing is, the distinctions that matter, its causes and
+            ends, the strongest objection, and how the pieces fit together—but weave that reasoning
+            into a natural conversation, not a lecture or formal disputation. Keep precise terms
+            when they clarify the issue, explain them simply, and use a concrete example when it
+            makes a deep idea easy to grasp. Be scholarly in substance and casually articulate in
+            expression: deep without sounding dense.
+            Use these habits only when they illuminate the actual question. Do not import a named
+            Thomistic framework merely to sound profound; for ordinary personal advice, one clean
+            distinction or a simple look at causes and ends is often enough. Translate the insight
+            into everyday language; do not introduce labels such as "act of will," "voluntary in
+            its cause," or "final cause" unless the user is actually asking about those ideas.
+            Depth means clarity and insight, not length.
+            Aim for this register: "Here's the distinction: being prepared and feeling comfortable
+            aren't the same thing. You need the first; you may never get the second." Or, on a
+            philosophical question: "Aquinas is basically asking what has to be true for change to
+            make sense." These show the ease and precision to imitate, not stock lines to repeat.
 
-            Answer simple and practical questions directly. When the user wants to think
-            something through, work alongside them: make distinctions in everyday language,
-            engage their reasoning, and ask at most one focused question when it would genuinely
-            help. Favor a concrete next step over generic encouragement or a rhetorical question.
-            Preserve the full reasoning, nuance, and useful detail the inquiry deserves; a casual
-            voice must never make the answer shallow, breezy, or abbreviated. Keep Thomistic
-            clarity, honesty, and sound reasoning beneath the surface; do not default to scholarly
-            terminology, formal headings, objections and replies, or a staged dialectic unless
-            the subject truly requires it or the user asks for it. Do not claim to be the user's
-            actual family or call them brother, sister, kiddo, buddy, or another pet name unless
-            they clearly invite it. Avoid stiffness, canned empathy, sentimentality, forced
-            intimacy, shallow cheerfulness, forced slang, and needless length.
+            Relate to the user with the warmth and candor of a loving older brother sitting beside
+            them. Be friendly, personal, curious, and genuinely invested. Use contractions, direct
+            address, an occasional inclusive "we," and natural turns such as "I think," "look," or
+            "here's the thing" when they fit. A little gentle humor is welcome. Let the language
+            have life and character; do not flatten every answer into neutral explanatory prose.
+            Do not perform a folksy sage persona or rely on quaint openings such as "Well now."
+            Do not call the user "my friend," "brother," or another familiar name unless invited.
+
+            Respond to the person as well as the question. Briefly acknowledge genuine curiosity,
+            a perceptive connection, confusion being worked through, or vulnerability before
+            continuing, but do so selectively and sincerely. Say what you really think, admit
+            uncertainty, and name hard truths with tact. Do not flatter, preach, use canned empathy,
+            force slang, claim to be the user's actual family, or use uninvited pet names.
+
+            Answer routine questions directly. Give substantial questions their full depth using
+            clear, breathable sentences and ordinary words wherever they work. Ask at most one
+            focused question when it truly helps. End with a useful implication, grounded next
+            step, or companionable final thought rather than an academic recap. Stay proportionate:
+            do not repeat the same point through several analogies or expand a simple answer merely
+            to display depth. For ordinary advice, usually give one illuminating distinction, at
+            most one brief example, and one practical next step in two or three compact paragraphs;
+            once the point is clear, stop. If asking a follow-up, ask only one question. Never
+            exceed three paragraphs for routine personal advice.
             """
         case .scholarly:
             """
@@ -1316,6 +1577,13 @@ private extension LiteRTAquinasModel {
         .joined(separator: "\n\n")
     }
 
+    /// Keeps the most recent `maxCharacters` of `text`, since the tail is what's most relevant
+    /// for grounding a follow-up question or definition, and marks that it was truncated.
+    static func tailBounded(_ text: String, maxCharacters: Int) -> String {
+        guard text.count > maxCharacters else { return text }
+        return "…\n" + text.suffix(maxCharacters)
+    }
+
     static func requestedDefinitionTerm(
         in transcript: [ChatBlock]
     ) -> String? {
@@ -1430,48 +1698,69 @@ private extension LiteRTAquinasModel {
         guard case .user(let rawQuestion, _, _) = context.transcript.last else {
             return ["Checking the relevant distinctions and evidence before answering."]
         }
+        var lines: [String] = []
+        let concepts = topicWords(in: rawQuestion)
+            .sorted()
+            .prefix(4)
+        if concepts.count >= 2 {
+            lines.append(
+                "Reading the question to identify its key concepts: \(concepts.joined(separator: ", "))."
+            )
+        }
         let question = rawQuestion.lowercased()
         if question.contains("council")
             || question.contains("nicaea")
             || question.contains("nicea")
             || question.contains("constantinople") {
-            return [
+            lines.append(
                 "Comparing the established sequence: Nicaea in 325 was first, Constantinople in 381 was second, and Nicaea II in 787 was seventh."
-            ]
+            )
+            return lines
         }
         if question.contains("didache")
             || question.contains("authorship")
             || question.contains("written by") {
-            return ["Separating established authorship evidence from uncertain attribution."]
+            lines.append("Separating established authorship evidence from uncertain attribution.")
+            return lines
         }
         if let term = requestedDefinitionTerm(in: context.transcript) {
-            return ["Clarifying what \(term) means in the context of the question."]
+            lines.append("Clarifying what \(term) means in the context of the question.")
+            return lines
         }
         if question.contains("forgiv")
             || question.contains("guilt")
             || question.contains("shame")
             || question.contains("moral failing")
             || question.contains("regret") {
-            return ["Distinguishing forgiveness, repentance, guilt, and growth after repeated failure."]
+            lines.append("Distinguishing forgiveness, repentance, guilt, and growth after repeated failure.")
+            return lines
         }
         if question.contains("different")
             || question.contains("compare")
             || question.contains("relationship")
             || question.contains("versus")
             || question.contains(" vs ") {
-            return ["Distinguishing the concepts by their principles, purposes, and implications."]
+            lines.append("Distinguishing the concepts by their principles, purposes, and implications.")
+            return lines
         }
         if question.hasPrefix("why ") || question.contains(" why ") {
-            return ["Identifying the governing principle and tracing why the conclusion follows."]
+            lines.append("Identifying the governing principle and tracing why the conclusion follows.")
+            return lines
+        }
+        if question.contains("how ") || question.hasPrefix("how ") {
+            lines.append("Working out the steps or mechanism the question is actually asking for.")
+            return lines
         }
         if question.contains("is it a sin")
             || question.contains("is this a sin")
             || question.contains("morally permissible")
             || question.contains("morally wrong")
             || question.contains("is it wrong") {
-            return ["Separating the act, intention, and circumstances before judging the whole."]
+            lines.append("Separating the act, intention, and circumstances before judging the whole.")
+            return lines
         }
-        return ["Identifying the central claim and checking the relevant distinctions and evidence."]
+        lines.append("Identifying the central claim and checking the relevant distinctions and evidence.")
+        return lines
     }
 
     /// A one-line, real (not decorative) status naming what retrieval actually found, shown
@@ -1480,17 +1769,32 @@ private extension LiteRTAquinasModel {
         for references: [AquinasGroundingReference]
     ) -> [String] {
         guard !references.isEmpty else { return [] }
-        var seen = Set<String>()
-        let titles = references.map(\.title).filter { seen.insert($0).inserted }
+        var seenTitles = Set<String>()
+        let titles = references.map(\.title).filter { seenTitles.insert($0).inserted }
+        var lines: [String]
         switch titles.count {
         case 1:
-            return ["Consulting \(titles[0])."]
+            lines = ["Consulting \(titles[0])."]
         case 2:
-            return ["Consulting \(titles[0]) and \(titles[1])."]
+            lines = ["Consulting \(titles[0]) and \(titles[1])."]
         default:
             let allButLast = titles.dropLast().joined(separator: ", ")
-            return ["Consulting \(allButLast), and \(titles.last!)."]
+            lines = ["Consulting \(allButLast), and \(titles.last!)."]
         }
+        var seenSources = Set<String>()
+        let sourceNames = references.map(\.sourceName).filter { seenSources.insert($0).inserted }
+        if sourceNames != titles {
+            switch sourceNames.count {
+            case 1:
+                lines.append("Cross-checking against \(sourceNames[0]).")
+            case 2:
+                lines.append("Cross-checking against \(sourceNames[0]) and \(sourceNames[1]).")
+            default:
+                let allButLast = sourceNames.dropLast().joined(separator: ", ")
+                lines.append("Cross-checking against \(allButLast), and \(sourceNames.last!).")
+            }
+        }
+        return lines
     }
 
     static func sanitizedVisibleText(_ raw: String) -> String {
@@ -1684,18 +1988,6 @@ private struct CandidatesPayload: Decodable {
 
 private struct ChildrenPayload: Decodable {
     let children: [DefinitionPayload]
-}
-
-private struct DailyQuestionPayload: Decodable {
-    let question: String
-    let reasonForAsking: String
-    let citedInsightTitle: String?
-
-    private enum CodingKeys: String, CodingKey {
-        case question
-        case reasonForAsking = "reason_for_asking"
-        case citedInsightTitle = "cited_insight_title"
-    }
 }
 
 private struct LocalConversationPayload: Decodable {

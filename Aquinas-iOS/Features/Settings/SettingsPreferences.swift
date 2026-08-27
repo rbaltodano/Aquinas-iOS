@@ -37,6 +37,10 @@ enum SettingsStorageKey {
     static let insightMapping = "aquinas.settings.insightMapping"
     static let definitionHighlights = "aquinas.settings.definitionHighlights"
     static let dailyQuestionFocus = "aquinas.settings.dailyQuestionFocus"
+    /// Retains the original question-alignment key so existing preferences migrate seamlessly
+    /// when question and response alignment become one conversation-wide setting.
+    static let conversationTextAlignment = "aquinas.settings.inputTextAlignment"
+    static let legacyResponseTextAlignment = "aquinas.settings.responseTextAlignment"
 
     static let allResettableKeys = [
         customInstructions,
@@ -63,9 +67,9 @@ enum SettingsStorageKey {
         dailyQuestionFocus,
         "aquinas.settings.userName",
         "aquinas.settings.conversationFontSize",
-        "aquinas.settings.inputTextAlignment",
+        conversationTextAlignment,
         "aquinas.settings.inputFont",
-        "aquinas.settings.responseTextAlignment",
+        legacyResponseTextAlignment,
         "aquinas.settings.responseFont",
         "aquinas.settings.conversationPersonality"
     ]

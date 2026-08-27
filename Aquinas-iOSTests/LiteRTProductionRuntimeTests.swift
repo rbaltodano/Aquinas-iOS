@@ -237,6 +237,17 @@ struct LiteRTProductionRuntimeTests {
     }
 
     @MainActor
+    @Test("Wikipedia-density inline annotation retains up to twelve distinct subjects")
+    func wikipediaDensityInlineAnnotationsRetainTwelveSubjects() {
+        let markedSubjects = (1...13).map { "{{Subject \($0)}}" }.joined(separator: ", ")
+        let (_, keyTerms) = LiteRTAquinasModel.inlineAnnotatedResponse(from: markedSubjects)
+
+        #expect(keyTerms.count == 12)
+        #expect(keyTerms.first?.displayText == "Subject 1")
+        #expect(keyTerms.last?.displayText == "Subject 12")
+    }
+
+    @MainActor
     @Test("An unterminated inline marker becomes plain prose without truncation")
     func unterminatedInlineMarkerPreservesProse() {
         let raw = "Aquinas distinguishes {{essence}} from exis{{tence"
@@ -451,6 +462,33 @@ struct LiteRTProductionRuntimeTests {
 
         #expect(references.first?.id == "didache-authorship")
         #expect(references.first?.facts.contains("author is unknown") == true)
+    }
+
+    @Test("Local grounding retrieves the John 14 Scripture stopgap entry")
+    func localGroundingRetrievesJohn14() {
+        let references = LocalAquinasGroundingProvider().references(
+            for: "Tell me about John Chapter 14",
+            limit: 3
+        )
+
+        #expect(references.first?.id == "john-14")
+        #expect(references.first?.facts.contains("Farewell Discourse") == true)
+        #expect(references.first?.facts.contains("John 4") == true)
+    }
+
+    @Test("Local grounding retrieves other curated Scripture stopgap entries")
+    func localGroundingRetrievesOtherScriptureEntries() {
+        let romans = LocalAquinasGroundingProvider().references(
+            for: "What does Romans chapter 8 say?",
+            limit: 2
+        )
+        #expect(romans.first?.id == "romans-8")
+
+        let psalm = LocalAquinasGroundingProvider().references(
+            for: "Can you explain Psalm 23?",
+            limit: 2
+        )
+        #expect(psalm.first?.id == "psalm-23")
     }
 
     @MainActor
@@ -680,6 +718,64 @@ struct LiteRTProductionRuntimeTests {
                 insights: [matching],
                 preservesMatchingTitle: true
             ).map(\.id) == [matching.id]
+        )
+    }
+
+    @Test("Context budget compacts older turns while preserving the latest question verbatim")
+    func contextBudgetPreservesLatestQuestion() throws {
+        let latestQuestion = "Was the Didache written by Paul, or is its authorship unknown?"
+        let context = ConversationContext(
+            transcript: [
+                .user("Explain early Christian writings.", nil, []),
+                .text(String(repeating: "Earlier discussion with important context. ", count: 240)),
+                .user(latestQuestion, nil, [])
+            ]
+        )
+
+        #expect(AquinasContextBudget.totalTokenLimit == 4_096)
+        #expect(AquinasContextBudget.shouldCompact(context))
+        let split = try #require(AquinasContextBudget.historyAndLatestTurn(in: context))
+        #expect(split.history.transcript.count == 2)
+        #expect(split.latestTurn.count == 1)
+        guard case .user(let preservedQuestion, _, _) = split.latestTurn[0] else {
+            Issue.record("The latest turn was not preserved as a user question")
+            return
+        }
+        #expect(preservedQuestion == latestQuestion)
+    }
+
+    @Test("Accuracy audit targets factual terms without delaying personal advice or ordinary questions")
+    func factualAccuracyAuditSelection() {
+        #expect(LiteRTAquinasModel.requiresFactualAccuracyAudit("Who wrote the Didache?"))
+        #expect(LiteRTAquinasModel.requiresFactualAccuracyAudit("Explain the Council of Nicaea."))
+        #expect(LiteRTAquinasModel.requiresFactualAccuracyAudit("How many ecumenical councils were there?"))
+        #expect(!LiteRTAquinasModel.requiresFactualAccuracyAudit("I feel stuck and need some perspective."))
+        #expect(!LiteRTAquinasModel.requiresFactualAccuracyAudit("Help me write a warm thank-you note."))
+        // A generic question-word prefix alone no longer triggers the second-pass audit —
+        // only a genuinely attribution/date/citation-sensitive term does. This avoids doubling
+        // generation latency on nearly every question while still catching the risky ones.
+        #expect(!LiteRTAquinasModel.requiresFactualAccuracyAudit("Tell me about John Chapter 14"))
+        #expect(!LiteRTAquinasModel.requiresFactualAccuracyAudit("What is the Trinity?"))
+    }
+
+    @Test("Audit meta-commentary is detected so a confused audit reply falls back to the draft")
+    func auditMetaCommentaryDetection() {
+        #expect(
+            LiteRTAquinasModel.isAuditMetaCommentary(
+                """
+                It seems there has been a mistake in the question you asked. You asked about \
+                John chapter 14, but the draft answer refers to John chapter 4. Please clarify \
+                which book or work you are referring to.
+                """
+            )
+        )
+        #expect(
+            !LiteRTAquinasModel.isAuditMetaCommentary(
+                """
+                John chapter 14 is a pivotal moment in the Farewell Discourse, where Jesus \
+                promises the disciples an Advocate and assures them of his continued presence.
+                """
+            )
         )
     }
 

@@ -14,12 +14,21 @@ Before changing any model-facing code, read
 truth for backend contracts, iOS seams, MiniLM relatedness, persistence, current status, and the
 remaining implementation order.
 
+An embedding-precision requantization is in progress to fix unreliable chapter/reference recall
+(the shipped `dynamic_wi8_emb4_afp32` package's 4-bit embeddings were confirmed as the cause via a
+controlled comparison, not the fine-tune). Full scoping, evidence, hard-won on-device testing
+notes, and the phased game plan live in
+[WI8AFP32-REQUANTIZATION-SCOPING.md](../Aquinas-Foundations/WI8AFP32-REQUANTIZATION-SCOPING.md) —
+read it before touching model quantization/promotion. Delete that file and fold its lasting facts
+in here once the initiative ships.
+
 The live app is local-first when a verified LiteRT-LM package is available.
 `AquinasApplicationRuntime` owns one process-scoped `LiteRTAquinasRuntime`, injects the same
 runtime into `LiteRTAquinasModel` and `ModelTaskQueue`, and preserves serialized lifecycle,
 streaming, and cancellation semantics. Ordinary local conversation is a single generation call:
-the model writes the visible prose answer and marks the foundational/clarification-worthy
-concepts inline as it writes, wrapping just that word or short term in `{{double curly braces}}`
+the model writes the visible prose answer and marks important concepts, subjects, named ideas, and
+specialized words inline at roughly Wikipedia-link frequency, wrapping just that word or short term
+in `{{double curly braces}}`
 exactly where it occurs. `LiteRTAquinasModel.inlineAnnotatedResponse` strips those markers back
 out and turns each into a `KeyTerm`. Because the marker is removed in place — the surrounding
 prose never moves — `displayText` is always an exact substring of the final answer by
@@ -27,17 +36,20 @@ construction, so there is no separate "recall this exactly" step for the model t
 way a second structured JSON pass repeatedly did. That two-pass design (full prose answer, then a
 second full generation call re-reading it to produce a `key_terms` JSON array) and the
 deterministic `NLTagger`/curated-vocabulary heuristic that briefly replaced it are both retired:
-highlighting is solely the model's own in-context judgment on that single pass. An answer can
-legitimately carry zero highlighted terms — nothing forces highlights onto an answer that doesn't
-warrant any — and metadata can never replace, truncate, or leak into the visible answer, since
+highlighting is solely the model's own in-context judgment on that single pass. Truly conversational
+or trivial answers can legitimately carry zero highlighted terms, while substantive answers are
+prompted to mark roughly 3-5 terms when short and 6-10 when concept-rich, with a validated ceiling
+of 12 for genuinely subject-dense prose; there is still no heuristic
+fallback if the model disobeys. Metadata can never replace, truncate, or leak into the visible answer,
+since
 stripping the markers is how the visible text is produced in the first place, not a downstream
 validation step that can fail open or closed. While generation is incomplete, the UI reports
 progress without presenting canned text as model reasoning. The completed public approach summary
 is persisted in the branch and remains available through **Show Thinking** after view recreation
-or relaunch. Ordinary conversation stays deterministic because sampled decoding corrupts this
-4-bit checkpoint; structured application operations are also deterministic. Direct definition
-requests return Insight metadata. Special actions remain neutral and use validated structured
-outputs. A non-cancellation local failure gets one local recovery attempt;
+or relaunch. Ordinary conversation stays deterministic because sampled decoding was unsafe for
+the retired 4-bit checkpoint; structured application operations are also deterministic. Direct
+definition requests return Insight metadata. Special actions remain neutral and use validated
+structured outputs. A non-cancellation local failure gets one local recovery attempt;
 substantial separated phrase repetition and mixed-script token corruption are rejected.
 When a repeated tail is detected, the runtime preserves the coherent prefix instead of discarding
 the entire draft. Do not restore prompt-forced word targets or automatic short-answer retries: the
@@ -58,9 +70,22 @@ The Thinking summary is an app-generated public approach description, never priv
 reasoning or chain-of-thought. It must describe the relevant concepts or checks without pretending
 to expose hidden scratch work.
 `AquinasGroundingProviding` is the factual-retrieval boundary. The current offline lexical
-bootstrap includes trusted Nicaea (325), Constantinople (381), Nicaea II (787), and Didache notes.
-It fixes those known regressions but is not broad RAG coverage; production ranking still needs the
-MiniLM query encoder and a versioned trusted corpus.
+bootstrap includes trusted Nicaea (325), Constantinople (381), Nicaea II (787), and Didache notes,
+plus a curated Scripture stopgap for a handful of extremely well-known chapters (John 3, John 14,
+Matthew 5, Romans 8, 1 Corinthians 13, Psalm 23). It fixes those known regressions but is not broad
+RAG coverage; production ranking still needs the MiniLM query encoder and a versioned trusted
+corpus.
+Ordinary conversation generation stays fully deterministic (`topK: 1, temperature: 0`) even after
+the meta-commentary/hedging guard below. A brief experiment added modest sampling to help escape a
+hedge/clarification failure mode, but the direct fix (detecting that failure shape and retrying
+once with an explicit anti-hedging instruction) already covers it, and the added randomness only
+made hallucinated answers less consistent from run to run — it was reverted.
+A response — on either the first generation pass or the factual-accuracy audit pass — that reads as
+confused meta-commentary about the model's own draft or the user's question (for example, asking
+the user to clarify an ordinary question, or describing a discrepancy it noticed in its own draft
+rather than answering) is detected and never shown to the user: the audit pass discards such output
+and keeps the prior draft, and the first pass gets one bounded retry with an explicit instruction to
+answer directly instead.
 The local conversation adapter protects explicit authorship corrections: prompts preserve named
 entities/negation, internally conflicting attribution/unknown-author drafts are rejected, and one
 corrective retry is allowed without assuming the user is automatically right. The Insight Tree
@@ -108,21 +133,20 @@ together at that lower bar). `InsightTreeViewModel`'s local-seed-aware `init` re
 `.task`-driven load, so a fresh mount doesn't render a guaranteed blank-then-populated flash before
 the seed catches up.
 
-The fine-tuned Aquinas package is 2,722,385,120 bytes with SHA-256
-`5cb26c8e29d52ecf3e2b651e590761fe593dddcab0cbcdac7dc0692605ee5569`. The production
-FP16/Metal probe passed on the 8 GB base iPhone 17 on July 30, 2026 with a 4.33-second cold load
-and 1.27-second one-sentence generation, then remained alive for more than 25 seconds. A
-development bundle seed may provide the package today. `LiteRTModelInstaller` can download,
-size-check, hash-check, and atomically install the package into Application Support, but release
-delivery still needs a hosted model URL, resumable/background transfer, storage/settings UI, and
-removal of the 2.72 GB bundled development seed.
-
-An experimental higher-precision `8fc4emb` package exists in the backend workspace, but its first
-simulator probe failed LiteRT GPU engine creation (`Failed to initialize kernel`) before generation.
-The app therefore still intentionally uses the verified 4-bit manifest. Debug probes may pass
-`--litert-model-path /absolute/path/to/model.litertlm` to test another exact package without
-replacing the bundled seed. Never promote a candidate before simulator and base-iPhone load,
-latency, memory, stability, and blind answer-quality gates pass.
+The production Aquinas package uses 8-bit decoder weights with 4-bit embeddings
+(`dynamic_wi8_emb4_afp32`). It is 3,862,121,696 bytes with SHA-256
+`9a6345f1a6cd39283f957977c84d31cc63b8dd56f2b8fffeb784940f63365282`, exactly matching
+`LiteRTModelManifest.aquinas` and the bundled development seed. This package replaced the retired
+2,722,385,120-byte 4-bit artifact because the latter exhibited repetition/looping. The 8-bit
+package's initial Simulator GPU failure was confirmed to be Simulator-only; it runs on the 8 GB
+base iPhone 17. A development bundle seed may provide the package today.
+`LiteRTModelInstaller` can download, size-check, hash-check, and atomically install the package
+into Application Support, but release delivery still needs a hosted model URL,
+resumable/background transfer, storage/settings UI, and removal of the 3.86 GB bundled
+development seed. Debug probes may pass `--litert-model-path /absolute/path/to/model.litertlm`
+to test another exact package without replacing it. Never promote a candidate before base-iPhone
+load, latency, memory, stability, and blind answer-quality gates pass; Simulator GPU initialization
+alone is not a valid rejection signal for this LiteRT package family.
 
 The 2,659,057,664-byte `litert-community/Qwen3-4B` mixed-INT4 candidate (SHA-256
 `f0794bc77efeaaf4f7af815f04c483b19b8f2ae4a102cef1b7b760a25848a18e`) is also rejected. It

@@ -254,6 +254,11 @@ private struct ResponseSegment: Identifiable {
         if case .insight = kind { return true }
         return false
     }
+
+    var isParagraph: Bool {
+        if case .paragraph = kind { return true }
+        return false
+    }
 }
 
 // MARK: - Streaming Message View
@@ -273,6 +278,7 @@ struct StreamingMessageView: View {
     let savedInsightIDs: Set<UUID>
     let showsResponseActions: Bool
     var onQuote: ((String) -> Void)? = nil
+    var onRegenerate: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil
     var onInsightTap: ((String, String) -> Void)? = nil
     var onInlineInsightQuote: ((ConceptDefinition) -> Void)? = nil
@@ -321,6 +327,7 @@ struct StreamingMessageView: View {
         savedInsightIDs: Set<UUID> = [],
         showsResponseActions: Bool = true,
         onQuote: ((String) -> Void)? = nil,
+        onRegenerate: (() -> Void)? = nil,
         onBranch: (() -> Void)? = nil,
         onInsightTap: ((String, String) -> Void)? = nil,
         onInlineInsightQuote: ((ConceptDefinition) -> Void)? = nil,
@@ -342,6 +349,7 @@ struct StreamingMessageView: View {
         self.savedInsightIDs = savedInsightIDs
         self.showsResponseActions = showsResponseActions
         self.onQuote = onQuote
+        self.onRegenerate = onRegenerate
         self.onBranch = onBranch
         self.onInsightTap = onInsightTap
         self.onInlineInsightQuote = onInlineInsightQuote
@@ -461,7 +469,9 @@ struct StreamingMessageView: View {
     private var responseFooter: some View {
         ModelResponseFooter(
             copyText: InlineInsightMarkup.plainText(from: fullText),
-            responseTextAlignment: responseTextAlignment
+            responseTextAlignment: responseTextAlignment,
+            onRegenerate: onRegenerate,
+            onBranch: onBranch
         )
         .transition(
             .move(edge: .top)
@@ -492,6 +502,9 @@ struct StreamingMessageView: View {
 
     private func spacingBeforeSegment(at index: Int) -> CGFloat {
         guard index > 0 else { return 0 }
+        if segments[index].isParagraph, segments[index - 1].isParagraph {
+            return 24
+        }
         return segments[index].isInsight || segments[index - 1].isInsight ? 24 : 16
     }
 
@@ -746,13 +759,18 @@ struct StreamingMessageView: View {
             return Text(token).font(baseFont)
         }
 
-        var text = Text(markdown.text).font(baseFont)
-        if markdown.isBold { text = text.bold() }
-        if markdown.isItalic { text = text.italic() }
+        var font = baseFont
+        if markdown.isBold { font = font.bold() }
+        if markdown.isItalic { font = font.italic() }
+
+        var attributed = AttributedString(markdown.text)
+        attributed.font = font
         if !markdown.trailingPunctuation.isEmpty {
-            text = text + Text(markdown.trailingPunctuation).font(baseFont)
+            var trailing = AttributedString(markdown.trailingPunctuation)
+            trailing.font = baseFont
+            attributed += trailing
         }
-        return text
+        return Text(attributed)
     }
 
     private func inlineMarkdown(from token: String) -> (text: String, trailingPunctuation: String, isBold: Bool, isItalic: Bool)? {
@@ -782,12 +800,17 @@ struct StreamingMessageView: View {
             let headingLevel: Int?
             let content: String
             let insight: ConceptDefinition?
+            let startsNewBlock: Bool
         }
 
         var rawLines: [RawLine] = []
+        var nextLineStartsNewBlock = false
         for line in text.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty else { continue }
+            guard !trimmed.isEmpty else {
+                nextLineStartsNewBlock = true
+                continue
+            }
 
             if let insight = InlineInsightMarkup.insight(from: trimmed) {
                 rawLines.append(
@@ -795,7 +818,8 @@ struct StreamingMessageView: View {
                         listKind: nil,
                         headingLevel: nil,
                         content: "",
-                        insight: insight
+                        insight: insight,
+                        startsNewBlock: nextLineStartsNewBlock
                     )
                 )
             } else if let match = CachedRegex.orderedListLine.firstMatch(
@@ -808,7 +832,8 @@ struct StreamingMessageView: View {
                         listKind: .ordered,
                         headingLevel: nil,
                         content: String(trimmed[itemRange]),
-                        insight: nil
+                        insight: nil,
+                        startsNewBlock: nextLineStartsNewBlock
                     )
                 )
             } else if let match = CachedRegex.unorderedListLine.firstMatch(
@@ -821,7 +846,8 @@ struct StreamingMessageView: View {
                         listKind: .unordered,
                         headingLevel: nil,
                         content: String(trimmed[itemRange]),
-                        insight: nil
+                        insight: nil,
+                        startsNewBlock: nextLineStartsNewBlock
                     )
                 )
             } else if let heading = markdownHeading(from: trimmed) {
@@ -830,7 +856,8 @@ struct StreamingMessageView: View {
                         listKind: nil,
                         headingLevel: heading.level,
                         content: heading.text,
-                        insight: nil
+                        insight: nil,
+                        startsNewBlock: nextLineStartsNewBlock
                     )
                 )
             } else {
@@ -839,10 +866,12 @@ struct StreamingMessageView: View {
                         listKind: nil,
                         headingLevel: nil,
                         content: trimmed,
-                        insight: nil
+                        insight: nil,
+                        startsNewBlock: nextLineStartsNewBlock
                     )
                 )
             }
+            nextLineStartsNewBlock = false
         }
 
         var result: [ResponseSegment] = []
@@ -865,7 +894,9 @@ struct StreamingMessageView: View {
             } else if let listKind = rawLines[i].listKind {
                 // Gather consecutive items of the same list style into one segment.
                 var items: [String] = []
-                while i < rawLines.count && rawLines[i].listKind == listKind {
+                while i < rawLines.count
+                    && rawLines[i].listKind == listKind
+                    && (items.isEmpty || !rawLines[i].startsNewBlock) {
                     items.append(rawLines[i].content)
                     i += 1
                 }
@@ -902,7 +933,8 @@ struct StreamingMessageView: View {
                 while i < rawLines.count
                     && rawLines[i].listKind == nil
                     && rawLines[i].headingLevel == nil
-                    && rawLines[i].insight == nil {
+                    && rawLines[i].insight == nil
+                    && (paraWords.isEmpty || !rawLines[i].startsNewBlock) {
                     paraWords.append(contentsOf: tokenize(rawLines[i].content))
                     i += 1
                 }
@@ -1080,8 +1112,9 @@ private struct LiveFormattedResponseView: View {
     let onInsightTap: ((String, String) -> Void)?
 
     var body: some View {
-        VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 16) {
-            ForEach(LiveResponseBlock.parse(text)) { block in
+        let blocks = LiveResponseBlock.parse(text)
+        VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 0) {
+            ForEach(Array(blocks.enumerated()), id: \.element.id) { index, block in
                 LiveResponseBlockView(
                     block: block,
                     sourceResponseBlock: text,
@@ -1092,10 +1125,16 @@ private struct LiveFormattedResponseView: View {
                     queuedInsightKeys: queuedInsightKeys,
                     onInsightTap: onInsightTap
                 )
+                .padding(.top, spacingBeforeBlock(at: index, in: blocks))
             }
         }
         .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
         .textSelection(.enabled)
+    }
+
+    private func spacingBeforeBlock(at index: Int, in blocks: [LiveResponseBlock]) -> CGFloat {
+        guard index > 0 else { return 0 }
+        return blocks[index].isParagraph && blocks[index - 1].isParagraph ? 24 : 16
     }
 }
 
@@ -1319,13 +1358,18 @@ private struct LiveTokenFlow: View {
             return Text(token).font(baseFont)
         }
 
-        var text = Text(markdown.text).font(baseFont)
-        if markdown.isBold { text = text.bold() }
-        if markdown.isItalic { text = text.italic() }
+        var font = baseFont
+        if markdown.isBold { font = font.bold() }
+        if markdown.isItalic { font = font.italic() }
+
+        var attributed = AttributedString(markdown.text)
+        attributed.font = font
         if !markdown.trailingPunctuation.isEmpty {
-            text = text + Text(markdown.trailingPunctuation).font(baseFont)
+            var trailing = AttributedString(markdown.trailingPunctuation)
+            trailing.font = baseFont
+            attributed += trailing
         }
-        return text
+        return Text(attributed)
     }
 
     private static func inlineMarkdown(
@@ -1493,6 +1537,11 @@ private struct LiveResponseBlock: Identifiable {
     let kind: Kind
     let annotationSequenceStart: Int
 
+    var isParagraph: Bool {
+        if case .paragraph = kind { return true }
+        return false
+    }
+
     static func parse(_ text: String) -> [LiveResponseBlock] {
         var blocks: [LiveResponseBlock] = []
         var paragraphLines: [String] = []
@@ -1531,10 +1580,15 @@ private struct LiveResponseBlock: Identifiable {
 
         for line in text.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            // Match the completed response parser, which skips blank lines and
-            // keeps adjacent prose in one paragraph flow. This prevents line
-            // spacing from changing at completion.
-            guard !trimmed.isEmpty else { continue }
+            // A blank Markdown line is a real block boundary. Flush now so the live formatter
+            // and completed-response formatter both preserve paragraph separation instead of
+            // collapsing the entire answer into one continuous flow.
+            guard !trimmed.isEmpty else {
+                flushParagraph()
+                flushOrderedList()
+                flushUnorderedList()
+                continue
+            }
 
             if let item = orderedListItem(from: trimmed) {
                 flushParagraph()

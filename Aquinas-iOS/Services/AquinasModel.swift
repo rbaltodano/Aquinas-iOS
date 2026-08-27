@@ -209,6 +209,71 @@ struct ConversationContext {
     }
 }
 
+/// The on-device LiteRT engine has one 4,096-token KV cache shared by the system prompt,
+/// retrieved references, conversation history, the latest question, and the answer. Keep a
+/// conservative reserve for everything except the visible conversation so a fluent answer does
+/// not come at the cost of silently losing earlier turns.
+enum AquinasContextBudget {
+    static let totalTokenLimit = 4_096
+    static let nonConversationReserve = 1_400
+    static let automaticCompactionThreshold = 3_200
+
+    static func estimatedTokenCount(in text: String) -> Int {
+        guard !text.isEmpty else { return 0 }
+        // Four UTF-8 bytes per token is a deliberately conservative English-language estimate.
+        // It also behaves more sensibly than word count for punctuation, markup, and long names.
+        return Int(ceil(Double(text.utf8.count) / 4.0))
+    }
+
+    static func estimatedRequestTokenCount(for context: ConversationContext) -> Int {
+        nonConversationReserve
+            + estimatedTokenCount(in: context.compactedContext ?? "")
+            + context.transcript.reduce(into: 0) { count, block in
+                count += estimatedTokenCount(in: plainText(for: block))
+            }
+    }
+
+    static func shouldCompact(_ context: ConversationContext) -> Bool {
+        estimatedRequestTokenCount(for: context) >= automaticCompactionThreshold
+            && historyAndLatestTurn(in: context) != nil
+    }
+
+    /// Separates the latest user request from the history that may be summarized. The latest
+    /// request must remain verbatim; asking the model to answer a summary of it can change names,
+    /// negation, or the actual question being asked.
+    static func historyAndLatestTurn(
+        in context: ConversationContext
+    ) -> (history: ConversationContext, latestTurn: [ChatBlock])? {
+        guard let latestUserIndex = context.transcript.lastIndex(where: { block in
+            if case .user = block { return true }
+            return false
+        }), latestUserIndex > context.transcript.startIndex else {
+            return nil
+        }
+        let historyBlocks = Array(context.transcript[..<latestUserIndex])
+        guard !historyBlocks.isEmpty else { return nil }
+        return (
+            ConversationContext(
+                compactedContext: context.compactedContext,
+                transcript: historyBlocks,
+                personality: context.personality
+            ),
+            Array(context.transcript[latestUserIndex...])
+        )
+    }
+
+    private static func plainText(for block: ChatBlock) -> String {
+        switch block {
+        case .text(let text):
+            InlineInsightMarkup.plainText(from: text)
+        case .user(let text, let concept, _):
+            [text, concept?.word, concept?.semanticDefinition]
+                .compactMap { $0 }
+                .joined(separator: " ")
+        }
+    }
+}
+
 /// Model-only markup for a user turn. Quoted Insights stay separate from the visible question in
 /// application state, then become explicit context immediately before that question at generation.
 enum ConversationPromptMarkup {

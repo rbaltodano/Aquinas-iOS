@@ -56,4 +56,36 @@ struct HomeQuestionOfTheDayTests {
             question.nextEligibleRefreshDate(calendar: calendar) >= expiration
         )
     }
+
+    @Test("An invalid cached value is hidden and can be replaced immediately")
+    func invalidCachedValueIsImmediatelyEligibleForReplacement() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let question = HomeQuestionOfTheDay(
+            question: "Failed to load",
+            generatedAt: now,
+            expiresAt: now.addingTimeInterval(24 * 60 * 60)
+        )
+
+        #expect(!question.isPending(at: now))
+        #expect(question.nextEligibleRefreshDate(calendar: calendar) == .distantPast)
+    }
+
+    @Test("A generated one-line question is accepted without a JSON wrapper")
+    func generatedPlainQuestionIsAccepted() {
+        #expect(
+            LiteRTAquinasModel.questionOfTheDayQuestion(
+                from: "Question: What practical step would test this conclusion?"
+            ) == "What practical step would test this conclusion?"
+        )
+        #expect(
+            LiteRTAquinasModel.questionOfTheDayQuestion(
+                from: "How might this distinction change the conclusion"
+            ) == "How might this distinction change the conclusion?"
+        )
+        #expect(
+            LiteRTAquinasModel.questionOfTheDayQuestion(
+                from: "Here is an explanation without a question."
+            ) == nil
+        )
+    }
 }

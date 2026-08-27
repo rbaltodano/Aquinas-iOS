@@ -6,6 +6,7 @@
 import LiteRTLM
 import Observation
 import SwiftUI
+import UIKit
 
 @MainActor
 @Observable
@@ -47,6 +48,25 @@ final class LiteRTDeviceProbeModel {
     private var engine: Engine?
     private var conversation: Conversation?
     private var productionRuntime: LiteRTAquinasRuntime?
+
+    var copySummary: String {
+        let sizeText = modelSizeBytes.map {
+            ByteCountFormatStyle(
+                style: .file,
+                allowedUnits: [.gb],
+                spellsOutZero: false,
+                includesActualByteCount: false
+            ).format($0)
+        } ?? "—"
+        let loadText = loadSeconds.map { "\($0.formatted(.number.precision(.fractionLength(2))))s" } ?? "—"
+        let generationText = generationSeconds.map { "\($0.formatted(.number.precision(.fractionLength(2))))s" } ?? "—"
+        return """
+        Model size: \(sizeText)
+        Cold load: \(loadText)
+        Generation: \(generationText)
+        Response: \(response)
+        """
+    }
 
     var isRunning: Bool {
         switch phase {
@@ -197,7 +217,7 @@ final class LiteRTDeviceProbeModel {
             }
 
             phase = .completed
-            detail = "The production conversation path completed locally."
+            detail = "The production conversation path completed locally with \(result.keyTerms.count) validated Insight links."
         } catch {
             phase = .failed
             detail = error.localizedDescription
@@ -340,6 +360,16 @@ struct LiteRTDeviceProbeView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .disabled(model.didStart)
+                if model.didStart {
+                    Button {
+                        UIPasteboard.general.string = model.copySummary
+                    } label: {
+                        Label("Copy results", systemImage: "doc.on.doc")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                }
             }
             .padding(AquinasTheme.Spacing.screenPadding)
         }

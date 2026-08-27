@@ -117,4 +117,70 @@ struct InsightTreeCanvasPersistenceTests {
 
         #expect(!treeB.placedMidpointNodeIDs.contains(midpoint.id))
     }
+
+    // MARK: - Make Node bookmarks
+
+    @MainActor
+    @Test("Make Node exposes bookmark records and removes an unbookmarked child")
+    func makeNodeBookmarkLifecycle() async throws {
+        let source = makeConcept(word: "Prudence")
+        let tree = InsightTreeViewModel(
+            insights: [source],
+            model: MockAquinasModel(),
+            midpointStoreScope: UUID()
+        )
+
+        tree.reserveMakeNodeGeneration(for: source.id)
+        let sourceInsight = InsightModel(concept: source)
+        try await tree.generateReservedMakeNodeChildren(for: sourceInsight)
+
+        let bookmarks = tree.makeNodeBookmarkConcepts(for: source.id)
+        #expect(bookmarks.count == 4)
+        #expect(bookmarks.first?.id == source.id)
+        #expect(Set(bookmarks.dropFirst().map(\.id)).isSubset(of: tree.generatedMakeNodeChildIDs))
+
+        let removedChildID = try #require(bookmarks.dropFirst().first?.id)
+        tree.removeMakeNodeChild(id: removedChildID)
+
+        #expect(!tree.generatedMakeNodeChildIDs.contains(removedChildID))
+        #expect(!tree.nodes.flatMap(\.insights).contains(where: { $0.id == removedChildID }))
+    }
+
+    @MainActor
+    @Test("Keeping attached Insights rehomes them under remaining Nodes")
+    func keptMakeNodeInsightsAreRehomed() async throws {
+        let source = makeConcept(word: "Prudence")
+        let neighbor = makeConcept(word: "Moral Judgment")
+        let tree = InsightTreeViewModel(
+            insights: [source, neighbor],
+            model: MockAquinasModel(),
+            midpointStoreScope: UUID()
+        )
+
+        tree.reserveMakeNodeGeneration(for: source.id)
+        try await tree.generateReservedMakeNodeChildren(for: InsightModel(concept: source))
+        let childBookmarks = Array(tree.makeNodeBookmarkConcepts(for: source.id).dropFirst())
+        tree.updateInsights(
+            [source, neighbor] + childBookmarks,
+            promotedInsightIDs: [source.id]
+        )
+        let remainingNodeIDs = Set(tree.nodes.compactMap { node in
+            tree.promotedSourceInsightID(forNodeID: node.id) == nil && !node.insights.isEmpty
+                ? node.id
+                : nil
+        })
+
+        tree.removeMakeNode(for: source.id, keepingChildren: true)
+        tree.updateInsights(
+            [neighbor] + childBookmarks,
+            promotedInsightIDs: []
+        )
+
+        for child in childBookmarks {
+            let ownerID = tree.nodes.first(where: {
+                $0.insights.contains(where: { $0.id == child.id })
+            })?.id
+            #expect(ownerID.map(remainingNodeIDs.contains) == true)
+        }
+    }
 }

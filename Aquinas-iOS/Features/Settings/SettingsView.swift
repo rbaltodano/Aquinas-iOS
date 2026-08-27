@@ -14,9 +14,8 @@ struct SettingsView: View {
     @Binding var userName: String
     @Binding var customInstructions: String
     @Binding var conversationFontSize: ConversationFontSizeOption
-    @Binding var inputTextAlignment: InputTextAlignmentOption
+    @Binding var conversationTextAlignment: ConversationTextAlignmentOption
     @Binding var inputFont: ConversationFontOption
-    @Binding var responseTextAlignment: ResponseTextAlignmentOption
     @Binding var responseFont: ConversationFontOption
     @Binding var conversationPersonality: ConversationPersonality
     var onOpenMenu: () -> Void
@@ -37,9 +36,8 @@ struct SettingsView: View {
                         userName: $userName,
                         customInstructions: $customInstructions,
                         conversationFontSize: $conversationFontSize,
-                        inputTextAlignment: $inputTextAlignment,
+                        conversationTextAlignment: $conversationTextAlignment,
                         inputFont: $inputFont,
-                        responseTextAlignment: $responseTextAlignment,
                         responseFont: $responseFont,
                         conversationPersonality: $conversationPersonality,
                         onReset: resetSettings
@@ -100,9 +98,8 @@ struct SettingsView: View {
         userName = ""
         customInstructions = ""
         conversationFontSize = .small
-        inputTextAlignment = .center
+        conversationTextAlignment = .center
         inputFont = .serif
-        responseTextAlignment = .center
         responseFont = .sans
         conversationPersonality = .balanced
     }
@@ -132,10 +129,10 @@ private struct SettingsHubView: View {
                 SettingsHubSection(
                     title: "General",
                     rows: [
-                        SettingsHubItem(title: "Appearance", route: .appearance),
-                        SettingsHubItem(title: "App Experience", route: .appExperience),
-                        SettingsHubItem(title: "Notifications", route: .notifications),
-                        SettingsHubItem(title: "Privacy & Data", route: .privacyAndData)
+                        SettingsHubItem(title: "Appearance", iconName: "paintpalette", route: .appearance),
+                        SettingsHubItem(title: "App Experience", iconName: "sparkles", route: .appExperience),
+                        SettingsHubItem(title: "Notifications", iconName: "bell", route: .notifications),
+                        SettingsHubItem(title: "Privacy & Data", iconName: "lock.shield", route: .privacyAndData)
                     ],
                     onSelect: onSelect
                 )
@@ -143,8 +140,8 @@ private struct SettingsHubView: View {
                 SettingsHubSection(
                     title: "Model",
                     rows: [
-                        SettingsHubItem(title: "Model Behavior", route: .modelBehavior),
-                        SettingsHubItem(title: "Model Activity", route: .modelActivity)
+                        SettingsHubItem(title: "Model Behavior", iconName: "brain", route: .modelBehavior),
+                        SettingsHubItem(title: "Model Activity", iconName: "waveform", route: .modelActivity)
                     ],
                     onSelect: onSelect
                 )
@@ -152,8 +149,8 @@ private struct SettingsHubView: View {
                 SettingsHubSection(
                     title: "Conversations",
                     rows: [
-                        SettingsHubItem(title: "Text & Display", route: .textAndDisplay),
-                        SettingsHubItem(title: "Conversation Defaults", route: .conversationDefaults)
+                        SettingsHubItem(title: "Text & Display", iconName: "textformat.size", route: .textAndDisplay),
+                        SettingsHubItem(title: "Conversation Defaults", iconName: "bubble.left.and.bubble.right", route: .conversationDefaults)
                     ],
                     onSelect: onSelect
                 )
@@ -161,8 +158,8 @@ private struct SettingsHubView: View {
                 SettingsHubSection(
                     title: "Support",
                     rows: [
-                        SettingsHubItem(title: "Documentation", route: .documentation),
-                        SettingsHubItem(title: "Report a Bug", route: .reportBug)
+                        SettingsHubItem(title: "Documentation", iconName: "book", route: .documentation),
+                        SettingsHubItem(title: "Report a Bug", iconName: "ladybug", route: .reportBug)
                     ],
                     onSelect: onSelect
                 )
@@ -173,6 +170,7 @@ private struct SettingsHubView: View {
 
 private struct SettingsHubItem: Identifiable {
     let title: LocalizedStringResource
+    let iconName: String
     let route: SettingsRoute
 
     var id: SettingsRoute { route }
@@ -195,20 +193,27 @@ private struct SettingsHubSection: View {
                         SettingsHaptics.playSelection()
                         onSelect(row.route)
                     } label: {
-                        Text(row.title)
-                            .font(AquinasTheme.Typography.body)
-                            .foregroundStyle(AquinasTheme.Colors.paragraphText)
-                            .frame(maxWidth: .infinity, minHeight: 18, alignment: .leading)
-                            .contentShape(Rectangle())
+                        HStack(spacing: 12) {
+                            Image(systemName: row.iconName)
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(AquinasTheme.Colors.paragraphText)
+                                .frame(width: 20)
+
+                            Text(row.title)
+                                .font(AquinasTheme.Typography.body)
+                                .foregroundStyle(AquinasTheme.Colors.paragraphText)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 18, alignment: .leading)
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityHint("Opens this settings menu")
                 }
             }
-            .padding(16)
+            .padding(24)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(AquinasTheme.Colors.canvasSecondary)
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -222,9 +227,8 @@ private struct SettingsDestinationView: View {
     @Binding var userName: String
     @Binding var customInstructions: String
     @Binding var conversationFontSize: ConversationFontSizeOption
-    @Binding var inputTextAlignment: InputTextAlignmentOption
+    @Binding var conversationTextAlignment: ConversationTextAlignmentOption
     @Binding var inputFont: ConversationFontOption
-    @Binding var responseTextAlignment: ResponseTextAlignmentOption
     @Binding var responseFont: ConversationFontOption
     @Binding var conversationPersonality: ConversationPersonality
     let onReset: () -> Void
@@ -249,9 +253,8 @@ private struct SettingsDestinationView: View {
         case .textAndDisplay:
             TextAndDisplaySettingsView(
                 conversationFontSize: $conversationFontSize,
-                inputTextAlignment: $inputTextAlignment,
+                conversationTextAlignment: $conversationTextAlignment,
                 inputFont: $inputFont,
-                responseTextAlignment: $responseTextAlignment,
                 responseFont: $responseFont
             )
         case .conversationDefaults:
@@ -703,9 +706,8 @@ private struct ModelActivityPreview: View {
 
 private struct TextAndDisplaySettingsView: View {
     @Binding var conversationFontSize: ConversationFontSizeOption
-    @Binding var inputTextAlignment: InputTextAlignmentOption
+    @Binding var conversationTextAlignment: ConversationTextAlignmentOption
     @Binding var inputFont: ConversationFontOption
-    @Binding var responseTextAlignment: ResponseTextAlignmentOption
     @Binding var responseFont: ConversationFontOption
 
     var body: some View {
@@ -714,14 +716,11 @@ private struct TextAndDisplaySettingsView: View {
                 SettingsLabeledControl(title: "Font Size") {
                     FontSizeSegmentedControl(selection: $conversationFontSize)
                 }
-                SettingsLabeledControl(title: "Input Text Alignment") {
-                    IconSegmentedControl(selection: $inputTextAlignment)
+                SettingsLabeledControl(title: "Conversation Text Alignment") {
+                    ConversationAlignmentSegmentedControl(selection: $conversationTextAlignment)
                 }
                 SettingsLabeledControl(title: "Input Font") {
                     FontSegmentedControl(selection: $inputFont)
-                }
-                SettingsLabeledControl(title: "Response Text Alignment") {
-                    ResponseAlignmentSegmentedControl(selection: $responseTextAlignment)
                 }
                 SettingsLabeledControl(title: "Response Font") {
                     FontSegmentedControl(selection: $responseFont)
@@ -853,10 +852,10 @@ private struct SettingsControlCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 16) {
             content
         }
-        .padding(16)
+        .padding(24)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(AquinasTheme.Colors.canvasSecondary)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
     }
 }
 
@@ -1137,7 +1136,7 @@ private struct AppearanceButton: View {
     }
 }
 
-enum InputTextAlignmentOption: String, CaseIterable, Identifiable {
+enum ConversationTextAlignmentOption: String, CaseIterable, Identifiable {
     case center
     case left
 
@@ -1151,6 +1150,13 @@ enum InputTextAlignmentOption: String, CaseIterable, Identifiable {
     }
 
     var frameAlignment: Alignment {
+        switch self {
+        case .center: .center
+        case .left: .leading
+        }
+    }
+
+    var horizontalAlignment: HorizontalAlignment {
         switch self {
         case .center: .center
         case .left: .leading
@@ -1179,11 +1185,14 @@ enum InputTextAlignmentOption: String, CaseIterable, Identifiable {
 
     var accessibilityLabel: LocalizedStringResource {
         switch self {
-        case .center: "Align input text center"
-        case .left: "Align input text left"
+        case .center: "Center all conversation text"
+        case .left: "Align all conversation text left"
         }
     }
 }
+
+typealias InputTextAlignmentOption = ConversationTextAlignmentOption
+typealias ResponseTextAlignmentOption = ConversationTextAlignmentOption
 
 enum ConversationFontOption: String, CaseIterable, Identifiable {
     case sans = "Sans"
@@ -1201,48 +1210,6 @@ enum ConversationFontOption: String, CaseIterable, Identifiable {
             .custom("Figtree-Regular", size: size.pointSize)
         case .serif:
             .custom("LibreBaskerville-Regular", size: size.pointSize)
-        }
-    }
-}
-
-enum ResponseTextAlignmentOption: String, CaseIterable, Identifiable {
-    case center
-    case left
-
-    var id: Self { self }
-
-    var textAlignment: TextAlignment {
-        switch self {
-        case .center: .center
-        case .left: .leading
-        }
-    }
-
-    var frameAlignment: Alignment {
-        switch self {
-        case .center: .center
-        case .left: .leading
-        }
-    }
-
-    var horizontalAlignment: HorizontalAlignment {
-        switch self {
-        case .center: .center
-        case .left: .leading
-        }
-    }
-
-    var iconName: String {
-        switch self {
-        case .center: "text.aligncenter"
-        case .left: "text.alignleft"
-        }
-    }
-
-    var accessibilityLabel: LocalizedStringResource {
-        switch self {
-        case .center: "Align response text center"
-        case .left: "Align response text left"
         }
     }
 }
@@ -1310,13 +1277,13 @@ private struct PersonalitySegmentedControl: View {
     }
 }
 
-private struct IconSegmentedControl: View {
-    @Binding var selection: InputTextAlignmentOption
+private struct ConversationAlignmentSegmentedControl: View {
+    @Binding var selection: ConversationTextAlignmentOption
     @Namespace private var selectionNamespace
 
     var body: some View {
         HStack(spacing: 4) {
-            ForEach(InputTextAlignmentOption.allCases) { option in
+            ForEach(ConversationTextAlignmentOption.allCases) { option in
                 Button {
                     guard selection != option else { return }
                     SettingsHaptics.playSelection()
@@ -1333,47 +1300,7 @@ private struct IconSegmentedControl: View {
                                 Capsule()
                                     .fill(AquinasTheme.Colors.systemSelection)
                                     .matchedGeometryEffect(
-                                        id: "input-alignment-selection",
-                                        in: selectionNamespace
-                                    )
-                            }
-                        }
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(option.accessibilityLabel)
-                .accessibilityAddTraits(selection == option ? .isSelected : [])
-            }
-        }
-        .padding(4)
-        .background(AquinasTheme.Colors.canvas)
-        .clipShape(Capsule())
-    }
-}
-
-private struct ResponseAlignmentSegmentedControl: View {
-    @Binding var selection: ResponseTextAlignmentOption
-    @Namespace private var selectionNamespace
-
-    var body: some View {
-        HStack(spacing: 4) {
-            ForEach(ResponseTextAlignmentOption.allCases) { option in
-                Button {
-                    guard selection != option else { return }
-                    SettingsHaptics.playSelection()
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.84)) {
-                        selection = option
-                    }
-                } label: {
-                    Image(systemName: option.iconName)
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(AquinasTheme.Colors.primaryReadable)
-                        .frame(width: 44, height: 26)
-                        .background {
-                            if selection == option {
-                                Capsule()
-                                    .fill(AquinasTheme.Colors.systemSelection)
-                                    .matchedGeometryEffect(
-                                        id: "response-alignment-selection",
+                                        id: "conversation-alignment-selection",
                                         in: selectionNamespace
                                     )
                             }

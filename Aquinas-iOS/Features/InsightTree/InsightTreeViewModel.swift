@@ -227,7 +227,7 @@ final class InsightTreeViewModel: ObservableObject {
         persistedTree = tree
         insights = tree.nodes.flatMap { node in
             node.insights.map { insight in
-                InsightModel(
+                return InsightModel(
                     id: insight.id,
                     title: insight.title.capitalized,
                     definition: insight.definition,
@@ -482,8 +482,11 @@ final class InsightTreeViewModel: ObservableObject {
         // once as its own pinned Midpoint node, and again as a member listed under some other
         // Node's description that it happens to resemble.
         let placedMidpointIDs = Set(placedMidpoints.map { $0.concept.id })
+        let attachedMakeNodeIDs = activeMakeNodeBookmarkIDs
         var (nextNodes, nextEdges) = makeClusteredTree(
-            from: embeddedInsights.filter { !placedMidpointIDs.contains($0.id) }
+            from: embeddedInsights.filter {
+                !placedMidpointIDs.contains($0.id) && !attachedMakeNodeIDs.contains($0.id)
+            }
         )
         appendPromotedNodes(to: &nextNodes, edges: &nextEdges, from: embeddedInsights)
         appendPlacedMidpointNodes(to: &nextNodes, edges: &nextEdges)
@@ -544,8 +547,9 @@ final class InsightTreeViewModel: ObservableObject {
         var builtNodes: [NodeModel] = []
         var builtEdges: [EdgeModel] = []
         for storedNode in tree.nodes {
-            let nodeInsights = storedNode.insights.map { insight in
-                InsightModel(
+            let nodeInsights = storedNode.insights.compactMap { insight -> InsightModel? in
+                guard !activeMakeNodeBookmarkIDs.contains(insight.id) else { return nil }
+                return InsightModel(
                     id: insight.id,
                     title: insight.title.capitalized,
                     definition: insight.definition,
@@ -554,6 +558,12 @@ final class InsightTreeViewModel: ObservableObject {
                     relatednessToNode: insight.relatedness,
                     distanceToNode: insight.distance
                 )
+            }
+            // A backend refresh may already have clustered a newly bookmarked Make Node child.
+            // While that child is still visually attached to its promoted node, don't leave its
+            // now-empty backend container behind as a ghost Node.
+            if !storedNode.insights.isEmpty && nodeInsights.isEmpty {
+                continue
             }
             let position: CGPoint
             if let restored = restoredPosition(for: storedNode.id) {
@@ -975,6 +985,83 @@ final class InsightTreeViewModel: ObservableObject {
         rebuildTree()
     }
 
+    /// The bookmark records represented by a completed Make Node action: the promoted node
+    /// concept itself followed by its generated child Insights.
+    func makeNodeBookmarkConcepts(for insightID: UUID) -> [ConceptDefinition] {
+        let generatedNodeID = promotedNodeID(for: insightID)
+        guard let source = insights.first(where: { $0.id == insightID }),
+              let children = generatedChildInsights[generatedNodeID] else {
+            return []
+        }
+
+        // The promoted Node retains the bookmark identity of the source Insight. This avoids
+        // creating two library records with the same word (the library intentionally merges
+        // same-word definitions) and makes unbookmarking the Node remove its original anchor.
+        let nodeConcept = ConceptDefinition(
+            id: source.id,
+            word: source.title,
+            partOfSpeech: "",
+            pronunciation: "",
+            meaning: source.definition,
+            example: ""
+        )
+        return [nodeConcept] + children.map(Self.concept(for:))
+    }
+
+    func promotedSourceInsightID(forNodeID nodeID: UUID) -> UUID? {
+        promotedInsightIDs.first { insightID in
+            if promotedNodeID(for: insightID) == nodeID { return true }
+            guard insightID == nodeID,
+                  let node = nodes.first(where: { $0.id == nodeID }) else { return false }
+            let generatedIDs = Set(
+                generatedChildInsights[promotedNodeID(for: insightID)]?.map(\.id) ?? []
+            )
+            return !generatedIDs.isEmpty && node.insights.contains { generatedIDs.contains($0.id) }
+        }
+    }
+
+    func removeMakeNodeChild(id childID: UUID) {
+        guard let entry = generatedChildInsights.first(where: {
+            $0.value.contains(where: { $0.id == childID })
+        }) else { return }
+        generatedChildInsights[entry.key]?.removeAll { $0.id == childID }
+        generatedMakeNodeChildIDs.remove(childID)
+        persistMakeNodeChildren()
+        rebuildTree()
+    }
+
+    /// Removes a promoted node. Kept children are assigned to the semantically nearest remaining
+    /// node before the promotion is released, so their next ordinary-tree rebuild has a stable,
+    /// intentional home instead of depending on insertion order.
+    func removeMakeNode(for insightID: UUID, keepingChildren: Bool) {
+        let nodeID = promotedNodeID(for: insightID)
+        let children = generatedChildInsights[nodeID] ?? []
+        if keepingChildren {
+            let candidates = nodes.filter {
+                promotedSourceInsightID(forNodeID: $0.id) == nil
+                    && !$0.insights.isEmpty
+                    && !$0.embedding.isEmpty
+            }
+            for child in children {
+                guard let embedding = child.embedding
+                    ?? computeEmbedding(for: "\(child.title). \(child.definition)"),
+                    !embedding.isEmpty,
+                    let nearest = candidates.min(by: {
+                    semanticDistance(embedding, $0.embedding)
+                        < semanticDistance(embedding, $1.embedding)
+                }) else { continue }
+                insightClusterAssignments[child.id] = nearest.id
+            }
+            persistInsightClusterAssignments()
+        }
+        cancelMakeNodeGeneration(for: insightID)
+    }
+
+    private var activeMakeNodeBookmarkIDs: Set<UUID> {
+        Set(promotedInsightIDs.map { promotedNodeID(for: $0) })
+            .union(generatedChildInsights.values.flatMap { $0.map(\.id) })
+    }
+
     private func generateMakeNodeChildren(
         for insight: InsightModel,
         promotedNodeID: UUID
@@ -1013,6 +1100,17 @@ final class InsightTreeViewModel: ObservableObject {
         childGenerationInFlight.remove(promotedNodeID)
         rebuildTree()
         generatedMakeNodeChildIDs.formUnion(children.map(\.id))
+    }
+
+    private static func concept(for insight: InsightModel) -> ConceptDefinition {
+        ConceptDefinition(
+            id: insight.id,
+            word: insight.title,
+            partOfSpeech: "",
+            pronunciation: "",
+            meaning: insight.definition,
+            example: ""
+        )
     }
 
     /// Appends user-placed midpoint nodes at their pinned positions, each connected by an edge
@@ -1430,9 +1528,20 @@ func computeEmbedding(for text: String) -> [Double]? {
 
 func cosineSimilarity(_ a: [Double], _ b: [Double]) -> Double {
     guard a.count == b.count else { return 0 }
-    let dot = zip(a, b).map(*).reduce(0, +)
-    let magA = sqrt(a.map { $0 * $0 }.reduce(0, +))
-    let magB = sqrt(b.map { $0 * $0 }.reduce(0, +))
+    // This runs for every pair during clustering and semantic layout. Avoid the three
+    // intermediate arrays previously created by `zip(...).map` and the two `map` calls.
+    var dot = 0.0
+    var squaredMagnitudeA = 0.0
+    var squaredMagnitudeB = 0.0
+    for index in a.indices {
+        let valueA = a[index]
+        let valueB = b[index]
+        dot += valueA * valueB
+        squaredMagnitudeA += valueA * valueA
+        squaredMagnitudeB += valueB * valueB
+    }
+    let magA = sqrt(squaredMagnitudeA)
+    let magB = sqrt(squaredMagnitudeB)
     guard magA > 0, magB > 0 else { return 0 }
     return dot / (magA * magB)
 }

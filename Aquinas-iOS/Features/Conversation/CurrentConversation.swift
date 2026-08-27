@@ -109,9 +109,8 @@ struct CurrentConversationView: View {
     @Binding var insightConversationQuoteRequest: InsightConversationQuoteRequest?
     @Binding var newConversationInsightQuoteRequest: NewConversationInsightQuoteRequest?
     let conversationFontSize: ConversationFontSizeOption
-    let inputTextAlignment: InputTextAlignmentOption
+    let conversationTextAlignment: ConversationTextAlignmentOption
     let inputFont: ConversationFontOption
-    let responseTextAlignment: ResponseTextAlignmentOption
     let responseFont: ConversationFontOption
     let conversationTitlePolicy: ConversationTitleOption
     @Binding var conversationPersonality: ConversationPersonality
@@ -207,7 +206,7 @@ struct CurrentConversationView: View {
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
 
     // MARK: Context usage
-    @State private var displayedContextWordCount: Int = 0
+    @State private var displayedContextTokenCount: Int = 0
 
     // MARK: Insight library sheet
     @State private var isInsightLibraryOpen: Bool = false
@@ -469,9 +468,10 @@ struct CurrentConversationView: View {
                     guard !isAlreadyCovered else { continue }
                 }
 
+                let newSeedID = UUID()
                 LocalInsightTreeSeedStore.appendSeed(
                     LocalInsightTreeSeed(
-                        id: UUID(),
+                        id: newSeedID,
                         label: candidate.label,
                         summary: candidate.summary,
                         embedding: embedding,
@@ -479,6 +479,14 @@ struct CurrentConversationView: View {
                         createdAt: Date()
                     ),
                     for: turn.conversationID
+                )
+                // Mirrors the backend analysis path above: without marking this Node Concept
+                // pending, opening the tree fresh (which tours only pending IDs, not a raw
+                // diff — see `presentPersistedTree`) would silently skip its reveal animation.
+                InsightDiscoveryStore.markNodesUndiscovered([newSeedID])
+                InsightDiscoveryStore.markPendingTreePresentation(
+                    insightIDs: [],
+                    nodeIDs: [newSeedID]
                 )
                 self.finishInsightTreeMutation(for: turn.conversationID)
             }
@@ -624,7 +632,7 @@ struct CurrentConversationView: View {
         return (question, InlineInsightMarkup.plainText(from: response))
     }
 
-    private func contextWordCount(in branch: ChatBranch?) -> Int {
+    private func contextTokenCount(in branch: ChatBranch?) -> Int {
         guard let branch else { return 0 }
         var textParts: [String] = []
 
@@ -653,22 +661,47 @@ struct CurrentConversationView: View {
             }
         }
 
-        return textParts.reduce(into: 0) { count, text in
-            count += text.split(whereSeparator: \.isWhitespace).count
+        return AquinasContextBudget.estimatedTokenCount(in: textParts.joined(separator: "\n"))
+    }
+
+    private var canCompactFocusedContext: Bool {
+        guard let branch = activeBranches.first(where: { $0.id == effectiveFocusedID })
+                ?? activeBranches.first else {
+            return false
+        }
+
+        if branch.compactedContext == nil,
+           branch.topQuestionSubmitted,
+           !branch.topQuestionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return true
+        }
+
+        let compactedBlockCount = min(
+            branch.compactedThroughBlockCount ?? 0,
+            branch.activeChatBlocks.count
+        )
+        return branch.activeChatBlocks.dropFirst(compactedBlockCount).contains { block in
+            switch block {
+            case .text(let text):
+                return !InlineInsightMarkup.plainText(from: text)
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            case .user(let text, _, _):
+                return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
         }
     }
 
     private func refreshDisplayedContextWordCount(animated: Bool = true) {
         let branch = activeBranches.first(where: { $0.id == effectiveFocusedID })
             ?? activeBranches.first
-        let count = contextWordCount(in: branch)
+        let count = contextTokenCount(in: branch)
 
         if animated {
             withAnimation(.easeInOut(duration: 0.65)) {
-                displayedContextWordCount = count
+                displayedContextTokenCount = count
             }
         } else {
-            displayedContextWordCount = count
+            displayedContextTokenCount = count
         }
     }
 
@@ -765,6 +798,11 @@ struct CurrentConversationView: View {
             savedConceptIDs: Set(collectedDefinitions.map(\.id)),
             onToggleSavedConcept: { concept in
                 toggleSavedConcept(concept)
+            },
+            onBookmarkConcepts: { concepts in
+                for concept in concepts {
+                    setSavedConcept(concept, isSaved: true)
+                }
             },
             inquireConnectionRequest: canvasMode.canvasInquireConnectionRequest,
             onInquireConnectionConcepts: { concepts in
@@ -942,24 +980,17 @@ struct CurrentConversationView: View {
                 modelTasksPopupState.reset()
                 canvasMode.canvasDismissHoverRequest += 1
             },
-            onModelStatusTap: {
-                contextCardState.reset()
-                if !modelTasksPopupState.isOpen {
-                    let generator = UIImpactFeedbackGenerator(style: .light)
-                    generator.prepare()
-                    generator.impactOccurred(intensity: 0.65)
-                }
-                withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
-                    modelTasksPopupState.isOpen.toggle()
-                }
-            },
             onMidpointCenter: { canvasMode.canvasMidpointCenterRequest += 1 },
             onMidpointPlace: { canvasMode.canvasMidpointPlaceRequest += 1 },
             onClearCanvasSelection: { canvasMode.canvasClearSelectionRequest += 1 },
-            contextWordCount: displayedContextWordCount,
+            contextWordCount: displayedContextTokenCount,
+            canCompactContext: canCompactFocusedContext && !modelTasks.isBusy,
+            onCompactContext: {
+                guard let branchID = effectiveFocusedID else { return false }
+                return await performContextCompaction(in: branchID)
+            },
             onClearConversation: clearCurrentConversation,
             onContextWillOpen: {
-                modelTasksPopupState.reset()
                 if canvasMode.isTopicCanvasVisible { canvasMode.canvasDismissHoverRequest += 1 }
             },
             contextCard: contextCardState
@@ -1251,7 +1282,8 @@ struct CurrentConversationView: View {
                 conversations[conversationIndex].title = persistedConversation.title
             }
             refreshDisplayedContextWordCount()
-            scrollToBottomAfterLayout()
+            // Keep the reader's viewport stable when the completed response appears.
+            // Scrolling to the response remains an explicit action through the dock.
         }
         // MARK: - Persistence / conversation management
         .onAppear {
@@ -1518,9 +1550,8 @@ struct CurrentConversationView: View {
                     targetSpawnResponseIndex: $targetSpawnResponseIndex,
                     externalSubmitTrigger: b.id == effectiveFocusedID ? externalSubmitTrigger : 0,
                     conversationFontSize: conversationFontSize,
-                    inputTextAlignment: inputTextAlignment,
+                    conversationTextAlignment: conversationTextAlignment,
                     inputFont: inputFont,
-                    responseTextAlignment: responseTextAlignment,
                     responseFont: responseFont,
                     conversationTitlePolicy: conversationTitlePolicy,
                     personality: conversationPersonality,
@@ -1850,9 +1881,16 @@ struct CurrentConversationView: View {
     }
 
     private func compactContext(in branchID: UUID) {
+        Task {
+            _ = await performContextCompaction(in: branchID)
+        }
+    }
+
+    @MainActor
+    private func performContextCompaction(in branchID: UUID) async -> Bool {
         guard !isCompactingContext,
               let branchIndex = activeBranches.firstIndex(where: { $0.id == branchID }) else {
-            return
+            return false
         }
 
         let branch = activeBranches[branchIndex]
@@ -1873,38 +1911,37 @@ struct CurrentConversationView: View {
             contentsOf: branch.activeChatBlocks.dropFirst(compactedBlockCount)
         )
 
-        guard branch.compactedContext != nil || !uncompactedTranscript.isEmpty else {
-            return
+        guard !uncompactedTranscript.isEmpty else {
+            return false
         }
 
         isCompactingContext = true
+        defer { isCompactingContext = false }
         let context = ConversationContext(
             compactedContext: branch.compactedContext,
-            transcript: uncompactedTranscript
+            transcript: uncompactedTranscript,
+            personality: conversationPersonality
         )
         let compactedThroughBlockCount = branch.activeChatBlocks.count
 
-        Task {
-            let summary = await aquinasModel.compact(context)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            await MainActor.run {
-                defer { isCompactingContext = false }
-                guard !summary.isEmpty else {
-                    isCompactionErrorPresented = true
-                    return
-                }
-                guard let currentIndex = activeBranches.firstIndex(where: { $0.id == branchID }) else {
-                    return
-                }
-                activeBranches[currentIndex].compactedContext = summary
-                activeBranches[currentIndex].compactedThroughBlockCount =
-                    min(compactedThroughBlockCount, activeBranches[currentIndex].activeChatBlocks.count)
-                saveCurrentConversation()
-                persistConversations()
-                refreshDisplayedContextWordCount()
-                isCompactionConfirmationPresented = true
-            }
+        let summary = await aquinasModel.compact(context)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !Task.isCancelled else { return false }
+        guard !summary.isEmpty else {
+            isCompactionErrorPresented = true
+            return false
         }
+        guard let currentIndex = activeBranches.firstIndex(where: { $0.id == branchID }) else {
+            return false
+        }
+        activeBranches[currentIndex].compactedContext = summary
+        activeBranches[currentIndex].compactedThroughBlockCount =
+            min(compactedThroughBlockCount, activeBranches[currentIndex].activeChatBlocks.count)
+        saveCurrentConversation()
+        persistConversations()
+        refreshDisplayedContextWordCount()
+        isCompactionConfirmationPresented = true
+        return true
     }
 
     /// Copy activeBranches back into the conversations array for the active conversation.
@@ -1961,11 +1998,11 @@ struct CurrentConversationView: View {
     /// conversation's identity remain stable while every question/response disappears.
     private func clearCurrentConversation() {
         persistenceTask?.cancel()
-        resetModelTaskPipeline()
+        resetModelTaskPipeline(conversationID: activeConversationID)
         let freshBranches = [ChatBranch(startingConcept: nil)]
         activeBranches = freshBranches
         focusedBranchID = freshBranches.first?.id
-        displayedContextWordCount = 0
+        displayedContextTokenCount = 0
         undiscoveredInsightCount = 0
         activeEmptyPromptEyebrow = ""
         activeEmptyPromptQuestion = ""
@@ -1995,7 +2032,7 @@ struct CurrentConversationView: View {
 
     /// Save current work, then create a fresh conversation and make it active.
     private func startNewConversation() {
-        resetModelTaskPipeline()
+        resetModelTaskPipeline(conversationID: activeConversationID)
         saveCurrentConversation()
         // Consume any pending topic tag set by a "New Conversation inside topic" action.
         let topicID = newConversationTopicID
@@ -2031,7 +2068,7 @@ struct CurrentConversationView: View {
         activeEmptyPromptEyebrow = pendingEyebrow
         activeEmptyPromptQuestion = pendingQuestion
         activeEmptyPromptSubtitle = pendingSubtitle
-        displayedContextWordCount = 0
+        displayedContextTokenCount = 0
         hasTextToSubmit = false
         canvasMode.promotedCanvasInsightIDs = []
         focusedBranchID = activeBranches.first?.id
@@ -2142,9 +2179,11 @@ struct CurrentConversationView: View {
         presentDefinition(insightWord)
     }
 
-    private func resetModelTaskPipeline() {
+    /// Cancel only the conversation being left/cleared, not the whole shared queue — a
+    /// different conversation's still-running job must survive navigating away from it.
+    private func resetModelTaskPipeline(conversationID: UUID?) {
         modelTasks.cancelTasks {
-            !$0.kind.isInsightTreeTask
+            !$0.kind.isInsightTreeTask && $0.conversationID == conversationID
         }
         modelTasks.clearCompletedTasks()
         modelTasksPopupState.reset()
@@ -2244,7 +2283,7 @@ struct CurrentConversationView: View {
 
     private func postDefinitionCompletedNotification(_ word: ConversationInsightWord) {
         let title = definitionState.definitionsByKey[word.id]?.word ?? word.text.capitalized
-        modelCompletionNotifications?.post(title: title) {
+        modelCompletionNotifications?.post(title: title, kind: .insightDefinition) {
             onRequestConversationPage()
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(250))
