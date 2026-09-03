@@ -69,12 +69,28 @@ from this exact hang. Never move this logic back onto the actor's own executor.
 The Thinking summary is an app-generated public approach description, never private model
 reasoning or chain-of-thought. It must describe the relevant concepts or checks without pretending
 to expose hidden scratch work.
-`AquinasGroundingProviding` is the factual-retrieval boundary. The current offline lexical
-bootstrap includes trusted Nicaea (325), Constantinople (381), Nicaea II (787), and Didache notes,
-plus a curated Scripture stopgap for a handful of extremely well-known chapters (John 3, John 14,
-Matthew 5, Romans 8, 1 Corinthians 13, Psalm 23). It fixes those known regressions but is not broad
-RAG coverage; production ranking still needs the MiniLM query encoder and a versioned trusted
-corpus.
+`AquinasGroundingProviding` is the factual-retrieval boundary. Do not assume this is still a small
+hardcoded stopgap — the backend side of this is already a real general-corpus retrieval system, not
+just a handful of curated chapters. `Aquinas_Backend/corpus/sources.yaml` manifests dozens of
+public-domain sources (the full Bible, Aquinas's own works, patristic and conciliar texts, the
+philosophical/historical sources he cites); `ingest_corpus.py` has already fetched most of them and
+embedded them with MiniLM into a persisted Chroma collection (`grounding_retrieval.py`), and
+`server.py` already retrieves nearest passages from that corpus and passes them into generation for
+real conversation requests — this is live, not planned.
+On-device parity is now closed, as of September 2026. `MiniLMGroundingProvider`/
+`OnDeviceGroundingStore` (iOS) consume a flat pre-embedded export of the backend's corpus —
+`Aquinas-iOS/LocalGrounding/` bundles `MiniLM.mlpackage` (a Core ML conversion of
+`all-MiniLM-L6-v2`, verified at ~0.9999 cosine fidelity against the reference PyTorch model),
+`vocab.txt`, `embeddings.bin`, and `passages.json` (48,048 passages exported from the backend's
+Chroma collection via `Aquinas_Backend/scripts/export_on_device_grounding.py` and
+`export_minilm_coreml.py`). `AquinasApplicationRuntime` tries `MiniLMGroundingProvider()` first and
+only falls back to the small hardcoded `LocalAquinasGroundingProvider` stopgap (Nicaea (325),
+Constantinople (381), Nicaea II (787), Didache notes, a curated Scripture subset) if those bundled
+assets are somehow missing/corrupt — confirmed working end-to-end on-device (loads, embeds a query,
+returns ranked real passages). Re-run the two export scripts and re-copy `LocalGrounding/` whenever
+the backend corpus grows meaningfully; there is no live sync between them. See
+MODEL-INTEGRATION.md's "Backend retrieval-first grounding checkpoint" for the backend-side history,
+and `Aquinas-Foundations/QWEN-TESTING-CASE-STUDY.md` for how this on-device gap was discovered.
 Ordinary conversation generation stays fully deterministic (`topK: 1, temperature: 0`) even after
 the meta-commentary/hedging guard below. A brief experiment added modest sampling to help escape a
 hedge/clarification failure mode, but the direct fix (detecting that failure shape and retrying
