@@ -168,6 +168,43 @@ nonisolated struct LocalAquinasGroundingProvider: AquinasGroundingProviding {
             .map(\.0)
     }
 
+    /// Curated references whose question matched a retrieval *alias* rather than merely sharing a
+    /// couple of tokens.
+    ///
+    /// The general `references(for:limit:)` ranking above admits a two-token overlap, which is the
+    /// right bar when these entries are the entire corpus but far too loose when they are merged
+    /// ahead of MiniLM results for every question. Alias hits are the precise signal, so the
+    /// merged path uses only those — see `MiniLMGroundingProvider`.
+    ///
+    /// This exists because the bundled 48k-passage corpus has essentially no conciliar or creedal
+    /// text: "Nicene Creed" appears once in the whole export (incidentally, in the Thirty-Nine
+    /// Articles) and "begotten, not made" once, so semantic search answers council questions out
+    /// of Livy and Herodotus. These curated entries carry the anti-confusion facts that coverage
+    /// gap would otherwise lose, and their stable ids are what `verifiedGroundedResponse` gates on.
+    static func aliasMatchedReferences(
+        for question: String,
+        limit: Int
+    ) -> [AquinasGroundingReference] {
+        guard limit > 0 else { return [] }
+        let normalizedQuestion = normalized(question)
+
+        return references
+            .compactMap { reference -> (AquinasGroundingReference, Int)? in
+                let score = reference.retrievalAliases.reduce(into: 0) { score, alias in
+                    if normalizedQuestion.contains(normalized(alias)) {
+                        score += alias.count
+                    }
+                }
+                return score > 0 ? (reference, score) : nil
+            }
+            .sorted {
+                if $0.1 == $1.1 { return $0.0.id < $1.0.id }
+                return $0.1 > $1.1
+            }
+            .prefix(limit)
+            .map(\.0)
+    }
+
     private static func normalized(_ text: String) -> String {
         text.folding(
             options: [.caseInsensitive, .diacriticInsensitive],

@@ -56,29 +56,82 @@ nonisolated final class MiniLMGroundingProvider: AquinasGroundingProviding {
         self.init(embedder: embedder, store: store)
     }
 
+    /// Grounding is assembled in three layers, most authoritative first, because semantic search
+    /// alone measurably fails two whole classes of question against this corpus:
+    ///
+    /// 1. **Curated facts.** The export carries almost no conciliar or creedal text, so council
+    ///    questions retrieve Roman history. Alias-matched curated entries cover that gap and are
+    ///    the only source of the stable ids (`nicaea-325`, `constantinople-381`, …) that
+    ///    `LiteRTAquinasModel.verifiedGroundedResponse` gates its verified answers on.
+    /// 2. **Explicit citations.** "John 14" is a lookup key, not a topic; resolved lexically
+    ///    against the corpus's own chapter tags. See `ScriptureCitation`.
+    /// 3. **Semantic search**, which is strong for doctrinal and conceptual questions, filling any
+    ///    remaining slots.
+    ///
+    /// Every layer can legitimately return nothing, and returning nothing is correct when the
+    /// corpus has no real answer — generation then proceeds ungrounded rather than grounded in
+    /// something false.
     func references(
         for question: String,
         limit: Int
     ) -> [AquinasGroundingReference] {
-        guard !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return []
+        guard limit > 0,
+              !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return [] }
+
+        var collected: [AquinasGroundingReference] = []
+        var seenIDs: Set<String> = []
+
+        func append(_ reference: AquinasGroundingReference) {
+            guard collected.count < limit, seenIDs.insert(reference.id).inserted else { return }
+            collected.append(reference)
         }
-        let passages: [GroundingPassage]
-        do {
-            let queryEmbedding = try embedder.embed(question)
-            passages = store.retrieve(queryEmbedding: queryEmbedding, k: limit)
-        } catch {
-            return []
+
+        for reference in LocalAquinasGroundingProvider.aliasMatchedReferences(
+            for: question,
+            // Curated notes anchor an answer; they must not crowd out the corpus itself.
+            limit: max(1, limit - 1)
+        ) {
+            append(reference)
         }
-        return passages.map { passage in
-            AquinasGroundingReference(
-                id: "\(passage.sourceID)-\(passage.distance)",
-                title: passage.title,
-                sourceName: passage.title,
-                facts: passage.text,
-                retrievalAliases: []
-            )
+
+        for citation in ScriptureCitation.citations(in: question) {
+            guard collected.count < limit else { break }
+            for passage in store.chapter(for: citation, limit: limit - collected.count) {
+                append(Self.reference(for: passage, id: "citation-\(citation.bookCode)\(citation.chapter)-\(passage.sourceID)-\(collected.count)"))
+            }
         }
+
+        if collected.count < limit {
+            do {
+                let queryEmbedding = try embedder.embed(question)
+                let passages = store.retrieve(
+                    queryEmbedding: queryEmbedding,
+                    k: limit - collected.count
+                )
+                for (offset, passage) in passages.enumerated() {
+                    append(Self.reference(for: passage, id: "corpus-\(passage.sourceID)-\(offset)"))
+                }
+            } catch {
+                // A failed embed leaves whatever the earlier layers found, which is still
+                // better grounding than none.
+            }
+        }
+
+        return collected
+    }
+
+    private static func reference(
+        for passage: GroundingPassage,
+        id: String
+    ) -> AquinasGroundingReference {
+        AquinasGroundingReference(
+            id: id,
+            title: passage.title,
+            sourceName: passage.title,
+            facts: passage.text,
+            retrievalAliases: []
+        )
     }
 }
 

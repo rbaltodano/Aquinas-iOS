@@ -86,11 +86,63 @@ Chroma collection via `Aquinas_Backend/scripts/export_on_device_grounding.py` an
 `export_minilm_coreml.py`). `AquinasApplicationRuntime` tries `MiniLMGroundingProvider()` first and
 only falls back to the small hardcoded `LocalAquinasGroundingProvider` stopgap (Nicaea (325),
 Constantinople (381), Nicaea II (787), Didache notes, a curated Scripture subset) if those bundled
-assets are somehow missing/corrupt — confirmed working end-to-end on-device (loads, embeds a query,
-returns ranked real passages). Re-run the two export scripts and re-copy `LocalGrounding/` whenever
-the backend corpus grows meaningfully; there is no live sync between them. See
+assets are somehow missing/corrupt. Re-run the two export scripts and re-copy `LocalGrounding/`
+whenever the backend corpus grows meaningfully; there is no live sync between them. See
 MODEL-INTEGRATION.md's "Backend retrieval-first grounding checkpoint" for the backend-side history,
 and `Aquinas-Foundations/QWEN-TESTING-CASE-STUDY.md` for how this on-device gap was discovered.
+
+"Retrieval returns real ranked passages" was the bar that closed parity; it is not the bar for
+*correct* grounding, and a measured audit of the shipped export found semantic search alone failing
+two whole classes of question. `MiniLMGroundingProvider` therefore assembles grounding in three
+layers, most authoritative first — alias-matched curated facts, then explicitly cited scripture
+chapters, then semantic search filling the remaining slots. Do not collapse this back into a single
+nearest-neighbour call:
+
+- **The corpus has almost no conciliar or creedal text.** Across all 48,048 passages "Nicene Creed"
+  appears once (incidentally, in the Thirty-Nine Articles) and "begotten, not made" once, while
+  roughly 28% of the corpus is classical secular history (Livy alone is 5,937 chunks against 5,973
+  for the entire Bible). "What did the Council of Nicaea decide about the Son?" consequently ranked
+  five straight Livy/Herodotus/Plutarch passages, matching on "council" and on *Nicaea the Greek
+  city*. `LocalAquinasGroundingProvider.aliasMatchedReferences` supplies the curated anti-confusion
+  facts that gap would otherwise lose. It matches on retrieval *aliases* only — the looser
+  two-token overlap used by the fallback path is the right bar when those entries are the entire
+  corpus, and far too loose when they are merged ahead of MiniLM for every question.
+- **A citation is a lookup key, not a topic.** "John chapter 14" ranked Augustine's *Confessions*
+  first and reached the Gospel of John only through a passage about *John Hyrcanus*, while the same
+  question in prose retrieved the right chapter at 0.69 similarity. `ScriptureCitation` +
+  `OnDeviceGroundingStore.chapter(for:)` resolve explicit references lexically against the corpus's
+  own `[JHN14]` chapter tags (1,616 chapters index cleanly) before semantic search runs.
+- **The relevance floor is a measured separation point, not a confidence level.**
+  `defaultMaxDistance` was 1.0, which admits any non-negative similarity and so screened nothing —
+  the Livy passages above (0.55) reached the prompt as grounding. Scored against this corpus,
+  clearly relevant questions land at 0.64-0.83 similarity and clearly irrelevant ones top out at
+  0.60, so the floor is 0.38 distance (0.62 similarity). Retrieving nothing is the correct outcome
+  when the corpus has no real answer: generation proceeds ungrounded, which is strictly better than
+  grounding it in Roman history.
+
+Reference ids from this provider are stable strings (`corpus-…`, `citation-…`) and the curated
+layer keeps its own (`nicaea-325`, `constantinople-381`, …). That matters beyond tidiness:
+`LiteRTAquinasModel.verifiedGroundedResponse` gates its verified answers on those exact curated ids,
+so while the provider minted ids containing the float distance that path was silently unreachable
+whenever MiniLM was active. Any future provider must keep emitting the curated ids.
+
+The bundled `MiniLM.mlpackage` must be exported at **FP32** (`compute_precision=ct.precision.FLOAT32`
+in `export_minilm_coreml.py`). coremltools defaults `mlprogram` conversion to FP16, and this model's
+FP16 CPU execution path is numerically broken: it returns NaN under `ComputeUnit.CPU_ONLY` on macOS,
+and in the iOS Simulator returns finite but badly wrong vectors. Because `MiniLMEmbedder` forces
+`.cpuOnly` on the Simulator (the FP16 MPSGraph path is device-only), every Simulator retrieval
+measurement was silently taken in a degraded embedding space — correct Summa hits scored ~0.50
+against the corpus instead of ~0.84, and correct passages fell several ranks. This is what made
+early smoke tests look like a corpus/chunking problem ("John chapter 14" ranking *Metaphysics*)
+when the corpus was fine. The export's original fidelity check passed because it only exercised
+Core ML's default compute path; it now verifies the CPU-only path explicitly, and that check is the
+thing standing between this regression and a re-ship, so do not remove it. FP32 doubles the model
+to ~86 MB, which is the correct trade for retrieval that works.
+
+Two corpus-side gaps remain open and need backend ingestion plus a re-export, not iOS changes: the
+missing conciliar/creedal texts above, and translation mismatch — the export is the World English
+Bible, so familiar KJV phrasings miss ("Let not your heart be troubled" scores 0.42 and retrieves
+Sirach, against a WEB text reading "Don't let your heart be troubled").
 Ordinary conversation generation stays fully deterministic (`topK: 1, temperature: 0`) even after
 the meta-commentary/hedging guard below. A brief experiment added modest sampling to help escape a
 hedge/clarification failure mode, but the direct fix (detecting that failure shape and retrying
