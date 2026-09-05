@@ -153,14 +153,25 @@ to ~86 MB, which is the correct trade for retrieval that works.
 
 Retrieval reliability is measured, not asserted: `Aquinas_Backend/evaluation/evaluate_retrieval.py`
 scores 56 questions against the real corpus and the real bundled Core ML model in seconds, with no
-device needed. The current baseline is **77% with the curated layer off, 80% with it on** — that
-3-point gap is the honest measure of how little the hand-written curated entries generalize, so
-adding more of them is not a reliability strategy. Per-category: doctrine, sacraments and
-out-of-scope screening all sit at 100%, while **scripture is 50%** — narrative Bible questions
-retrieve Summa commentary *about* a topic instead of the passage itself, since the Summa is 17,783
-chunks against the Bible's 5,973 and its phrasing is more question-shaped. That bias is the largest
-open retrieval problem for an app whose subject is scripture. Run the eval before and after any
-change to chunking, weighting, thresholds, or corpus contents.
+device needed. The current baseline is **82% with the curated layer off**; the hand-written curated entries add
+only a few points on top, which is the honest measure of how little they generalize, so adding more
+of them is not a reliability strategy. Doctrine, sacraments and out-of-scope screening sit at 100%
+and scripture at 75%. Run the eval before and after any change to chunking, weighting, thresholds,
+or corpus contents.
+
+Scripture retrieval was 50% until named passages were resolved lexically. Three hypotheses were
+measured and two rejected: chunk boilerplate (`[MAT05]`, the WEB header, footnote cross-references
+spliced mid-sentence) costs only ~0.05 similarity, and prepending descriptive headers gains
+0.16-0.30 but is diluted by the 128-token window. The actual cause is that **MiniLM matches topics,
+not names**. A descriptor containing the literal words "the Our Father" scores 0.345 against "What
+is the Our Father?", and Matthew 5 scores 0.213 against "What are the Beatitudes?" because the word
+"Beatitudes" never occurs in the chapter — it says "Blessed are...". No chunking or weighting change
+fixes an embedder that does not do names, so `ScriptureCitation.namedPassages` resolves them the way
+`John 14` is resolved: lexically, to a location in the real corpus. It hardcodes no answers, so it
+serves any question about the passage rather than the one someone anticipated.
+
+The remaining gaps are corpus, not retrieval: church-history 57% and creeds 50% cannot improve
+without ingesting conciliar and creedal texts.
 
 Two corpus-side gaps remain open and need backend ingestion plus a re-export, not iOS changes: the
 missing conciliar/creedal texts above, and translation mismatch — the export is the World English

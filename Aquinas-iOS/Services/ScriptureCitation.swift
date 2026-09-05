@@ -68,6 +68,83 @@ nonisolated struct ScriptureCitation: Equatable {
     private static let sortedAliases: [(alias: String, code: String, display: String)] =
         bookAliases.sorted { $0.alias.count > $1.alias.count }
 
+    /// Passages people name rather than cite. "The Beatitudes", "the prodigal son" and "the Our
+    /// Father" are lookup keys exactly like "John 14" is, and for the same reason they must be
+    /// resolved lexically: MiniLM is a topical matcher, not a lexical one. Measured against the
+    /// bundled corpus, a descriptor card containing the literal words "the Our Father" scores 0.345
+    /// against the question "What is the Our Father?", and Matthew 5 itself scores 0.213 against
+    /// "What are the Beatitudes?" — the word "Beatitudes" never appears in the chapter, which says
+    /// "Blessed are...". Re-chunking, cleaning boilerplate and prepending descriptive headers were
+    /// all measured and none closed that gap; naming is simply not what the embedder does.
+    ///
+    /// This maps a name to a *location in the real corpus*. It does not hardcode an answer — the
+    /// text still comes from Scripture — so it generalises to any question about the passage
+    /// rather than only the one someone anticipated.
+    private static let namedPassages: [(name: String, code: String, chapter: Int, display: String)] = [
+        ("beatitudes", "MAT", 5, "Matthew 5"),
+        ("sermon on the mount", "MAT", 5, "Matthew 5"),
+        ("salt of the earth", "MAT", 5, "Matthew 5"),
+        ("light of the world", "MAT", 5, "Matthew 5"),
+        ("lord's prayer", "MAT", 6, "Matthew 6"),
+        ("lords prayer", "MAT", 6, "Matthew 6"),
+        ("our father", "MAT", 6, "Matthew 6"),
+        ("treasure in heaven", "MAT", 6, "Matthew 6"),
+        ("golden rule", "MAT", 7, "Matthew 7"),
+        ("great commission", "MAT", 28, "Matthew 28"),
+        ("sheep and the goats", "MAT", 25, "Matthew 25"),
+        ("parable of the talents", "MAT", 25, "Matthew 25"),
+        ("parable of the sower", "MAT", 13, "Matthew 13"),
+        ("good samaritan", "LUK", 10, "Luke 10"),
+        ("mary and martha", "LUK", 10, "Luke 10"),
+        ("prodigal son", "LUK", 15, "Luke 15"),
+        ("lost sheep", "LUK", 15, "Luke 15"),
+        ("lost coin", "LUK", 15, "Luke 15"),
+        ("magnificat", "LUK", 1, "Luke 1"),
+        ("annunciation", "LUK", 1, "Luke 1"),
+        ("nativity", "LUK", 2, "Luke 2"),
+        ("christmas story", "LUK", 2, "Luke 2"),
+        ("road to emmaus", "LUK", 24, "Luke 24"),
+        ("prologue of john", "JHN", 1, "John 1"),
+        ("word became flesh", "JHN", 1, "John 1"),
+        ("born again", "JHN", 3, "John 3"),
+        ("woman at the well", "JHN", 4, "John 4"),
+        ("samaritan woman", "JHN", 4, "John 4"),
+        ("bread of life", "JHN", 6, "John 6"),
+        ("good shepherd", "JHN", 10, "John 10"),
+        ("raising of lazarus", "JHN", 11, "John 11"),
+        ("washing of the feet", "JHN", 13, "John 13"),
+        ("farewell discourse", "JHN", 14, "John 14"),
+        ("way the truth and the life", "JHN", 14, "John 14"),
+        ("the vine and the branches", "JHN", 15, "John 15"),
+        ("doubting thomas", "JHN", 20, "John 20"),
+        ("ten commandments", "EXO", 20, "Exodus 20"),
+        ("burning bush", "EXO", 3, "Exodus 3"),
+        ("passover", "EXO", 12, "Exodus 12"),
+        ("parting of the red sea", "EXO", 14, "Exodus 14"),
+        ("creation account", "GEN", 1, "Genesis 1"),
+        ("garden of eden", "GEN", 2, "Genesis 2"),
+        ("the fall", "GEN", 3, "Genesis 3"),
+        ("cain and abel", "GEN", 4, "Genesis 4"),
+        ("noah", "GEN", 6, "Genesis 6"),
+        ("tower of babel", "GEN", 11, "Genesis 11"),
+        ("binding of isaac", "GEN", 22, "Genesis 22"),
+        ("joseph and his brothers", "GEN", 37, "Genesis 37"),
+        ("david and goliath", "1SA", 17, "1 Samuel 17"),
+        ("the shepherd psalm", "PSA", 23, "Psalm 23"),
+        ("valley of the shadow of death", "PSA", 23, "Psalm 23"),
+        ("hymn to love", "1CO", 13, "1 Corinthians 13"),
+        ("love is patient", "1CO", 13, "1 Corinthians 13"),
+        ("fruit of the spirit", "GAL", 5, "Galatians 5"),
+        ("armor of god", "EPH", 6, "Ephesians 6"),
+        ("faith without works", "JAS", 2, "James 2"),
+        ("suffering servant", "ISA", 53, "Isaiah 53"),
+        ("fiery furnace", "DAN", 3, "Daniel 3"),
+        ("den of lions", "DAN", 6, "Daniel 6"),
+        ("pentecost", "ACT", 2, "Acts 2"),
+        ("road to damascus", "ACT", 9, "Acts 9"),
+        ("faith chapter", "HEB", 11, "Hebrews 11")
+    ]
+
     /// Every citation named in `question`, most specific book name first. Returns an empty array
     /// for questions that merely mention a book without a chapter ("who wrote John?"), since
     /// those are topical and semantic search handles them correctly.
@@ -82,6 +159,16 @@ nonisolated struct ScriptureCitation: Equatable {
 
         var found: [ScriptureCitation] = []
         var claimed: [Range<String.Index>] = []
+
+        for entry in namedPassages.sorted(by: { $0.name.count > $1.name.count })
+        where normalized.contains(entry.name) {
+            let citation = ScriptureCitation(
+                bookCode: entry.code,
+                chapter: entry.chapter,
+                displayName: entry.display
+            )
+            if !found.contains(citation) { found.append(citation) }
+        }
 
         for entry in sortedAliases {
             var searchStart = normalized.startIndex
