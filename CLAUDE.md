@@ -114,11 +114,23 @@ nearest-neighbour call:
   own `[JHN14]` chapter tags (1,616 chapters index cleanly) before semantic search runs.
 - **The relevance floor is a measured separation point, not a confidence level.**
   `defaultMaxDistance` was 1.0, which admits any non-negative similarity and so screened nothing —
-  the Livy passages above (0.55) reached the prompt as grounding. Scored against this corpus,
-  clearly relevant questions land at 0.64-0.83 similarity and clearly irrelevant ones top out at
-  0.60, so the floor is 0.38 distance (0.62 similarity). Retrieving nothing is the correct outcome
-  when the corpus has no real answer: generation proceeds ungrounded, which is strictly better than
-  grounding it in Roman history.
+  the Livy passages above (0.55) reached the prompt as grounding. Retrieving nothing is the correct
+  outcome when the corpus has no real answer: generation proceeds ungrounded, which is strictly
+  better than grounding it in Roman history.
+
+  The floor is **tiered**, and a single global value provably cannot do this job. Loose enough to
+  retrieve ordinary narrative scripture is also loose enough to readmit those Livy passages. So a
+  semantic passage standing on its own only needs the standard floor (0.45 distance / 0.55
+  similarity), while one added *alongside* an authoritative curated fact or cited chapter must
+  clear `corroborationMaxDistance` (0.38 / 0.62). Padding a prompt that already contains the answer
+  is not neutral: it is how the model ended up writing about John 4 when it had been handed John 14.
+
+  Both numbers come from sweeping them against
+  `Aquinas_Backend/evaluation/evaluate_retrieval.py`, not from eyeballing queries. An earlier 0.38
+  global floor was calibrated only on doctrinal questions — where the Summa's "Whether X..."
+  phrasing mirrors the question — and silently discarded the Lord's Prayer, the Good Samaritan and
+  the prodigal son despite all three being in the corpus (61% overall). Do not retune either value
+  without re-running that eval.
 
 Reference ids from this provider are stable strings (`corpus-…`, `citation-…`) and the curated
 layer keeps its own (`nicaea-325`, `constantinople-381`, …). That matters beyond tidiness:
@@ -138,6 +150,17 @@ when the corpus was fine. The export's original fidelity check passed because it
 Core ML's default compute path; it now verifies the CPU-only path explicitly, and that check is the
 thing standing between this regression and a re-ship, so do not remove it. FP32 doubles the model
 to ~86 MB, which is the correct trade for retrieval that works.
+
+Retrieval reliability is measured, not asserted: `Aquinas_Backend/evaluation/evaluate_retrieval.py`
+scores 56 questions against the real corpus and the real bundled Core ML model in seconds, with no
+device needed. The current baseline is **77% with the curated layer off, 80% with it on** — that
+3-point gap is the honest measure of how little the hand-written curated entries generalize, so
+adding more of them is not a reliability strategy. Per-category: doctrine, sacraments and
+out-of-scope screening all sit at 100%, while **scripture is 50%** — narrative Bible questions
+retrieve Summa commentary *about* a topic instead of the passage itself, since the Summa is 17,783
+chunks against the Bible's 5,973 and its phrasing is more question-shaped. That bias is the largest
+open retrieval problem for an app whose subject is scripture. Run the eval before and after any
+change to chunking, weighting, thresholds, or corpus contents.
 
 Two corpus-side gaps remain open and need backend ingestion plus a re-export, not iOS changes: the
 missing conciliar/creedal texts above, and translation mismatch — the export is the World English

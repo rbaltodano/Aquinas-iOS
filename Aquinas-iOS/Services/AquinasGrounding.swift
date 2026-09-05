@@ -30,6 +30,21 @@ nonisolated protocol AquinasGroundingProviding: Sendable {
 }
 
 nonisolated struct LocalAquinasGroundingProvider: AquinasGroundingProviding {
+    /// State only what is true. A `facts` string must never name the thing it is trying to rule
+    /// out, because the model reads that name as the subject rather than as the exclusion.
+    ///
+    /// Confirmed on a physical iPhone: the `john-14` note used to end "This is a different passage
+    /// from John 4, the account of Jesus and the Samaritan woman at the well." Asked "what does
+    /// John 14 say", retrieval was correct — Show Thinking listed both the curated note and the
+    /// real `John 14 — World English Bible` chapter text — and the model answered with an entire
+    /// essay on John 4 and the woman at the well, inventing a "John 4:231" citation to support it.
+    /// The sentence written to prevent that confusion produced it.
+    ///
+    /// Disambiguation belongs in `retrievalAliases`, which steer retrieval without entering the
+    /// prompt. Several entries below still carry contrastive clauses ("It was not called the
+    /// Council of Adhesion", "It must not be confused with Nicaea in 325", "It is not known to have
+    /// been written by the Apostle Paul") and are the same hazard; they are kept for now only
+    /// because they predate this finding and have not been individually re-tested on device.
     private static let references: [AquinasGroundingReference] = [
         AquinasGroundingReference(
             id: "nicaea-325",
@@ -79,7 +94,7 @@ nonisolated struct LocalAquinasGroundingProvider: AquinasGroundingProviding {
             id: "john-14",
             title: "Gospel of John, Chapter 14",
             sourceName: "Aquinas curated reference note",
-            facts: "John 14 is part of Jesus's Farewell Discourse to his disciples at the Last Supper, the night before his crucifixion. It opens with Jesus telling the disciples not to let their hearts be troubled, and to trust in God and in him. In response to Thomas's question about the way, Jesus says he is the way, the truth, and the life, and that no one comes to the Father except through him. Jesus promises to send the Holy Spirit, called the Advocate (or Helper), to be with the disciples after he is gone, and to teach them and remind them of all he has said. This is a different passage from John 4, the account of Jesus and the Samaritan woman at the well.",
+            facts: "John 14 is part of Jesus's Farewell Discourse to his disciples at the Last Supper, the night before his crucifixion. It opens with Jesus telling the disciples not to let their hearts be troubled, and to trust in God and in him. In response to Thomas's question about the way, Jesus says he is the way, the truth, and the life, and that no one comes to the Father except through him. Jesus promises to send the Holy Spirit, called the Advocate (or Helper), to be with the disciples after he is gone, and to teach them and remind them of all he has said.",
             retrievalAliases: [
                 "john 14", "john chapter 14", "gospel of john 14", "farewell discourse",
                 "way the truth and the life", "let not your hearts be troubled"

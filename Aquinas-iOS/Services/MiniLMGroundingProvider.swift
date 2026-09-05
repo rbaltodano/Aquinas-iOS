@@ -105,9 +105,22 @@ nonisolated final class MiniLMGroundingProvider: AquinasGroundingProviding {
         if collected.count < limit {
             do {
                 let queryEmbedding = try embedder.embed(question)
+                // A single global floor cannot serve both jobs. Loose enough to retrieve ordinary
+                // narrative scripture (the Good Samaritan, the prodigal son) is also loose enough
+                // to admit the 0.554-similarity Livy passages on "what did the Council of Nicaea
+                // decide" -- measured, not hypothetical. So the floor depends on what the earlier
+                // layers already found: when nothing authoritative matched, semantic search is the
+                // only grounding available and uses the standard floor; when a curated fact or a
+                // cited chapter already answered the question, weak semantic passages are padding
+                // next to a confident answer, and padding is how a model ends up writing about
+                // John 4 when it was handed John 14.
+                let semanticMaxDistance: Float? = collected.isEmpty
+                    ? nil
+                    : Self.corroborationMaxDistance
                 let passages = store.retrieve(
                     queryEmbedding: queryEmbedding,
-                    k: limit - collected.count
+                    k: limit - collected.count,
+                    maxDistance: semanticMaxDistance
                 )
                 for (offset, passage) in passages.enumerated() {
                     append(Self.reference(for: passage, id: "corpus-\(passage.sourceID)-\(offset)"))
@@ -120,6 +133,10 @@ nonisolated final class MiniLMGroundingProvider: AquinasGroundingProviding {
 
         return collected
     }
+
+    /// Bar a semantic passage must clear to be added *alongside* an authoritative curated fact or
+    /// cited chapter, as opposed to standing on its own. Stricter than the store's default floor.
+    private static let corroborationMaxDistance: Float = 0.38
 
     private static func reference(
         for passage: GroundingPassage,

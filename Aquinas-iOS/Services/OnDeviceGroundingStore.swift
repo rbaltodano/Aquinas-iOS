@@ -53,7 +53,20 @@ final class OnDeviceGroundingStore {
     /// Retrieving nothing is the safe outcome here: generation then proceeds
     /// ungrounded, which is strictly better than grounding it in Roman
     /// history.
-    private let defaultMaxDistance: Float = 0.38
+    ///
+    /// The value is 0.45, chosen by sweeping it against the 56-case set in
+    /// `Aquinas_Backend/evaluation/evaluate_retrieval.py` rather than by
+    /// eyeballing a handful of queries. An earlier 0.38 was calibrated only on
+    /// doctrinal questions, where the Summa's "Whether X..." phrasing closely
+    /// mirrors the question, and it silently discarded ordinary narrative
+    /// scripture -- the Lord's Prayer, the Good Samaritan and the prodigal son
+    /// all returned nothing despite being in the corpus (61% overall, 17
+    /// no-coverage failures). Loosening to 0.45 distance recovers them (75%,
+    /// 7 no-coverage) while still screening every out-of-scope question in the
+    /// set. Going further to 0.50 scores higher overall but begins grounding
+    /// "how do I bake sourdough bread", which is the failure this floor
+    /// exists to prevent, so it is not the maximum of the score curve.
+    private let defaultMaxDistance: Float = 0.45
 
     init(embeddingsURL: URL, passagesURL: URL) throws {
         let passagesData = try Data(contentsOf: passagesURL)
