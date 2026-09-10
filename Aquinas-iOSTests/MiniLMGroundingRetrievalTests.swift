@@ -62,6 +62,89 @@ struct MiniLMGroundingRetrievalTests {
         #expect(references.contains { $0.facts.count > 40 })
     }
 
+    @Test("A named council title finds its relevant decree, not its front matter")
+    func trentJustificationFindsDecree() throws {
+        let provider = try MiniLMGroundingProvider()
+        let references = provider.references(
+            for: "What did the Council of Trent teach about justification?",
+            limit: 3
+        )
+
+        let combined = references.map(\.facts).joined(separator: "\n").lowercased()
+        #expect(
+            combined.contains("not remission of sins merely"),
+            "Trent source routing did not reach Chapter VII's definition of justification"
+        )
+    }
+
+    @Test("Authority-section pointers select the primary-source formulation")
+    func authoritySectionPointersSelectPrimaryText() throws {
+        let provider = try MiniLMGroundingProvider()
+        let checks = [
+            (
+                question: "How did Nicaea describe Christ's relationship to the Father?",
+                sourceText: "very god of very god"
+            ),
+            (
+                question: "How did Chalcedon describe Christ?",
+                sourceText: "in two natures"
+            ),
+            (
+                question: "What did the Council of Trent teach about the real presence?",
+                sourceText: "on the real presence of our lord"
+            ),
+            (
+                question: "How does the Roman Catechism define Baptism?",
+                sourceText: "consists of ablution"
+            )
+        ]
+
+        for check in checks {
+            let references = provider.references(for: check.question, limit: 3)
+            #expect(
+                references.contains {
+                    $0.id.hasPrefix("authority-section-")
+                        && $0.facts.localizedCaseInsensitiveContains(check.sourceText)
+                },
+                "authority pointer did not select the source's own formulation for: \(check.question)"
+            )
+        }
+    }
+
+    @Test("An authority pointer includes the section's explanatory context")
+    func authoritySectionIncludesFollowingContext() throws {
+        let provider = try MiniLMGroundingProvider()
+        let references = provider.references(
+            for: "What did the Council of Trent teach about the real presence?",
+            limit: 3
+        )
+        let combined = references.map(\.facts).joined(separator: "\n").lowercased()
+        #expect(
+            combined.contains("truly, real") && combined.contains("substantially contained"),
+            "authority lookup stopped at Trent's heading instead of including Chapter I's explanation"
+        )
+    }
+
+    @Test("Authority sections enable evidence-first generation")
+    func authoritySectionEnablesEvidenceFirstInstruction() {
+        let reference = AquinasGroundingReference(
+            id: "authority-section-council-of-trent-0",
+            title: "Canons and Decrees of the Council of Trent",
+            sourceName: "Canons and Decrees of the Council of Trent",
+            facts: "CHAPTER VII. What the Justification of the impious is.",
+            retrievalAliases: []
+        )
+        let context = ConversationContext(
+            transcript: [.user("What did Trent teach about justification?", nil, [])]
+        )
+
+        let instruction = LiteRTAquinasModel.evidenceExperimentInstruction(
+            context: context, references: [reference]
+        )
+        #expect(instruction.contains("exact primary-source section"))
+        #expect(instruction.contains("Do not use general background knowledge to fill a gap"))
+    }
+
     @Test("Questions the corpus cannot answer ground in nothing")
     func offTopicQuestionReturnsNoGrounding() throws {
         let provider = try MiniLMGroundingProvider()

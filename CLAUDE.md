@@ -9,6 +9,55 @@ rather than resetting to the checkpoint merely because the tree is dirty.
 
 ## Model integration is live
 
+**Corpus updates, September 7–9, 2026:** the bundled corpus now contains
+**51,836 passages**. September 7 added Percival's *Seven Ecumenical Councils*,
+Schaff's ecumenical creeds and the 1921 *Baltimore Catechism No. 3*; September
+9 added Waterworth's 1848 *Canons and Decrees of the Council of Trent* and
+Donovan's 1829 *Catechism of the Council of Trent*. Both backend export scripts
+were rerun and all four assets copied into `Aquinas-iOS/LocalGrounding/` after
+the final update; MiniLM remains FP32 and both fidelity checks passed. The fixed
+curated-off eval remains **46/56 (82%)**. The September 7 expansion improved
+church history 4/7 → 5/7 and creeds 1/2 → 2/2, but regressed out-of-scope
+screening 7/7 → 5/7 (current pope and Vatican II now retrieve historical council
+passages). The two September 9 primary-source additions made no result change on
+that fixed set, which includes no Council of Trent or Roman Catechism question.
+Do not describe either expansion as a net reliability improvement. Edition,
+license, before/after and asset-hash evidence is in
+`../Aquinas_Backend/corpus/expansion-2026-09-07/` and
+`../Aquinas_Backend/corpus/authority-expansion-2026-09-09/`.
+
+**Named-source routing, September 9, 2026:** an exact title such as “Council
+of Trent,” “Roman Catechism,” “Nicene Creed,” or “Arius” now constrains ranking
+to its exported document before the normal corpus-wide semantic search. Inside
+that selected source, meaningful question terms rank matching passages; an
+exact source-plus-term hit is a document lookup and may be below the global
+semantic floor. It supplies no hand-written answer and leaves the 0.45/0.38
+relevance floors unchanged. The Trent case requires the actual Session VI,
+Chapter VII wording (“not remission of sins merely”), rather than a nearby
+heading. With that stricter evidence, the 65-case evaluation is **55/65
+(85%)**, including 8/10 church-history cases, 6/6 sacraments cases, and 4/4
+catechism cases. The routing table is parsed from
+`MiniLMGroundingProvider.swift` by the evaluator so its behavior cannot silently
+diverge from the app. A second, narrower authority-section table resolves a
+named authority plus its topic to a heading in the imported primary text:
+Trent/justification, Eucharist, or penance; Nicaea/Christ; Chalcedon/Christ;
+and the Roman Catechism on Baptism, Eucharist, or penance. These are
+source-location pointers, never generated answers, and run before broad source
+ranking. Each pointer retrieves the following chunks from the same source as
+well, so a short heading is accompanied by its actual explanation. The direct-
+evidence suite includes natural-language variants for each pointer and
+retrieves the intended primary formulation.
+
+**Evidence-first authority answers, September 10, 2026:** when an
+authority-section pointer supplies the grounding, normal generation receives a
+primary-source-only instruction and its required factual audit sees only those
+section chunks. Both passes must remove claims not stated or plainly entailed
+by the text; they must not fill gaps from general model knowledge. This is a
+generation constraint, not a curated answer and not yet an end-to-end
+generation-quality score. The prompt contract has a focused retrieval test;
+the iPhone 17 simulator currently launches test suites but reports zero tests
+executed with an unknown result, so validate the actual wording on device.
+
 Before changing any model-facing code, read
 [MODEL-INTEGRATION.md](../Aquinas-Foundations/MODEL-INTEGRATION.md). It is the cross-repo source of
 truth for backend contracts, iOS seams, MiniLM relatedness, persistence, current status, and the
@@ -152,11 +201,13 @@ thing standing between this regression and a re-ship, so do not remove it. FP32 
 to ~86 MB, which is the correct trade for retrieval that works.
 
 Retrieval reliability is measured, not asserted: `Aquinas_Backend/evaluation/evaluate_retrieval.py`
-scores 56 questions against the real corpus and the real bundled Core ML model in seconds, with no
-device needed. The current baseline is **82% with the curated layer off**; the hand-written curated entries add
+scores 58 questions against the real corpus and the real bundled Core ML model in seconds, with no
+device needed. The historical fixed-set baseline is **46/56 (82%) with the curated layer off**;
+the current expanded source-routing set is **55/65 (85%) under its stricter direct-evidence
+checks**. The hand-written curated entries add
 only a few points on top, which is the honest measure of how little they generalize, so adding more
-of them is not a reliability strategy. Doctrine, sacraments and out-of-scope screening sit at 100%
-and scripture at 75%. Run the eval before and after any change to chunking, weighting, thresholds,
+of them is not a reliability strategy. Doctrine, sacraments, catechism, and creeds sit at 100%, church
+history at 80%, and scripture at 75%. Run the eval before and after any change to chunking, weighting, thresholds,
 or corpus contents.
 
 Scripture retrieval was 50% until named passages were resolved lexically. Three hypotheses were

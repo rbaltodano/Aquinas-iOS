@@ -10,6 +10,15 @@ import LiteRTLM
 /// the development backend remains a recovery path while model delivery and failure telemetry are
 /// being productionized.
 struct LiteRTAquinasModel: AquinasModel {
+#if DEBUG
+    /// Exposes the production prompt to the opt-in evidence experiment only.
+    static func evidenceExperimentInstruction(
+        context: ConversationContext,
+        references: [AquinasGroundingReference]
+    ) -> String {
+        conversationSystemInstruction(context: context, groundingReferences: references)
+    }
+#endif
     private let runtime: LiteRTAquinasRuntime
     private let fallback: BackendAquinasModel
     private let groundingProvider: any AquinasGroundingProviding
@@ -162,6 +171,7 @@ struct LiteRTAquinasModel: AquinasModel {
                 for: latestQuestion,
                 limit: 3
             )
+            let authorityEvidenceFirst = Self.hasAuthoritySectionReference(groundingReferences)
             // Retrieval finishes before generation even starts, so surface it
             // immediately — real activity to look at during the slow part
             // (generation), not a decorative placeholder.
@@ -301,12 +311,15 @@ struct LiteRTAquinasModel: AquinasModel {
                     from: Self.plainConversationText(from: raw)
                 )
             }
-            if Self.factualAccuracyAuditNeeded(for: latestQuestion) {
+            if Self.factualAccuracyAuditNeeded(for: latestQuestion) || authorityEvidenceFirst {
                 do {
                     let audited = try await accuracyAuditedResponse(
                         question: latestQuestion,
                         draft: Self.plainConversationText(from: raw),
-                        references: groundingReferences,
+                        references: authorityEvidenceFirst
+                            ? groundingReferences.filter { $0.id.hasPrefix("authority-section-") }
+                            : groundingReferences,
+                        requiresPrimarySourceFaithfulness: authorityEvidenceFirst,
                         personality: context.personality
                     )
                     try Task.checkCancellation()
@@ -905,11 +918,15 @@ struct LiteRTAquinasModel: AquinasModel {
         question: String,
         draft: String,
         references: [AquinasGroundingReference],
+        requiresPrimarySourceFaithfulness: Bool,
         personality: ConversationPersonality
     ) async throws -> String {
         let evidence = references.isEmpty
             ? "(no trusted reference passage was retrieved)"
             : references.map(\.promptText).joined(separator: "\n\n")
+        let evidenceLabel = requiresPrimarySourceFaithfulness
+            ? "Exact primary-source passages selected for the named authority and topic:"
+            : "Trusted reference passages retrieved by semantic similarity; some may be irrelevant:"
         let prompt = """
         <TASK:FACTUAL_ACCURACY_AUDIT>
         Act as a skeptical final editor. Return the complete answer only, never an audit report.
@@ -920,8 +937,16 @@ struct LiteRTAquinasModel: AquinasModel {
         Draft answer:
         \(draft)
 
-        Trusted reference passages retrieved by semantic similarity; some may be irrelevant:
+        \(evidenceLabel)
         \(evidence)
+
+        \(requiresPrimarySourceFaithfulness ? """
+        This is an exact primary-source section selected for the named authority and topic. Treat
+        it as controlling evidence. Every substantive statement about what that authority teaches
+        must be directly stated by, or be a plain modern-English restatement of, these passages.
+        Remove an assertion when the passages do not support it. Do not add a doctrine, sacrament,
+        historical claim, or implication merely because it sounds related.
+        """ : "")
 
         Check every concrete name, date, number, authorship claim, quotation, causal assertion,
         and statement that one work or person teaches something. Correct any contradiction with a
@@ -1028,6 +1053,10 @@ private extension LiteRTAquinasModel {
         return factualTerms.contains(where: normalized.contains)
     }
 
+    static func hasAuthoritySectionReference(_ references: [AquinasGroundingReference]) -> Bool {
+        references.contains { $0.id.hasPrefix("authority-section-") }
+    }
+
     static func accuracyAuditVoiceInstruction(
         _ personality: ConversationPersonality
     ) -> String {
@@ -1048,22 +1077,31 @@ private extension LiteRTAquinasModel {
         explicitCorrection: AuthorshipCorrection? = nil,
         groundingReferences: [AquinasGroundingReference] = []
     ) -> String {
+        let authorityEvidenceFirst = hasAuthoritySectionReference(groundingReferences)
+        let groundingQualification = authorityEvidenceFirst
+            ? "These include an exact primary-source section for the named authority and topic."
+            : "These were retrieved automatically by semantic similarity and may be only loosely relevant, incomplete excerpts, or not actually applicable to this question."
         let groundedContext = groundingReferences.isEmpty
             ? "No trusted reference notes were retrieved for this question."
             : """
             Reference passages retrieved for this question, each labeled with its source title:
             \(groundingReferences.map(\.promptText).joined(separator: "\n\n"))
 
-            These were retrieved automatically by semantic similarity and may be only loosely
-            relevant, incomplete excerpts, or not actually applicable to this question — use a
-            passage only where it genuinely bears on the question, and do not force-fit or invent
-            a connection when it does not. When a passage materially grounds a claim, you may name
-            its source title in prose. Never merge distinct councils or works, replace an exact
-            name with a guessed name, or fabricate a citation, quotation, or detail not present in
-            the passage. If the passages do not establish a requested fact and you are uncertain,
-            say so plainly instead of inventing an answer. Do not mention retrieval or these
-            internal notes unless the user asks about sources.
+            \(groundingQualification) Use a passage only where it genuinely bears on the question,
+            and do not force-fit or invent a connection when it does not. When a passage materially
+            grounds a claim, you may name its source title in prose. Never merge distinct councils
+            or works, replace an exact name with a guessed name, or fabricate a citation, quotation,
+            or detail not present in the passage. If the passages do not establish a requested fact
+            and you are uncertain, say so plainly instead of inventing an answer. Do not mention
+            retrieval or these internal notes unless the user asks about sources.
             """
+        let authorityEvidenceInstruction = authorityEvidenceFirst ? """
+        The references include an exact primary-source section for the named authority and topic.
+        Answer what that authority teaches from those passages first. Keep every substantive
+        doctrinal or historical claim within what they state or plainly entail. Do not use general
+        background knowledge to fill a gap, and do not attach a related doctrine merely because it
+        sounds plausible. A concise, faithful answer is better than a broader but unsupported one.
+        """ : ""
         return """
         You are Aquinas, a philosophical study partner. Follow the logic with intellectual charity.
         Treat earlier claims as revisable: when the user's reasoning defeats a premise, exposes a
@@ -1093,6 +1131,8 @@ private extension LiteRTAquinasModel {
         } ?? "")
 
         \(groundedContext)
+
+        \(authorityEvidenceInstruction)
 
         \(personalityInstruction(context.personality))
 

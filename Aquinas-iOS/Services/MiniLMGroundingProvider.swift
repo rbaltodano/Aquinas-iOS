@@ -56,7 +56,7 @@ nonisolated final class MiniLMGroundingProvider: AquinasGroundingProviding {
         self.init(embedder: embedder, store: store)
     }
 
-    /// Grounding is assembled in three layers, most authoritative first, because semantic search
+    /// Grounding is assembled in five layers, most authoritative first, because semantic search
     /// alone measurably fails two whole classes of question against this corpus:
     ///
     /// 1. **Curated facts.** The export carries almost no conciliar or creedal text, so council
@@ -65,7 +65,12 @@ nonisolated final class MiniLMGroundingProvider: AquinasGroundingProviding {
     ///    `LiteRTAquinasModel.verifiedGroundedResponse` gates its verified answers on.
     /// 2. **Explicit citations.** "John 14" is a lookup key, not a topic; resolved lexically
     ///    against the corpus's own chapter tags. See `ScriptureCitation`.
-    /// 3. **Semantic search**, which is strong for doctrinal and conceptual questions, filling any
+    /// 3. **Authority-section lookup.** A named doctrinal question such as Trent on justification
+    ///    resolves to a section heading in that primary source. The pointer only selects corpus
+    ///    text; it never supplies an answer.
+    /// 4. **Named source lookup.** A council, creed or work title is a document key, not a broad
+    ///    historical topic. It constrains semantic ranking to that real source.
+    /// 5. **Semantic search**, which is strong for doctrinal and conceptual questions, filling any
     ///    remaining slots.
     ///
     /// Every layer can legitimately return nothing, and returning nothing is correct when the
@@ -80,10 +85,11 @@ nonisolated final class MiniLMGroundingProvider: AquinasGroundingProviding {
         else { return [] }
 
         var collected: [AquinasGroundingReference] = []
-        var seenIDs: Set<String> = []
+        var seenPassages: Set<String> = []
 
         func append(_ reference: AquinasGroundingReference) {
-            guard collected.count < limit, seenIDs.insert(reference.id).inserted else { return }
+            let passageKey = "\(reference.sourceName)\u{1F}\(reference.facts)"
+            guard collected.count < limit, seenPassages.insert(passageKey).inserted else { return }
             collected.append(reference)
         }
 
@@ -105,6 +111,34 @@ nonisolated final class MiniLMGroundingProvider: AquinasGroundingProviding {
         if collected.count < limit {
             do {
                 let queryEmbedding = try embedder.embed(question)
+                for route in AuthoritySection.routes(in: question) {
+                    guard collected.count < limit else { break }
+                    for (offset, passage) in store.section(
+                        sourceIDs: route.sourceIDs,
+                        requiredTerms: route.sectionTerms,
+                        limit: limit - collected.count
+                    ).enumerated() {
+                        append(Self.reference(
+                            for: passage,
+                            id: "authority-section-\(passage.sourceID)-\(offset)"
+                        ))
+                    }
+                }
+                let namedSourceIDs = NamedCorpusSource.sourceIDs(in: question)
+                if !namedSourceIDs.isEmpty {
+                    let sourceRankingQuery = NamedCorpusSource.rankingQuery(in: question)
+                    let sourceEmbedding = sourceRankingQuery == question
+                        ? queryEmbedding
+                        : try embedder.embed(sourceRankingQuery)
+                    for (offset, passage) in store.retrieve(
+                        queryEmbedding: sourceEmbedding,
+                        k: limit - collected.count,
+                        sourceIDs: namedSourceIDs,
+                        prioritizingTerms: NamedCorpusSource.searchTerms(in: question)
+                    ).enumerated() {
+                        append(Self.reference(for: passage, id: "source-\(passage.sourceID)-\(offset)"))
+                    }
+                }
                 // A single global floor cannot serve both jobs. Loose enough to retrieve ordinary
                 // narrative scripture (the Good Samaritan, the prodigal son) is also loose enough
                 // to admit the 0.554-similarity Livy passages on "what did the Council of Nicaea
@@ -149,6 +183,146 @@ nonisolated final class MiniLMGroundingProvider: AquinasGroundingProviding {
             facts: passage.text,
             retrievalAliases: []
         )
+    }
+}
+
+private enum NamedCorpusSource {
+    private static let aliases: [(name: String, sourceIDs: Set<String>)] = [
+        ("council of trent", ["council-of-trent"]),
+        ("trent", ["council-of-trent"]),
+        ("roman catechism", ["roman-catechism-donovan"]),
+        ("catechism of the council of trent", ["roman-catechism-donovan"]),
+        ("tridentine catechism", ["roman-catechism-donovan"]),
+        ("didache", ["didache"]),
+        ("teaching of the twelve apostles", ["didache"]),
+        ("council of nicaea", ["seven-ecumenical-councils"]),
+        ("council of constantinople", ["seven-ecumenical-councils"]),
+        ("council of chalcedon", ["seven-ecumenical-councils"]),
+        ("arius", ["seven-ecumenical-councils"]),
+        ("nicene creed", ["ecumenical-creeds-schaff"]),
+        ("apostles' creed", ["ecumenical-creeds-schaff"]),
+        ("apostles creed", ["ecumenical-creeds-schaff"])
+    ]
+
+    static func sourceIDs(in question: String) -> Set<String> {
+        let normalized = normalized(question)
+        return aliases.reduce(into: []) { matched, entry in
+            if normalized.contains(entry.name) { matched.formUnion(entry.sourceIDs) }
+        }
+    }
+
+    /// Within a named source, topic-bearing query terms should outrank title and front-matter
+    /// chunks. For example, the Council of Trent source contains its own title on several early
+    /// pages, while the question's "justification" term identifies the actual decree. Source
+    /// aliases are stripped because the caller has already used them to choose the source.
+    static func searchTerms(in question: String) -> Set<String> {
+        let normalizedQuestion = normalized(question)
+        let matchingAliases = aliases.filter { normalizedQuestion.contains($0.name) }
+        let aliasWords = Set(matchingAliases.flatMap { entry in
+            entry.name.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        })
+        let stopWords: Set<String> = [
+            "about", "after", "against", "and", "before", "could", "does", "from", "have", "into",
+            "are", "council", "catechism", "decide", "did", "does", "is", "say", "should", "teach", "that", "the", "their", "these", "they", "this", "was", "what", "when", "who", "why",
+            "where", "which", "with", "would"
+        ]
+        let terms = Set(normalizedQuestion.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+            .filter { $0.count >= 3 && !stopWords.contains($0) })
+        let topicTerms = terms.subtracting(aliasWords)
+        // A question consisting only of a named person or work (for example, "Who was Arius?")
+        // still needs the name to find a passage. When the question supplies a real topic as
+        // well, remove the source title so title pages cannot crowd out its relevant section.
+        return topicTerms
+    }
+
+    static func rankingQuery(in question: String) -> String {
+        let terms = searchTerms(in: question).sorted()
+        return terms.isEmpty ? question : terms.joined(separator: " ")
+    }
+
+    private static func normalized(_ text: String) -> String {
+        text.folding(
+            options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX")
+        ).lowercased()
+    }
+}
+
+/// Maps a well-known doctrinal formulation to the heading that contains it in an imported
+/// primary source. This is retrieval metadata: it identifies the source text to read, and never
+/// carries a paraphrase, conclusion, or negative example for the language model to repeat.
+private enum AuthoritySection {
+    private static let table: [(
+        authorityTerms: [String],
+        topicTerms: Set<String>,
+        sourceIDs: Set<String>,
+        sectionTerms: Set<String>
+    )] = [
+        (
+            authorityTerms: ["trent"],
+            topicTerms: ["justification", "justified"],
+            sourceIDs: ["council-of-trent"],
+            sectionTerms: ["what the justification of the impious is"]
+        ),
+        (
+            authorityTerms: ["trent"],
+            topicTerms: ["communion", "eucharist", "host", "presence"],
+            sourceIDs: ["council-of-trent"],
+            sectionTerms: ["on the real presence of our lord"]
+        ),
+        (
+            authorityTerms: ["trent"],
+            topicTerms: ["absolution", "confession", "penance"],
+            sourceIDs: ["council-of-trent"],
+            sectionTerms: ["doctrine on the sacrament of penance"]
+        ),
+        (
+            authorityTerms: ["roman", "catechism"],
+            topicTerms: ["baptism", "baptized", "baptize"],
+            sourceIDs: ["roman-catechism-donovan"],
+            sectionTerms: ["define baptism as we may"]
+        ),
+        (
+            authorityTerms: ["roman", "catechism"],
+            topicTerms: ["communion", "eucharist"],
+            sourceIDs: ["roman-catechism-donovan"],
+            sectionTerms: ["on the sacrament of the eucharist"]
+        ),
+        (
+            authorityTerms: ["roman", "catechism"],
+            topicTerms: ["absolution", "confession", "penance"],
+            sourceIDs: ["roman-catechism-donovan"],
+            sectionTerms: ["penance may be administered and becomes necessary"]
+        ),
+        (
+            authorityTerms: ["nicaea"],
+            topicTerms: ["christ", "consubstantial", "father", "homoousios", "jesus", "son"],
+            sourceIDs: ["seven-ecumenical-councils"],
+            sectionTerms: ["very god of very god"]
+        ),
+        (
+            authorityTerms: ["chalcedon"],
+            topicTerms: ["christ", "incarnation", "nature", "natures"],
+            sourceIDs: ["seven-ecumenical-councils"],
+            sectionTerms: ["in two natures"]
+        )
+    ]
+
+    static func routes(in question: String) -> [(sourceIDs: Set<String>, sectionTerms: Set<String>)] {
+        let words = Set(
+            question.folding(
+                options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX")
+            )
+            .lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+        )
+        return table.compactMap { route in
+            guard route.authorityTerms.allSatisfy(words.contains),
+                  !route.topicTerms.isDisjoint(with: words)
+            else { return nil }
+            return (sourceIDs: route.sourceIDs, sectionTerms: route.sectionTerms)
+        }
     }
 }
 

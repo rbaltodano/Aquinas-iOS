@@ -34,6 +34,7 @@ final class OnDeviceGroundingStore {
     private let embeddingDimension = 384
     private let passages: [PassageRecord]
     private let embeddings: Data
+    private let sourceIndices: [String: [Int]]
     /// "JHN14" -> the passage range covering that chapter, built once from the
     /// corpus's own leading `[JHN14]` locator tags. Lets an explicit citation
     /// be resolved as a lookup key instead of a semantic query.
@@ -70,7 +71,8 @@ final class OnDeviceGroundingStore {
 
     init(embeddingsURL: URL, passagesURL: URL) throws {
         let passagesData = try Data(contentsOf: passagesURL)
-        self.passages = try JSONDecoder().decode([PassageRecord].self, from: passagesData)
+        let decodedPassages = try JSONDecoder().decode([PassageRecord].self, from: passagesData)
+        self.passages = decodedPassages
         self.embeddings = try Data(contentsOf: embeddingsURL, options: .alwaysMapped)
 
         let expectedBytes = passages.count * embeddingDimension * MemoryLayout<Float>.size
@@ -78,6 +80,7 @@ final class OnDeviceGroundingStore {
             throw OnDeviceGroundingStoreError.corpusMismatch
         }
         self.chapterRanges = Self.indexChapters(in: passages)
+        self.sourceIndices = Dictionary(grouping: decodedPassages.indices, by: { decodedPassages[$0].sourceId })
     }
 
     /// Chapters are chunked across several passages, but only the first chunk
@@ -160,22 +163,57 @@ final class OnDeviceGroundingStore {
 
     var passageCount: Int { passages.count }
 
+    /// Returns a source-local run beginning at a known section heading or formula. Authority
+    /// pointers identify the first passage exactly; the following chunks supply the explanation
+    /// that a short heading alone cannot carry. This never crosses into another source.
+    func section(
+        sourceIDs: Set<String>,
+        requiredTerms: Set<String>,
+        limit: Int
+    ) -> [GroundingPassage] {
+        guard limit > 0, !requiredTerms.isEmpty else { return [] }
+        let indices = sourceIDs.sorted().flatMap { sourceIndices[$0] ?? [] }
+        guard let anchorOffset = indices.firstIndex(where: { index in
+            requiredTerms.allSatisfy { passages[index].text.localizedCaseInsensitiveContains($0) }
+        }) else { return [] }
+
+        let anchorSourceID = passages[indices[anchorOffset]].sourceId
+        return indices[anchorOffset...]
+            .prefix { passages[$0].sourceId == anchorSourceID }
+            .prefix(limit)
+            .map { index in
+                let record = passages[index]
+                return GroundingPassage(
+                    text: record.text,
+                    title: record.title,
+                    sourceID: record.sourceId,
+                    distance: 0
+                )
+            }
+    }
+
     func retrieve(
         queryEmbedding: [Float],
         k: Int = 4,
-        maxDistance: Float? = nil
+        maxDistance: Float? = nil,
+        sourceIDs: Set<String>? = nil,
+        prioritizingTerms: Set<String> = [],
+        requiredTerms: Set<String> = []
     ) -> [GroundingPassage] {
         guard queryEmbedding.count == embeddingDimension, !passages.isEmpty else {
             return []
         }
         let threshold = maxDistance ?? defaultMaxDistance
+        let candidateIndices = sourceIDs.map { ids in
+            ids.flatMap { sourceIndices[$0] ?? [] }
+        } ?? Array(passages.indices)
 
         var similarities = [Float](repeating: 0, count: passages.count)
         embeddings.withUnsafeBytes { (rawBuffer: UnsafeRawBufferPointer) in
             let base = rawBuffer.bindMemory(to: Float.self).baseAddress!
             queryEmbedding.withUnsafeBufferPointer { queryBuffer in
                 let query = queryBuffer.baseAddress!
-                for index in 0..<passages.count {
+                for index in candidateIndices {
                     let row = base + index * embeddingDimension
                     var dot: Float = 0
                     vDSP_dotpr(query, 1, row, 1, &dot, vDSP_Length(embeddingDimension))
@@ -184,10 +222,36 @@ final class OnDeviceGroundingStore {
             }
         }
 
-        let ranked = similarities.enumerated()
-            .map { index, similarity in (index: index, distance: 1 - similarity) }
-            .filter { $0.distance <= threshold }
-            .sorted { $0.distance < $1.distance }
+        let permitsSourceTermMatch = sourceIDs != nil && !prioritizingTerms.isEmpty
+        let ranked = candidateIndices.lazy
+            .map { index in
+                let record = self.passages[index]
+                let matchedTerms = prioritizingTerms.reduce(into: 0) { count, term in
+                    if record.text.localizedCaseInsensitiveContains(term) { count += 1 }
+                }
+                let satisfiesRequiredTerms = requiredTerms.allSatisfy {
+                    record.text.localizedCaseInsensitiveContains($0)
+                }
+                return (
+                    index: index,
+                    distance: 1 - similarities[index],
+                    matchedTerms: matchedTerms,
+                    satisfiesRequiredTerms: satisfiesRequiredTerms
+                )
+            }
+            // An explicit document title plus a real term in that document is a lookup hit, like
+            // a Bible citation. It may legitimately sit below the corpus-wide semantic floor,
+            // which exists to reject unrelated *global* matches such as Livy on "council".
+            .filter {
+                $0.satisfiesRequiredTerms
+                    && ($0.distance <= threshold || (permitsSourceTermMatch && $0.matchedTerms > 0))
+            }
+            .sorted {
+                if $0.matchedTerms != $1.matchedTerms {
+                    return $0.matchedTerms > $1.matchedTerms
+                }
+                return $0.distance < $1.distance
+            }
             .prefix(k)
 
         return ranked.map { entry in
