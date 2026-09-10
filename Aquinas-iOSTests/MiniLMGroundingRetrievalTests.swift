@@ -111,6 +111,18 @@ struct MiniLMGroundingRetrievalTests {
         )
     }
 
+    @Test("A person named as the whole question still searches within that source")
+    func ariusQuestionUsesCouncilSource() throws {
+        let provider = try MiniLMGroundingProvider()
+        let references = provider.references(for: "Who was Arius and what did he teach?", limit: 3)
+
+        #expect(references.contains {
+            $0.id.hasPrefix("source-seven-ecumenical-councils-")
+                && ($0.facts.localizedCaseInsensitiveContains("Arius")
+                    || $0.facts.localizedCaseInsensitiveContains("Arian"))
+        })
+    }
+
     @Test("Authority-section pointers select the primary-source formulation")
     func authoritySectionPointersSelectPrimaryText() throws {
         let provider = try MiniLMGroundingProvider()

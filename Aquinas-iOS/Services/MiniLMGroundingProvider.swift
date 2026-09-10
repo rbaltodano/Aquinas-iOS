@@ -187,6 +187,12 @@ nonisolated final class MiniLMGroundingProvider: AquinasGroundingProviding {
 }
 
 private enum NamedCorpusSource {
+    /// A person's name may be the only meaningful lookup term in an otherwise generic question
+    /// ("Who was Arius?"). Document titles deliberately do not use this fallback: matching
+    /// "Roman" and "Catechism" throughout the Roman Catechism promotes front matter above its
+    /// actual teaching.
+    private static let personAliases: Set<String> = ["arius"]
+
     private static let aliases: [(name: String, sourceIDs: Set<String>)] = [
         ("council of trent", ["council-of-trent"]),
         ("trent", ["council-of-trent"]),
@@ -230,10 +236,11 @@ private enum NamedCorpusSource {
             .map(String.init)
             .filter { $0.count >= 3 && !stopWords.contains($0) })
         let topicTerms = terms.subtracting(aliasWords)
-        // A question consisting only of a named person or work (for example, "Who was Arius?")
-        // still needs the name to find a passage. When the question supplies a real topic as
-        // well, remove the source title so title pages cannot crowd out its relevant section.
-        return topicTerms
+        // A person-only question (for example, "Who was Arius?") still needs the name to find a
+        // passage. When a document title is the whole question, preserve semantic source ranking
+        // instead; common title words would otherwise make its front matter a false lookup hit.
+        let matchesPersonAlias = matchingAliases.contains { personAliases.contains($0.name) }
+        return topicTerms.isEmpty && matchesPersonAlias ? terms : topicTerms
     }
 
     static func rankingQuery(in question: String) -> String {
