@@ -143,13 +143,24 @@ final class OnDeviceGroundingStore {
         return "\(code)\(number)"
     }
 
-    /// The passages making up an explicitly cited chapter, in reading order.
-    /// Returns an empty array when the corpus does not carry that chapter.
+    /// The passages making up an explicitly cited chapter, in reading order. A named passage may
+    /// supply a literal source-text anchor, in which case reading begins at that chunk instead of
+    /// at the chapter opening. Returns an empty array when the corpus does not carry the chapter
+    /// or a claimed anchor is absent, so a stale pointer cannot silently supply the wrong text.
     func chapter(for citation: ScriptureCitation, limit: Int) -> [GroundingPassage] {
         guard limit > 0,
               let range = chapterRanges["\(citation.bookCode)\(citation.chapter)"]
         else { return [] }
-        return range.prefix(limit).map { index in
+        let start: Int
+        if let anchorText = citation.anchorText {
+            guard let anchor = range.first(where: {
+                passages[$0].text.localizedCaseInsensitiveContains(anchorText)
+            }) else { return [] }
+            start = anchor
+        } else {
+            start = range.lowerBound
+        }
+        return passages.indices[start..<range.upperBound].prefix(limit).map { index in
             let record = passages[index]
             return GroundingPassage(
                 text: record.text,

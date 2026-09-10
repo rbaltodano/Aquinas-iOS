@@ -54,6 +54,36 @@ struct MiniLMGroundingRetrievalTests {
         )
     }
 
+    @Test("Named passages begin at their own source text, not at a chapter's opening")
+    func namedPassagesUseSourceTextAnchors() throws {
+        let provider = try MiniLMGroundingProvider()
+        let checks = [
+            (
+                question: "What is the parable of the Good Samaritan about?",
+                sourceText: "a certain samaritan"
+            ),
+            (
+                question: "How did Jesus teach us to pray?",
+                sourceText: "lord, teach us to pray"
+            ),
+            (
+                question: "What does the Our Father say?",
+                sourceText: "our father in heaven"
+            )
+        ]
+
+        for check in checks {
+            let references = provider.references(for: check.question, limit: 3)
+            #expect(
+                references.contains {
+                    $0.id.hasPrefix("citation-")
+                        && $0.facts.localizedCaseInsensitiveContains(check.sourceText)
+                },
+                "named-passage pointer did not begin at its source text for: \(check.question)"
+            )
+        }
+    }
+
     @Test("Doctrinal questions still retrieve the corpus itself")
     func doctrinalQuestionRetrievesCorpus() throws {
         let provider = try MiniLMGroundingProvider()

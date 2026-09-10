@@ -34,8 +34,8 @@ exact source-plus-term hit is a document lookup and may be below the global
 semantic floor. It supplies no hand-written answer and leaves the 0.45/0.38
 relevance floors unchanged. The Trent case requires the actual Session VI,
 Chapter VII wording (“not remission of sins merely”), rather than a nearby
-heading. With that stricter evidence, the 65-case evaluation is **55/65
-(85%)**, including 8/10 church-history cases, 6/6 sacraments cases, and 4/4
+heading. With that stricter evidence, the 65-case evaluation is **57/65
+(88%)**, including 8/10 church-history cases, 6/6 sacraments cases, and 4/4
 catechism cases. The routing table is parsed from
 `MiniLMGroundingProvider.swift` by the evaluator so its behavior cannot silently
 diverge from the app. A second, narrower authority-section table resolves a
@@ -201,13 +201,13 @@ thing standing between this regression and a re-ship, so do not remove it. FP32 
 to ~86 MB, which is the correct trade for retrieval that works.
 
 Retrieval reliability is measured, not asserted: `Aquinas_Backend/evaluation/evaluate_retrieval.py`
-scores 58 questions against the real corpus and the real bundled Core ML model in seconds, with no
+scores 65 questions against the real corpus and the real bundled Core ML model in seconds, with no
 device needed. The historical fixed-set baseline is **46/56 (82%) with the curated layer off**;
-the current expanded source-routing set is **55/65 (85%) under its stricter direct-evidence
+the current expanded source-routing set is **57/65 (88%) under its stricter direct-evidence
 checks**. The hand-written curated entries add
 only a few points on top, which is the honest measure of how little they generalize, so adding more
 of them is not a reliability strategy. Doctrine, sacraments, catechism, and creeds sit at 100%, church
-history at 80%, and scripture at 75%. Run the eval before and after any change to chunking, weighting, thresholds,
+history at 80%, and scripture at 92%. Run the eval before and after any change to chunking, weighting, thresholds,
 or corpus contents.
 
 Scripture retrieval was 50% until named passages were resolved lexically. Three hypotheses were
@@ -221,13 +221,21 @@ fixes an embedder that does not do names, so `ScriptureCitation.namedPassages` r
 `John 14` is resolved: lexically, to a location in the real corpus. It hardcodes no answers, so it
 serves any question about the passage rather than the one someone anticipated.
 
-The remaining gaps are corpus, not retrieval: church-history 57% and creeds 50% cannot improve
-without ingesting conciliar and creedal texts.
+Some named stories begin after a chapter's opening chunk: the Good Samaritan is in the fourth Luke
+10 chunk, while the chapter begins with the mission of the seventy. Those names now carry a literal
+phrase from their primary text as an anchor, so retrieval begins at the passage itself; a missing
+anchor returns no citation rather than silently falling back to unrelated material from the chapter.
 
-Two corpus-side gaps remain open and need backend ingestion plus a re-export, not iOS changes: the
-missing conciliar/creedal texts above, and translation mismatch — the export is the World English
-Bible, so familiar KJV phrasings miss ("Let not your heart be troubled" scores 0.42 and retrieves
-Sirach, against a WEB text reading "Don't let your heart be troubled").
+The remaining 8 measured misses have distinct causes: absent coverage for lying, forgiveness, the
+Didache, and Bible reliability; incorrect semantic routing for the resurrection and Arius; and
+false grounding for current-Pope and Vatican II questions. Do not mask any of these with a curated
+answer. Source ingestion addresses only the absent-coverage cases; the false-grounding cases need
+their own measured routing or abstention work.
+
+One corpus-side gap remains open and needs backend ingestion plus a re-export: translation mismatch.
+The export is the World English Bible, so familiar KJV phrasings miss ("Let not your heart be
+troubled" scores 0.42 and retrieves Sirach, against a WEB text reading "Don't let your heart be
+troubled").
 Ordinary conversation generation stays fully deterministic (`topK: 1, temperature: 0`) even after
 the meta-commentary/hedging guard below. A brief experiment added modest sampling to help escape a
 hedge/clarification failure mode, but the direct fix (detecting that failure shape and retrying

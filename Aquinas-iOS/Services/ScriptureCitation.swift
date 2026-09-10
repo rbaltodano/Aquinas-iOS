@@ -21,6 +21,16 @@ nonisolated struct ScriptureCitation: Equatable {
     let chapter: Int
     /// Display form for prompt/citation text, e.g. "John 14".
     let displayName: String
+    /// A phrase in the source text at which this named passage begins. A chapter citation has no
+    /// anchor and therefore begins at the chapter opening.
+    let anchorText: String?
+
+    init(bookCode: String, chapter: Int, displayName: String, anchorText: String? = nil) {
+        self.bookCode = bookCode
+        self.chapter = chapter
+        self.displayName = displayName
+        self.anchorText = anchorText
+    }
 
     /// Book aliases mapped to the USFM codes used by the bundled World English Bible export.
     /// Ordered longest-first at lookup time so "1 john" wins over "john" in "1 John 2".
@@ -88,6 +98,7 @@ nonisolated struct ScriptureCitation: Equatable {
         ("lord's prayer", "MAT", 6, "Matthew 6"),
         ("lords prayer", "MAT", 6, "Matthew 6"),
         ("our father", "MAT", 6, "Matthew 6"),
+        ("teach us to pray", "LUK", 11, "Luke 11"),
         ("treasure in heaven", "MAT", 6, "Matthew 6"),
         ("golden rule", "MAT", 7, "Matthew 7"),
         ("great commission", "MAT", 28, "Matthew 28"),
@@ -145,6 +156,18 @@ nonisolated struct ScriptureCitation: Equatable {
         ("faith chapter", "HEB", 11, "Hebrews 11")
     ]
 
+    /// Some familiar passages begin after the opening chunk of their chapter. These anchors are
+    /// literal phrases from the bundled World English Bible and select that source text in reading
+    /// order; they are locations, never summaries or answers. The natural wording "teach us to
+    /// pray" likewise identifies the question-and-answer at the start of Luke 11.
+    private static let namedPassageAnchors: [String: String] = [
+        "lord's prayer": "our father in heaven",
+        "lords prayer": "our father in heaven",
+        "our father": "our father in heaven",
+        "teach us to pray": "lord, teach us to pray",
+        "good samaritan": "a certain man was going down from jerusalem to jericho"
+    ]
+
     /// Every citation named in `question`, most specific book name first. Returns an empty array
     /// for questions that merely mention a book without a chapter ("who wrote John?"), since
     /// those are topical and semantic search handles them correctly.
@@ -165,7 +188,8 @@ nonisolated struct ScriptureCitation: Equatable {
             let citation = ScriptureCitation(
                 bookCode: entry.code,
                 chapter: entry.chapter,
-                displayName: entry.display
+                displayName: entry.display,
+                anchorText: namedPassageAnchors[entry.name]
             )
             if !found.contains(citation) { found.append(citation) }
         }
