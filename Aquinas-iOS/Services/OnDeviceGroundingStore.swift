@@ -233,7 +233,12 @@ final class OnDeviceGroundingStore {
             }
         }
 
-        let permitsSourceTermMatch = sourceIDs != nil && !prioritizingTerms.isEmpty
+        // An exact source title identifies a document, not merely a semantic topic. When the
+        // caller has no remaining topic terms ("What is the Didache?"), the best passage inside
+        // that explicitly selected source is still safe grounding even if it misses the global
+        // floor. With topic terms, retain the narrower literal-term requirement so front matter
+        // cannot outrank the requested section.
+        let permitsNamedSourceLookup = sourceIDs != nil
         let ranked = candidateIndices.lazy
             .map { index in
                 let record = self.passages[index]
@@ -255,7 +260,9 @@ final class OnDeviceGroundingStore {
             // which exists to reject unrelated *global* matches such as Livy on "council".
             .filter {
                 $0.satisfiesRequiredTerms
-                    && ($0.distance <= threshold || (permitsSourceTermMatch && $0.matchedTerms > 0))
+                    && ($0.distance <= threshold
+                        || (permitsNamedSourceLookup
+                            && (prioritizingTerms.isEmpty || $0.matchedTerms > 0)))
             }
             .sorted {
                 if $0.matchedTerms != $1.matchedTerms {
