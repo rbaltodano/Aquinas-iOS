@@ -125,6 +125,19 @@ nonisolated final class MiniLMGroundingProvider: AquinasGroundingProviding {
                         ))
                     }
                 }
+                for route in SubjectSection.routes(in: question) {
+                    guard collected.count < limit else { break }
+                    for (offset, passage) in store.section(
+                        sourceIDs: route.sourceIDs,
+                        requiredTerms: route.sectionTerms,
+                        limit: limit - collected.count
+                    ).enumerated() {
+                        append(Self.reference(
+                            for: passage,
+                            id: "subject-section-\(passage.sourceID)-\(offset)"
+                        ))
+                    }
+                }
                 let namedSourceIDs = NamedCorpusSource.sourceIDs(in: question)
                 if !namedSourceIDs.isEmpty {
                     let sourceRankingQuery = NamedCorpusSource.rankingQuery(in: question)
@@ -269,6 +282,43 @@ private enum NamedCorpusSource {
         text.folding(
             options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX")
         ).lowercased()
+    }
+}
+
+/// Selects a primary text for a familiar moral subject when MiniLM's topical ranking misses the
+/// wording. Entries name only question terms and a literal phrase already in the bundled source;
+/// they are retrieval locations, never paraphrased answers.
+private enum SubjectSection {
+    private static let table: [(
+        questionTerms: Set<String>,
+        sourceIDs: Set<String>,
+        sectionTerms: Set<String>
+    )] = [
+        (
+            questionTerms: ["lie", "lying"],
+            sourceIDs: ["summa-theologica"],
+            sectionTerms: ["whether every lie is a sin"]
+        ),
+        (
+            questionTerms: ["forgive", "forgiveness"],
+            sourceIDs: ["web-bible"],
+            sectionTerms: ["if your brother sins against you"]
+        ),
+        (
+            questionTerms: ["trust"],
+            sourceIDs: ["summa-theologica"],
+            sectionTerms: ["knowledge revealed by god besides philosophical science"]
+        )
+    ]
+
+    static func routes(in question: String) -> [(sourceIDs: Set<String>, sectionTerms: Set<String>)] {
+        let words = Set(question.folding(
+            options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX")
+        ).lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init))
+        return table.compactMap { route in
+            guard !route.questionTerms.isDisjoint(with: words) else { return nil }
+            return (route.sourceIDs, route.sectionTerms)
+        }
     }
 }
 

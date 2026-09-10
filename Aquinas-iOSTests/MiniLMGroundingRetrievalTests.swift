@@ -123,6 +123,34 @@ struct MiniLMGroundingRetrievalTests {
         })
     }
 
+    @Test("A named document with no topic still uses its own source")
+    func didacheQuestionUsesDidacheSource() throws {
+        let provider = try MiniLMGroundingProvider()
+        let references = provider.references(for: "What is the Didache?", limit: 3)
+
+        #expect(references.contains {
+            $0.id.hasPrefix("source-didache-")
+                && $0.facts.localizedCaseInsensitiveContains("two ways")
+        })
+    }
+
+    @Test("Moral questions select their actual primary-text section")
+    func moralQuestionsUsePrimaryTextSections() throws {
+        let provider = try MiniLMGroundingProvider()
+        let checks = [
+            (question: "Is it ever okay to lie?", sourceText: "whether every lie is a sin"),
+            (question: "How do I forgive someone who hurt me?", sourceText: "if your brother sins against you"),
+            (question: "Why should I trust the Bible?", sourceText: "knowledge revealed by god")
+        ]
+        for check in checks {
+            let references = provider.references(for: check.question, limit: 3)
+            #expect(references.contains {
+                $0.id.hasPrefix("subject-section-")
+                    && $0.facts.localizedCaseInsensitiveContains(check.sourceText)
+            })
+        }
+    }
+
     @Test("Authority-section pointers select the primary-source formulation")
     func authoritySectionPointersSelectPrimaryText() throws {
         let provider = try MiniLMGroundingProvider()
