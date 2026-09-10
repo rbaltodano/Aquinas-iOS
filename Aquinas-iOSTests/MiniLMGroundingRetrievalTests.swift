@@ -200,4 +200,11 @@ struct MiniLMGroundingRetrievalTests {
         #expect(provider.references(for: "How do I bake sourdough bread?", limit: 3).isEmpty)
         #expect(provider.references(for: "What is the capital of Japan?", limit: 3).isEmpty)
     }
+
+    @Test("Questions outside the fixed corpus do not receive unrelated history as evidence")
+    func currentAndVaticanIIScopeReturnsNoGrounding() throws {
+        let provider = try MiniLMGroundingProvider()
+        #expect(provider.references(for: "Who is the current Pope?", limit: 3).isEmpty)
+        #expect(provider.references(for: "What did Vatican II teach about religious freedom?", limit: 3).isEmpty)
+    }
 }

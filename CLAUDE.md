@@ -34,8 +34,8 @@ exact source-plus-term hit is a document lookup and may be below the global
 semantic floor. It supplies no hand-written answer and leaves the 0.45/0.38
 relevance floors unchanged. The Trent case requires the actual Session VI,
 Chapter VII wording (“not remission of sins merely”), rather than a nearby
-heading. With that stricter evidence, the 65-case evaluation is **59/65
-(91%)**, including 9/10 church-history cases, 6/6 sacraments cases, and 4/4
+heading. With that stricter evidence, the 65-case evaluation is **61/65
+(94%)**, including 9/10 church-history cases, 6/6 sacraments cases, and 4/4
 catechism cases. The routing table is parsed from
 `MiniLMGroundingProvider.swift` by the evaluator so its behavior cannot silently
 diverge from the app. A second, narrower authority-section table resolves a
@@ -203,11 +203,11 @@ to ~86 MB, which is the correct trade for retrieval that works.
 Retrieval reliability is measured, not asserted: `Aquinas_Backend/evaluation/evaluate_retrieval.py`
 scores 65 questions against the real corpus and the real bundled Core ML model in seconds, with no
 device needed. The historical fixed-set baseline is **46/56 (82%) with the curated layer off**;
-the current expanded source-routing set is **59/65 (91%) under its stricter direct-evidence
+the current expanded source-routing set is **61/65 (94%) under its stricter direct-evidence
 checks**. The hand-written curated entries add
 only a few points on top, which is the honest measure of how little they generalize, so adding more
 of them is not a reliability strategy. Doctrine, sacraments, catechism, and creeds sit at 100%, church
-history at 90%, and scripture at 100%. Run the eval before and after any change to chunking, weighting, thresholds,
+history at 90%, scripture at 100%, and out-of-scope screening at 100%. Run the eval before and after any change to chunking, weighting, thresholds,
 or corpus contents.
 
 Scripture retrieval was 50% until named passages were resolved lexically. Three hypotheses were
@@ -228,10 +228,13 @@ anchor returns no citation rather than silently falling back to unrelated materi
 An explicit question about the resurrection of Jesus or Christ is similarly a Gospel-event location:
 it selects the opening resurrection chapters in all four Gospels, up to the normal passage limit.
 
-The remaining 6 measured misses have distinct causes: absent coverage for lying, forgiveness, the
-Didache, and Bible reliability; and false grounding for current-Pope and Vatican II questions. Do
-not mask any of these with a curated answer. Source ingestion addresses only the absent-coverage
-cases; the false-grounding cases need their own measured routing or abstention work.
+The remaining 4 measured misses are absent coverage for lying, forgiveness, the Didache, and Bible
+reliability. Do not mask any of these with a curated answer; they need source ingestion.
+
+Questions about the current Pope, Vatican II, or the Second Vatican Council have an explicit
+corpus-boundary check in `MiniLMGroundingProvider`. The fixed offline sources cannot substantiate
+them, so the provider returns no passages rather than presenting unrelated council history as
+evidence. This check supplies no response text and does not claim that the model knows the answer.
 
 One corpus-side gap remains open and needs backend ingestion plus a re-export: translation mismatch.
 The export is the World English Bible, so familiar KJV phrasings miss ("Let not your heart be

@@ -83,6 +83,7 @@ nonisolated final class MiniLMGroundingProvider: AquinasGroundingProviding {
         guard limit > 0,
               !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return [] }
+        guard !CorpusScope.excludes(question) else { return [] }
 
         var collected: [AquinasGroundingReference] = []
         var seenPassages: Set<String> = []
@@ -183,6 +184,22 @@ nonisolated final class MiniLMGroundingProvider: AquinasGroundingProviding {
             facts: passage.text,
             retrievalAliases: []
         )
+    }
+}
+
+/// The bundled sources end before Vatican II and contain no current ecclesial data. These are
+/// explicit corpus-boundary checks, not responses: they prevent unrelated historical passages from
+/// being presented as evidence for a question this fixed, offline corpus cannot substantiate.
+private enum CorpusScope {
+    static func excludes(_ question: String) -> Bool {
+        let normalized = question.folding(
+            options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX")
+        ).lowercased()
+        let words = Set(normalized.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init))
+        return (words.contains("current") && words.contains("pope"))
+            || normalized.contains("vatican ii")
+            || normalized.contains("vatican 2")
+            || normalized.contains("second vatican council")
     }
 }
 
