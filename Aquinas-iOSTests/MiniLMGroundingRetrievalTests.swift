@@ -69,6 +69,10 @@ struct MiniLMGroundingRetrievalTests {
             (
                 question: "What does the Our Father say?",
                 sourceText: "our father in heaven"
+            ),
+            (
+                question: "What do the Gospels say about the resurrection of Jesus?",
+                sourceText: "he isn't here, but is risen"
             )
         ]
 

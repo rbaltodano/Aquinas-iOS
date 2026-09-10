@@ -115,6 +115,17 @@ nonisolated struct ScriptureCitation: Equatable {
         ("nativity", "LUK", 2, "Luke 2"),
         ("christmas story", "LUK", 2, "Luke 2"),
         ("road to emmaus", "LUK", 24, "Luke 24"),
+        // The Gospel accounts open these chapters at the resurrection itself. Keep all four so a
+        // question about what the Gospels say is grounded in multiple witnesses, up to the
+        // provider's normal passage limit.
+        ("resurrection of jesus", "MAT", 28, "Matthew 28"),
+        ("resurrection of jesus", "MRK", 16, "Mark 16"),
+        ("resurrection of jesus", "LUK", 24, "Luke 24"),
+        ("resurrection of jesus", "JHN", 20, "John 20"),
+        ("resurrection of christ", "MAT", 28, "Matthew 28"),
+        ("resurrection of christ", "MRK", 16, "Mark 16"),
+        ("resurrection of christ", "LUK", 24, "Luke 24"),
+        ("resurrection of christ", "JHN", 20, "John 20"),
         ("prologue of john", "JHN", 1, "John 1"),
         ("word became flesh", "JHN", 1, "John 1"),
         ("born again", "JHN", 3, "John 3"),
