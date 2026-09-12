@@ -45,7 +45,8 @@ there when introducing logic with meaningful regression risk.
   Branch and conversation Canvas modes but hides while an Insight is hovered.
 - Cached contextual definitions must open immediately even while the model is occupied. Check the
   conversation/source cache before enqueueing a definition.
-- A direct definition request such as “What does X mean?” renders an in-text Insight. Saved terms
+- A direct definition request such as “What does X mean?” renders once as ordinary response prose.
+  Tapping an inline term in a substantive response opens its contextual definition. Saved terms
   deduplicate by normalized title and append a new context-definition entry when the same term is
   encountered with a different meaning.
 - Question of the Day generation is queued as `Consolidate information`, shows

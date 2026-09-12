@@ -191,11 +191,13 @@ final class LiteRTDeviceProbeModel {
             let context = ConversationContext(
                 transcript: [.user(question, nil, [])]
             )
+            let groundingProvider = try MiniLMGroundingProvider()
             let model = LiteRTAquinasModel(
                 runtime: runtime,
                 fallback: BackendAquinasModel(
                     baseURL: URL(string: "http://127.0.0.1:9")!
-                )
+                ),
+                groundingProvider: groundingProvider
             )
 
             phase = .generating

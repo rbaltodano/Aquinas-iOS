@@ -4,6 +4,7 @@
 //
 
 import SwiftUI
+import Combine
 import UniformTypeIdentifiers
 import UIKit
 import PhotosUI
@@ -173,6 +174,7 @@ struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable {
 
 enum AppPage: Equatable {
     case home
+    case library
     case conversation
     case openConversations
     case settings
@@ -181,6 +183,7 @@ enum AppPage: Equatable {
 }
 
 // MARK: - App Shell
+
 
 struct ContentView: View {
     @Environment(\.aquinasModel) private var aquinasModel
@@ -204,6 +207,8 @@ struct ContentView: View {
     @State private var suppressGlobalTreePromptUntilExternalModelCompletion: Bool = false
     @State private var activePage: AppPage = .home
     @State private var displayedPage: AppPage = .home
+    @State private var isLibraryReaderVisible = false
+    @State private var libraryNavigationRequest: LibraryNavigationRequest?
     @State private var hasAppliedStartupDestination = false
     @State private var appLockController = AppLockController()
     @State private var isPageContentVisible: Bool = true
@@ -462,6 +467,14 @@ struct ContentView: View {
             }
         case .conversation:
             EmptyView()
+        case .library:
+            if !isLibraryReaderVisible {
+                PageModelControls(
+                    modelTasks: modelTasks,
+                    popupState: modelTasksPopupState,
+                    alwaysShowModelStatus: true
+                )
+            }
         case .openConversations:
             PageModelControls(
                 modelTasks: modelTasks,
@@ -790,10 +803,6 @@ struct ContentView: View {
                                         requestedConversationID = conversation.id
                                         activePage = .conversation
                                     },
-                                    onNewConversation: {
-                                        newConversationRequest += 1
-                                        activePage = .conversation
-                                    },
                                     onStartQuestion: { dailyQuestion in
                                         pendingNewConversationQuestion = dailyQuestion.question
                                         pendingNewConversationEyebrow = "QUESTION OF THE DAY"
@@ -828,6 +837,8 @@ struct ContentView: View {
                             case .conversation:
                                 Color.clear
                                     .allowsHitTesting(false)
+                            case .library:
+                                libraryPage
                             case .openConversations:
                                 OpenConversationsView(
                                     conversations: sideMenuConversations,
@@ -1197,6 +1208,11 @@ struct ContentView: View {
                                 activePage = .home
                             }
                         },
+                        onOpenLibrary: {
+                            dismissGlobalSideMenu {
+                                activePage = .library
+                            }
+                        },
                         onOpenConversations: {
                             dismissGlobalSideMenu {
                                 activePage = .openConversations
@@ -1381,12 +1397,34 @@ struct ContentView: View {
         ) { _ in
             loadShellConversationState()
         }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .openGroundingSourceInLibrary)
+                .compactMap { $0.object as? LibraryNavigationRequest }
+        ) { request in
+            libraryNavigationRequest = request
+            activePage = .library
+        }
         .onChange(of: collectedDefinitions) { oldValue, newValue in
             InsightLibraryStore.save(newValue)
             guard activePage == .insights,
                   !suppressGlobalTreePromptUntilExternalModelCompletion else { return }
             isGlobalTreeUpdatePromptVisible = globalTreeNeedsUpdate
         }
+    }
+
+    private var libraryPage: some View {
+        LibraryView(
+            onOpenMenu: {
+                dismissKeyboard()
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                    isGlobalSideMenuOpen = true
+                }
+            },
+            modelTasks: modelTasks,
+            modelTasksPopupState: modelTasksPopupState,
+            onReaderVisibilityChange: { isLibraryReaderVisible = $0 },
+            navigationRequest: libraryNavigationRequest
+        )
     }
 
     /// Closes the panel before changing the view behind it, so its contents

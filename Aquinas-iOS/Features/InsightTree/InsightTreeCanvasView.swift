@@ -100,6 +100,10 @@ struct InsightTreeCanvasView: View {
     @State private var selectionRipples:   [RippleTrigger] = []
     @State private var hasAppeared:        Bool = false
     @State private var revealedInsightIDs: Set<UUID> = []
+    /// Connector lines for newly inserted Insights are intentionally staged after the chip
+    /// reveal. Existing lines are seeded here immediately; new lines are added by the entrance
+    /// sequence once the Insight's own animation has completed.
+    @State private var revealedInsightConnectorIDs: Set<UUID> = []
     @State private var revealedNodeIDs: Set<UUID> = []
     /// Stable topology baselines for live (non-persisted) trees. Reveal state is deliberately
     /// separate: an Insight can already belong to the tree while remaining hidden during its
@@ -379,9 +383,11 @@ struct InsightTreeCanvasView: View {
                     // Show the fallback tree without moving the camera or marking it as the
                     // persisted baseline. A completed backend load will do both.
                     revealedInsightIDs = visibleInsightIDs(in: nodes)
+                    revealedInsightConnectorIDs = visibleInsightIDs(in: nodes)
                     reportUndiscoveredInsightCount()
                 } else {
                     let newInsights = computeNewInsights()
+                    revealedInsightConnectorIDs.subtract(Set(newInsights.map(\.id)))
                     markUndiscovered(newInsights.map(\.id))   // new since last open → blue dot
                     reportUndiscoveredInsightCount()
                     saveAllInsightIDsAsSeen()
@@ -986,28 +992,30 @@ struct InsightTreeCanvasView: View {
         let hasSelection = !selectedCanvasTargets.isEmpty
         // Placed-midpoint chips sit on the node itself, so they have no orbit connectors.
         let connectorNodes = displayNodes.filter { !placedMidpointNodeIDs.contains($0.id) }
-        ForEach(connectorNodes) { node in
+        ForEach(connectorNodes, id: \.id) { node in
             let visibleInsights = canvasInsights(for: node)
             ForEach(Array(visibleInsights.enumerated()), id: \.element.id) { index, insight in
-                let start = depthScreenPosition(node.position, nodeID: node.id, camera: camera, size: size)
-                let end = depthScreenPosition(
-                    insightWorldPosition(for: node, index: index, count: visibleInsights.count),
-                    nodeID: node.id,
-                    camera: camera,
-                    size: size
-                )
-                // Connector lines stay at a constant opacity regardless of zoom — only the
-                // chip label/background fade with `labelOpacity`, not the lines themselves.
-                let baseOpacity = 0.55
-
-                AnimatableLine(start: start, end: end)
-                    .stroke(
-                        AquinasTheme.Colors.divider.opacity(baseOpacity * (hasSelection ? 0.5 : 1.0)),
-                        style: StrokeStyle(lineWidth: 1, lineCap: .round)
+                if revealedInsightConnectorIDs.contains(insight.id) {
+                    let start = depthScreenPosition(node.position, nodeID: node.id, camera: camera, size: size)
+                    let end = depthScreenPosition(
+                        insightWorldPosition(for: node, index: index, count: visibleInsights.count),
+                        nodeID: node.id,
+                        camera: camera,
+                        size: size
                     )
-                    .frame(width: size.width, height: size.height)
-                    .allowsHitTesting(false)
-                    .animation(.easeInOut(duration: 0.22), value: hasSelection)
+                    // Connector lines stay at a constant opacity regardless of zoom — only the
+                    // chip label/background fade with `labelOpacity`, not the lines themselves.
+                    let baseOpacity = 0.55
+
+                    InsightConnectorLine(
+                        start: start,
+                        end: end,
+                        color: AquinasTheme.Colors.divider.opacity(baseOpacity * (hasSelection ? 0.5 : 1.0))
+                    )
+                        .frame(width: size.width, height: size.height)
+                        .allowsHitTesting(false)
+                        .animation(.easeInOut(duration: 0.22), value: hasSelection)
+                }
             }
         }
     }
@@ -2824,6 +2832,9 @@ struct InsightTreeCanvasView: View {
         let newInsights = nodes.flatMap { node in
             canvasInsights(for: node).filter { newInsightIDs.contains($0.id) }
         }
+        // Clear these before the asynchronous camera/reveal sequence begins. This prevents a
+        // connector from the previous topology from remaining visible during the camera scroll.
+        revealedInsightConnectorIDs.subtract(newInsightIDs)
         confirmedPersistedInsightIDs = currentInsightIDs
         confirmedPersistedNodeIDs = currentNodeIDs
         undiscoveredInsightIDs.formUnion(loadUndiscoveredInsightIDs())
@@ -2831,6 +2842,7 @@ struct InsightTreeCanvasView: View {
 
         guard !newInsights.isEmpty || !newNodeIDs.isEmpty else {
             revealedInsightIDs = currentInsightIDs
+            revealedInsightConnectorIDs = currentInsightIDs
             revealedNodeIDs = currentNodeIDs
             saveAllInsightIDsAsSeen()
             reportUndiscoveredInsightCount()
@@ -2875,7 +2887,14 @@ struct InsightTreeCanvasView: View {
         let allInsightIDs = visibleInsightIDs(in: nodes)
         let allNodeIDs = Set(nodes.map(\.id))
         revealedInsightIDs = allInsightIDs.subtracting(insightIDs)
+        revealedInsightConnectorIDs = allInsightIDs.subtracting(insightIDs)
         revealedNodeIDs = allNodeIDs.subtracting(newNodeIDs)
+
+        // The topology callback can arrive before the simulation has reconciled the new nodes.
+        // Give the layout a beat to create/settle their bodies before resolving camera targets;
+        // otherwise positionedTargets is empty and the post-update camera tour is skipped.
+        try? await Task.sleep(for: .milliseconds(200))
+        guard !Task.isCancelled else { return }
 
         let targets: [Target] =
             nodes.filter { newNodeIDs.contains($0.id) }.map { Target.node($0.id) }
@@ -2897,13 +2916,10 @@ struct InsightTreeCanvasView: View {
         }
         guard !positionedTargets.isEmpty else {
             revealedInsightIDs = allInsightIDs
+            revealedInsightConnectorIDs = allInsightIDs
             revealedNodeIDs = allNodeIDs
             return
         }
-
-        // Give the user one beat to register the newly settled topology before the tour.
-        try? await Task.sleep(for: .milliseconds(200))
-        guard !Task.isCancelled else { return }
 
         if positionedTargets.count <= 3 {
             for (target, position) in positionedTargets {
@@ -2916,6 +2932,13 @@ struct InsightTreeCanvasView: View {
                 case .insight(let insight):
                     _ = withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
                         revealedInsightIDs.insert(insight.id)
+                    }
+                    // Let the chip's spring finish before introducing its connector. The line
+                    // view then animates its own trim from the related Node toward the Insight.
+                    try? await Task.sleep(for: .milliseconds(620))
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.easeInOut(duration: 0.62)) {
+                        revealedInsightConnectorIDs.insert(insight.id)
                     }
                 case .node(let nodeID):
                     _ = withAnimation(.easeOut(duration: 0.22)) {
@@ -2936,6 +2959,13 @@ struct InsightTreeCanvasView: View {
             withAnimation(.easeOut(duration: 0.22)) {
                 revealedNodeIDs.formUnion(newNodeIDs)
                 revealedInsightIDs.formUnion(insightIDs)
+            }
+            // The group reveal uses the same post-chip delay, so all new connectors enter
+            // together after the Insights have fully animated in.
+            try? await Task.sleep(for: .milliseconds(620))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.62)) {
+                revealedInsightConnectorIDs.formUnion(insightIDs)
             }
             let center = CGPoint(
                 x: positions.map(\.x).reduce(0, +) / CGFloat(positions.count),
@@ -3095,10 +3125,12 @@ struct InsightTreeCanvasView: View {
         try? await Task.sleep(nanoseconds: 250_000_000)
         guard !Task.isCancelled else { return }
         revealedInsightIDs = nonNewIDs
+        revealedInsightConnectorIDs = nonNewIDs
 
         if newInsights.isEmpty {
             // Nothing new — reveal everything at the stagger point and we're done.
             revealedInsightIDs = allIDs
+            revealedInsightConnectorIDs = allIDs
             return
         }
 
@@ -3116,6 +3148,9 @@ struct InsightTreeCanvasView: View {
                 _ = withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
                     revealedInsightIDs.insert(insight.id)
                 }
+                try? await Task.sleep(nanoseconds: 620_000_000)
+                guard !Task.isCancelled else { return }
+                revealedInsightConnectorIDs.insert(insight.id)
                 // Fire a ripple from this insight's world position as it springs in.
                 if let worldPos = worldPosition(forInsightID: insight.id) {
                     rippleTrigger = RippleTrigger(worldOrigin: worldPos,
@@ -3132,6 +3167,9 @@ struct InsightTreeCanvasView: View {
             withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
                 revealedInsightIDs.formUnion(newIDs)
             }
+            try? await Task.sleep(nanoseconds: 620_000_000)
+            guard !Task.isCancelled else { return }
+            revealedInsightConnectorIDs.formUnion(newIDs)
             // Single ripple at the centroid of all new insights.
             let positions = newInsights.compactMap { worldPosition(forInsightID: $0.id) }
             if !positions.isEmpty {
@@ -3237,6 +3275,32 @@ private struct AnimatableLine: Shape {
             path.move(to: start)
             path.addLine(to: end)
         }
+    }
+}
+
+/// A connector that reveals from its related Node toward the newly revealed Insight.
+private struct InsightConnectorLine: View {
+    var start: CGPoint
+    var end: CGPoint
+    var color: Color
+    @State private var drawProgress: CGFloat = 0
+
+    init(start: CGPoint, end: CGPoint, color: Color) {
+        self.start = start
+        self.end = end
+        self.color = color
+    }
+
+    var body: some View {
+        AnimatableLine(start: start, end: end)
+            .trim(from: 0, to: drawProgress)
+            .stroke(color, style: StrokeStyle(lineWidth: 1, lineCap: .round))
+            .onAppear {
+                drawProgress = 0
+                withAnimation(.easeInOut(duration: 0.62)) {
+                    drawProgress = 1
+                }
+            }
     }
 }
 

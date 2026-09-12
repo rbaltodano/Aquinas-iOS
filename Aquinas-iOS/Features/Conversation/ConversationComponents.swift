@@ -223,6 +223,10 @@ struct ChatThreadColumn: View {
     @State private var modelQueuedResponseIndices: Set<Int> = []
     @State private var responseThinkingIntroByIndex: [Int: Bool] = [:]
     @State private var responseThinkingSummaryByIndex: [Int: [String]] = [:]
+    /// Retrieved grounding passages per response index, held from the moment retrieval finishes
+    /// so the loading state can show them, then persisted onto the response presentation so
+    /// **Show Thinking** can list the same sources again later.
+    @State private var responseGroundingSourcesByIndex: [Int: [GroundingSourceSummary]] = [:]
     @State private var responseRevealGatesByIndex: [Int: ResponseRevealGate] = [:]
     @State private var pendingGeneratedTitleQuestion: String? = nil
     @State private var localConnectionConcepts: [ConceptDefinition]?
@@ -433,6 +437,7 @@ struct ChatThreadColumn: View {
         }
         responseThinkingIntroByIndex[responseIndex] = thinkingEnabled
         responseThinkingSummaryByIndex.removeValue(forKey: responseIndex)
+        responseGroundingSourcesByIndex.removeValue(forKey: responseIndex)
         branchData.removeResponsePresentation(at: responseIndex)
         onResponseStarted()
         withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
@@ -507,6 +512,8 @@ struct ChatThreadColumn: View {
                     break
                 case .thinkingSummary(let summary):
                     responseThinkingSummaryByIndex[responseIndex] = summary
+                case .groundingSources(let sources):
+                    responseGroundingSourcesByIndex[responseIndex] = sources
                 case .responseText(let streamedText):
                     // Keep the network stream buffered until the backend returns the
                     // fully annotated response. This prevents unannotated text from
@@ -536,10 +543,15 @@ struct ChatThreadColumn: View {
                 ? response.thinkingSummary
                 : []
             responseThinkingSummaryByIndex[responseIndex] = persistedThinkingSummary
+            let persistedGroundingSources = thinkingEnabled
+                ? responseGroundingSourcesByIndex[responseIndex] ?? []
+                : []
             let completedPresentation = ResponsePresentationMetadata(
                 responseIndex: responseIndex,
                 showsThinking: thinkingEnabled && !persistedThinkingSummary.isEmpty,
-                thinkingSummary: persistedThinkingSummary
+                thinkingSummary: persistedThinkingSummary,
+                groundingSources: persistedGroundingSources,
+                evidenceBasis: response.evidenceBasis
             )
             branchData.setResponsePresentation(completedPresentation)
             withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
@@ -589,6 +601,7 @@ struct ChatThreadColumn: View {
         animatedResponseIndices.remove(responseIndex)
         responseThinkingIntroByIndex.removeValue(forKey: responseIndex)
         responseThinkingSummaryByIndex.removeValue(forKey: responseIndex)
+        responseGroundingSourcesByIndex.removeValue(forKey: responseIndex)
 
         guard branchData.activeChatBlocks.indices.contains(responseIndex) else {
             onResponseCancelled()
@@ -618,6 +631,7 @@ struct ChatThreadColumn: View {
         streamingResponseIndices.remove(responseIndex)
         responseThinkingIntroByIndex.removeValue(forKey: responseIndex)
         responseThinkingSummaryByIndex.removeValue(forKey: responseIndex)
+        responseGroundingSourcesByIndex.removeValue(forKey: responseIndex)
         branchData.removeResponsePresentation(at: responseIndex)
 
         guard branchData.activeChatBlocks.indices.contains(responseIndex) else {
@@ -809,10 +823,20 @@ struct ChatThreadColumn: View {
             ?? true
     }
 
+    private func responseGroundingSources(at index: Int) -> [GroundingSourceSummary] {
+        responseGroundingSourcesByIndex[index]
+            ?? branchData.responsePresentation(at: index)?.groundingSources
+            ?? []
+    }
+
     private func responseThinkingSummary(at index: Int) -> [String] {
         responseThinkingSummaryByIndex[index]
             ?? branchData.responsePresentation(at: index)?.thinkingSummary
             ?? []
+    }
+
+    private func responseEvidenceBasis(at index: Int) -> ResponseEvidenceBasis? {
+        branchData.responsePresentation(at: index)?.evidenceBasis
     }
 
     private func quotedConceptMatchID(
@@ -1221,6 +1245,8 @@ struct ChatThreadColumn: View {
                                 isQueuedForModel: isResponseQueued(at: index),
                                 usesNetworkStream: false,
                                 thinkingSummary: responseThinkingSummary(at: index),
+                                groundingSources: responseGroundingSources(at: index),
+                                evidenceBasis: responseEvidenceBasis(at: index),
                                 funStatusText: funStatusText(for: index),
                                 targetSpawnY: $targetSpawnY,
                                 targetSpawnResponseIndex: $targetSpawnResponseIndex,
@@ -1609,6 +1635,8 @@ struct TrackedResponseCard: View {
     let isQueuedForModel: Bool
     let usesNetworkStream: Bool
     let thinkingSummary: [String]
+    let groundingSources: [GroundingSourceSummary]
+    let evidenceBasis: ResponseEvidenceBasis?
     let funStatusText: String?
     @Binding var targetSpawnY: CGFloat
     @Binding var targetSpawnResponseIndex: Int?
@@ -1656,6 +1684,8 @@ struct TrackedResponseCard: View {
             isQueuedForModel: isQueuedForModel,
             usesNetworkStream: usesNetworkStream,
             thinkingSummary: thinkingSummary,
+            groundingSources: groundingSources,
+            evidenceBasis: evidenceBasis,
             funStatusText: funStatusText,
             responseTextAlignment: responseTextAlignment,
             responseFont: responseFont,

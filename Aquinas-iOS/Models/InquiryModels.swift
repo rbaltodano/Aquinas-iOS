@@ -83,6 +83,14 @@ struct ResponsePresentationMetadata: Codable, Equatable {
     let responseIndex: Int
     let showsThinking: Bool
     let thinkingSummary: [String]
+    /// The passages retrieval actually supplied for this answer, kept so **Show Thinking** can
+    /// list them again after the fact. Optional because synthesized `Codable` decoding fails on a
+    /// missing key rather than falling back to a property's default value, so presentations
+    /// persisted before this field existed would otherwise stop decoding.
+    var groundingSources: [GroundingSourceSummary]? = nil
+    /// A small provenance disclosure for ordinary no-source answers. Optional so saved
+    /// conversations written before this existed continue to decode.
+    var evidenceBasis: ResponseEvidenceBasis? = nil
 }
 
 /// A saved top-level conversation canvas. This is in-memory prototype persistence.

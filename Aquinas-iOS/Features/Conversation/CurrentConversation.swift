@@ -164,7 +164,6 @@ struct CurrentConversationView: View {
     @State private var commandToInsert: String = ""
     @State private var insertCommandRequest: Int = 0
     @State private var isCompactingContext: Bool = false
-    @State private var isCompactionConfirmationPresented: Bool = false
     @State private var isCompactionErrorPresented: Bool = false
     @State private var undiscoveredInsightCount: Int = 0
     @State private var persistedTreeRefreshRequest: Int = 0
@@ -324,6 +323,20 @@ struct CurrentConversationView: View {
               responseIndex < branch.activeChatBlocks.count,
               case .text(let responseText) = branch.activeChatBlocks[responseIndex],
               let question = precedingQuestion(in: branch, before: responseIndex) else {
+            return
+        }
+
+        // A corpus-scope abstention contains no claim to organize. In particular, do not let a
+        // later "take a guess" follow-up turn turn missing evidence into a durable tree subject.
+        guard !LiteRTAquinasModel.isCorpusScopeAbstention(
+            InlineInsightMarkup.plainText(from: responseText)
+        ) else {
+            return
+        }
+
+        // General-knowledge conversation is intentionally transient. It should remain a normal
+        // exchange, without turning a model-only answer into a durable Insight Tree subject.
+        guard branch.responsePresentation(at: responseIndex)?.evidenceBasis != .generalKnowledge else {
             return
         }
 
@@ -1093,11 +1106,6 @@ struct CurrentConversationView: View {
         }
         .safeAreaInset(edge: .bottom) {
             bottomInquiryControlDock
-        }
-        .alert("Context compacted", isPresented: $isCompactionConfirmationPresented) {
-            Button("OK", role: .cancel) { }
-        } message: {
-            Text("Earlier turns were condensed for the model. Your visible conversation is unchanged.")
         }
         .alert("Couldn’t compact context", isPresented: $isCompactionErrorPresented) {
             Button("OK", role: .cancel) { }
@@ -1939,8 +1947,10 @@ struct CurrentConversationView: View {
             min(compactedThroughBlockCount, activeBranches[currentIndex].activeChatBlocks.count)
         saveCurrentConversation()
         persistConversations()
+        // Compaction succeeds silently: the context gauge drops immediately, which is the
+        // feedback that matters. A full-screen confirmation interrupts the conversation to
+        // report something the user can already see. Failure still alerts.
         refreshDisplayedContextWordCount()
-        isCompactionConfirmationPresented = true
         return true
     }
 

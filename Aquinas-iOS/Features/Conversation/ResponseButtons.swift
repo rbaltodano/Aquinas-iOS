@@ -11,6 +11,7 @@ import UIKit
 /// The compact disclaimer and copy control shown beneath every completed model response.
 struct ModelResponseFooter: View {
     let copyText: String
+    var evidenceBasis: ResponseEvidenceBasis? = nil
     var responseTextAlignment: ResponseTextAlignmentOption = .left
     var onRegenerate: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil

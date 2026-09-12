@@ -19,7 +19,6 @@ struct HomeDashboardView: View {
     let yourQuote: YourQuoteCard?
     var onOpenMenu: () -> Void
     var onSelectConversation: (InquiryConversation) -> Void
-    var onNewConversation: () -> Void
     var onStartQuestion: (HomeQuestionOfTheDay) -> Void
     var onOpenInsightBridge: (UUID, UUID) -> Void
     var onFocusNode: (UUID) -> Void = { _ in }
@@ -96,8 +95,7 @@ struct HomeDashboardView: View {
                                 HomeDashboardContent.insights(for: $0, savedInsights: savedInsights)
                             } ?? [],
                             onSelectConversation: onSelectConversation,
-                            onOpenInsight: { activeInsight = $0 },
-                            onNewConversation: onNewConversation
+                            onOpenInsight: { activeInsight = $0 }
                         )
 
                         HomeFigmaDivider()
@@ -141,7 +139,9 @@ struct HomeDashboardView: View {
                             HomeFigmaDivider()
                         }
 
-                        HomeFigmaReadingSection(items: Array(HomeDashboardContent.furtherStudyItems.prefix(3)))
+                        HomeFigmaReadingSection(
+                            items: HomeDashboardContent.recommendedReading(from: regularConversations)
+                        )
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -275,7 +275,6 @@ private struct HomeFigmaResumeSection: View {
     let insights: [ConceptDefinition]
     var onSelectConversation: (InquiryConversation) -> Void
     var onOpenInsight: (ConceptDefinition) -> Void
-    var onNewConversation: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
@@ -290,8 +289,6 @@ private struct HomeFigmaResumeSection: View {
                     onSelect: { onSelectConversation(conversation) },
                     onOpenInsight: onOpenInsight
                 )
-            } else {
-                HomeFigmaEmptyConversationCard(action: onNewConversation)
             }
         }
     }
@@ -302,11 +299,22 @@ private struct HomeFigmaReadingSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
-            HomeFigmaSectionTitle("Reading Material")
+            HomeFigmaSectionTitle("Read Material")
 
             VStack(alignment: .leading, spacing: 24) {
                 ForEach(items) { item in
-                    HomeFigmaReadingRow(item: item)
+                    Button {
+                        NotificationCenter.default.post(
+                            name: .openGroundingSourceInLibrary,
+                            object: LibraryNavigationRequest(
+                                sourceTitle: item.title,
+                                sourceName: item.author
+                            )
+                        )
+                    } label: {
+                        HomeFigmaReadingRow(item: item)
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
@@ -631,34 +639,6 @@ private struct HomeFigmaStat: View {
     }
 }
 
-private struct HomeFigmaEmptyConversationCard: View {
-    var action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Begin a line of inquiry")
-                    .font(AquinasTheme.Typography.uiSubheading)
-                    .foregroundColor(AquinasTheme.Colors.primaryReadable)
-
-                Text("Ask a question, save insights, and build a study path from the first response.")
-                    .font(AquinasTheme.Typography.body)
-                    .foregroundColor(AquinasTheme.Colors.paragraphText)
-                    .lineSpacing(7)
-            }
-            .padding(24)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(AquinasTheme.Colors.canvasSecondary)
-            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 28, style: .continuous)
-                    .stroke(AquinasTheme.Colors.quietBorder, lineWidth: 1)
-            )
-        }
-        .buttonStyle(.plain)
-    }
-}
-
 private struct HomeFigmaReadingRow: View {
     let item: FurtherStudyItem
 
@@ -748,6 +728,49 @@ private enum HomeDashboardContent {
             reason: "A concise doctrinal reference when a question needs firm coordinates."
         )
     ]
+
+    /// Ranks the library works that have actually grounded answers across the user's
+    /// conversations. Because response presentations are persisted with each conversation,
+    /// this naturally updates as new questions are answered without another background job.
+    static func recommendedReading(from conversations: [InquiryConversation]) -> [FurtherStudyItem] {
+        let sourceGroups = conversations
+            .flatMap { conversation in
+                conversation.branches.flatMap { branch in
+                    (branch.responsePresentations ?? []).flatMap { presentation in
+                        presentation.groundingSources ?? []
+                    }
+                }
+            }
+            .reduce(into: [String: (source: GroundingSourceSummary, count: Int)]()) { result, source in
+                let key = source.id.isEmpty ? source.title.lowercased() : source.id
+                if let current = result[key] {
+                    result[key] = (current.source, current.count + 1)
+                } else {
+                    result[key] = (source, 1)
+                }
+            }
+
+        let ranked = sourceGroups.values
+            .sorted {
+                if $0.count != $1.count { return $0.count > $1.count }
+                return $0.source.title.localizedCaseInsensitiveCompare($1.source.title) == .orderedAscending
+            }
+            .prefix(3)
+            .map { entry in
+                FurtherStudyItem(
+                    category: "Suggested for you",
+                    title: entry.source.title,
+                    author: entry.source.sourceName,
+                    reason: entry.count == 1
+                        ? "Referenced in one of your recent answers."
+                        : "Referenced (entry.count) times across your conversations."
+                )
+            }
+
+        return ranked.count == 3
+            ? Array(ranked)
+            : Array((Array(ranked) + furtherStudyItems).prefix(3))
+    }
 
     nonisolated private static let dailyQuestions: [String] = [
         "What does it mean for knowledge to become wisdom?",

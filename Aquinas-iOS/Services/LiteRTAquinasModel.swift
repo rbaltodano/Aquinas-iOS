@@ -143,8 +143,118 @@ struct LiteRTAquinasModel: AquinasModel {
         factualAccuracyAuditNeeded(for: question)
     }
 
+    /// The corpus is required for claims that need a verifiable source. Ordinary definitions,
+    /// reflections, practical discussion, and hypotheticals are allowed to use the model's
+    /// general knowledge when retrieval has no relevant passage.
+    static func requiresCorpusEvidence(_ question: String) -> Bool {
+        let normalized = question
+            .folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return false }
+
+        if let definitionTerm = definitionRequestTerm(in: [.user(question, nil, [])]),
+           requiresSpecialistDefinitionEvidence(definitionTerm) {
+            return true
+        }
+
+        let sourceDependentTerms = [
+            "quote", "quotation", "according to", "citation", "source", "authorship",
+            "author", "wrote", "written by", "date", "year", "century", "how many",
+            "current", "latest", "today", "council", "nicaea", "chalcedon", "trent",
+            "creed", "catechism", "canon", "scripture", "bible", "gospel", "chapter",
+            "verse", "summa", "didache", "encyclical", "document", "decree", "history",
+            "historical", "war", "battle", "revolution", "empire", "reign", "happened",
+            "occurred"
+        ]
+        if sourceDependentTerms.contains(where: normalized.contains) {
+            return true
+        }
+
+        if normalized.hasPrefix("who was ")
+            || normalized.hasPrefix("who is ")
+            || normalized.hasPrefix("when did ")
+            || normalized.hasPrefix("when was ")
+            || normalized.hasPrefix("where did ")
+            || normalized.hasPrefix("where was ") {
+            return true
+        }
+
+        return false
+    }
+
+    /// The compact on-device model is reliable for ordinary definitions, but not for unfamiliar,
+    /// highly technical labels when retrieval has no direct evidence. Require a passage for those
+    /// terms rather than presenting a fluent invented definition as knowledge.
+    static func requiresSpecialistDefinitionEvidence(_ term: String) -> Bool {
+        let words = term.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        guard words.count == 1, let word = words.first else { return false }
+        let normalized = word.lowercased()
+        return normalized.count >= 16
+            || (normalized.count >= 12 && normalized.hasSuffix("ism"))
+    }
+
     static func isAuditMetaCommentary(_ text: String) -> Bool {
         looksLikeAuditMetaCommentary(text)
+    }
+
+    /// A fixed-corpus abstention is not an answer and must never become an Insight Tree subject.
+    static func isCorpusScopeAbstention(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines) == corpusScopeAbstentionText
+    }
+
+    /// A Question of the Day is stored as a leading user prompt, followed immediately by the
+    /// person's reflective reply. The reply alone is often personal language with little source
+    /// vocabulary ("I should be more gracious"), so retrieve from the whole prompt-and-reply
+    /// exchange. Ordinary turns alternate user/model blocks and still retrieve from the latest
+    /// question alone, preserving the corpus-scope abstention for unrelated questions.
+    static func groundingQuery(for context: ConversationContext) -> String {
+        guard let latestIndex = context.transcript.lastIndex(where: { block in
+            if case .user = block { return true }
+            return false
+        }),
+        case .user(let latestQuestion, _, _) = context.transcript[latestIndex] else {
+            return ""
+        }
+
+        let latest = latestQuestion.trimmed
+        guard latestIndex > 0,
+              case .user(let precedingPrompt, _, _) = context.transcript[latestIndex - 1]
+        else {
+            return latest
+        }
+
+        let prompt = precedingPrompt.trimmed
+        guard !prompt.isEmpty else { return latest }
+        return "\(prompt)\n\n\(latest)"
+    }
+
+    /// For a definition, accept semantic retrieval only if a passage explicitly names the term.
+    /// This is a per-answer evidence check; it does not change retrieval thresholds or floors.
+    static func definitionEvidence(
+        for term: String,
+        in references: [AquinasGroundingReference]
+    ) -> [AquinasGroundingReference] {
+        let normalizedTerm = normalizedDefinitionEvidenceText(term)
+        guard !normalizedTerm.isEmpty else { return [] }
+        return references.filter { reference in
+            normalizedDefinitionEvidenceText(
+                "\(reference.title) \(reference.facts)"
+            )
+            .contains(normalizedTerm)
+        }
+    }
+
+    private static func normalizedDefinitionEvidenceText(_ text: String) -> String {
+        text.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        .lowercased()
+        .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func respond(to context: ConversationContext) async -> ModelResponse {
@@ -168,45 +278,77 @@ struct LiteRTAquinasModel: AquinasModel {
             onUpdate(.generationStarted)
             let latestQuestion = Self.latestUserQuestion(in: context.transcript)
             let groundingReferences = groundingProvider.references(
-                for: latestQuestion,
+                for: Self.groundingQuery(for: context),
                 limit: 3
             )
-            let authorityEvidenceFirst = Self.hasAuthoritySectionReference(groundingReferences)
+            let requestedDefinitionTerm = Self.requestedDefinitionTerm(in: context.transcript)
+            // A semantic near-match is not evidence that a passage actually defines the requested
+            // term. Retrieval still runs, but ordinary definitions use general knowledge unless a
+            // returned passage explicitly names the term.
+            let responseReferences = requestedDefinitionTerm.map {
+                Self.definitionEvidence(for: $0, in: groundingReferences)
+            } ?? groundingReferences
+            let evidenceBasis: ResponseEvidenceBasis = responseReferences.isEmpty
+                ? .generalKnowledge
+                : .corpusGrounded
+            guard !responseReferences.isEmpty || !Self.requiresCorpusEvidence(latestQuestion) else {
+                let response = ModelResponse(
+                    text: Self.corpusScopeAbstentionText,
+                    thinkingSummary: thinkingEnabled ? [
+                        "No relevant passage was found in the texts loaded on this device."
+                    ] : [],
+                    evidenceBasis: .sourceRequired
+                )
+                if thinkingEnabled, !response.thinkingSummary.isEmpty {
+                    onUpdate(.thinkingSummary(response.thinkingSummary))
+                }
+                onUpdate(.responseText(response.text))
+                return response
+            }
+            let authorityEvidenceFirst = Self.hasAuthoritySectionReference(responseReferences)
             // Retrieval finishes before generation even starts, so surface it
             // immediately — real activity to look at during the slow part
             // (generation), not a decorative placeholder.
             let fallbackThinkingSummary: [String] = thinkingEnabled
                 ? Self.publicApproachSummary(for: context) + Self.groundingSourceSummary(
-                    for: groundingReferences
+                    for: responseReferences
                 )
                 : []
             if thinkingEnabled, !fallbackThinkingSummary.isEmpty {
                 onUpdate(.thinkingSummary(fallbackThinkingSummary))
             }
+            if thinkingEnabled, !responseReferences.isEmpty {
+                onUpdate(
+                    .groundingSources(
+                        Self.groundingSourceDetails(for: responseReferences)
+                    )
+                )
+            }
             if let verifiedResponse = Self.verifiedGroundedResponse(
                 for: latestQuestion,
-                references: groundingReferences,
+                references: responseReferences,
                 thinkingEnabled: thinkingEnabled
             ) {
-                if thinkingEnabled, !verifiedResponse.thinkingSummary.isEmpty {
-                    onUpdate(.thinkingSummary(verifiedResponse.thinkingSummary))
+                let response = verifiedResponse.withEvidenceBasis(.corpusGrounded)
+                if thinkingEnabled, !response.thinkingSummary.isEmpty {
+                    onUpdate(.thinkingSummary(response.thinkingSummary))
                 }
-                onUpdate(.responseText(verifiedResponse.text))
-                return verifiedResponse
+                onUpdate(.responseText(response.text))
+                return response
             }
-            if let term = Self.requestedDefinitionTerm(
-                in: context.transcript
-            ) {
+            if let term = requestedDefinitionTerm {
                 let definition = try await generateDefinition(
                     term,
-                    context: context
+                    context: context,
+                    references: responseReferences
                 )
                 try Task.checkCancellation()
                 let response = ModelResponse(
                     text: definition.meaning,
                     thinkingSummary: fallbackThinkingSummary,
-                    keyTerms: [KeyTerm(displayText: definition.word)],
-                    insight: definition
+                    keyTerms: [],
+                    insight: nil,
+                    evidenceBasis: evidenceBasis
                 )
                 if thinkingEnabled, !response.thinkingSummary.isEmpty {
                     onUpdate(.thinkingSummary(response.thinkingSummary))
@@ -230,7 +372,7 @@ struct LiteRTAquinasModel: AquinasModel {
                     )
                     : context,
                 explicitCorrection: correction,
-                groundingReferences: groundingReferences
+                groundingReferences: responseReferences
             )
             var raw = try await runtime.generate(
                 systemInstruction: systemInstruction,
@@ -311,14 +453,16 @@ struct LiteRTAquinasModel: AquinasModel {
                     from: Self.plainConversationText(from: raw)
                 )
             }
-            if Self.factualAccuracyAuditNeeded(for: latestQuestion) || authorityEvidenceFirst {
+            if !responseReferences.isEmpty,
+               Self.factualAccuracyAuditNeeded(for: latestQuestion),
+               !authorityEvidenceFirst {
                 do {
                     let audited = try await accuracyAuditedResponse(
                         question: latestQuestion,
                         draft: Self.plainConversationText(from: raw),
                         references: authorityEvidenceFirst
-                            ? groundingReferences.filter { $0.id.hasPrefix("authority-section-") }
-                            : groundingReferences,
+                            ? responseReferences.filter { $0.id.hasPrefix("authority-section-") }
+                            : responseReferences,
                         requiresPrimarySourceFaithfulness: authorityEvidenceFirst,
                         personality: context.personality
                     )
@@ -351,7 +495,8 @@ struct LiteRTAquinasModel: AquinasModel {
             return ModelResponse(
                 text: responseText,
                 thinkingSummary: fallbackThinkingSummary,
-                keyTerms: keyTerms
+                keyTerms: responseReferences.isEmpty ? [] : keyTerms,
+                evidenceBasis: evidenceBasis
             )
         } catch {
             guard !Task.isCancelled else {
@@ -409,7 +554,11 @@ struct LiteRTAquinasModel: AquinasModel {
         in context: ConversationContext
     ) async throws -> ConceptDefinition {
         do {
-            return try await generateDefinition(term, context: context)
+            return try await generateDefinition(
+                term,
+                context: context,
+                references: definitionReferences(for: term, context: context)
+            )
         } catch {
             if Task.isCancelled { throw CancellationError() }
             guard canUseBackendFallback else { throw error }
@@ -423,7 +572,11 @@ struct LiteRTAquinasModel: AquinasModel {
         conversationID: UUID?
     ) async throws -> ConceptDefinition {
         do {
-            return try await generateDefinition(term, context: context)
+            return try await generateDefinition(
+                term,
+                context: context,
+                references: definitionReferences(for: term, context: context)
+            )
         } catch {
             if Task.isCancelled { throw CancellationError() }
             guard canUseBackendFallback else { throw error }
@@ -634,9 +787,13 @@ struct LiteRTAquinasModel: AquinasModel {
     ) async throws -> [ConceptDefinition] {
         let prompt = """
         <TASK:MAKE_NODE_CHILDREN>
-        Generate exactly three child Insights that help a learner understand the parent Node
-        Concept. Each child must be distinct, accurate, intellectually useful, and subordinate to
-        the parent rather than a renaming or restatement. Return JSON only:
+        Generate exactly three distinct, elementary concepts that are one conceptual level below
+        the parent Node Concept. Choose the closest and most directly related subordinate concepts
+        possible: foundational ideas that define the parent's conceptual structure and are
+        narrower in scope than the parent. Each child must be meaningful as an independent Insight,
+        not merely an explanation, example, application, consequence, benefit, study aid, loose
+        association, renaming, or restatement. Give each definition in one concise sentence.
+        Return JSON only:
         {"children":[{"title":"...","definition":"..."},{"title":"...","definition":"..."},
         {"title":"...","definition":"..."}]}
 
@@ -725,23 +882,29 @@ struct LiteRTAquinasModel: AquinasModel {
         debugQuestionOfTheDayConsoleLog(message)
     }
 
+    private func definitionReferences(
+        for term: String,
+        context: ConversationContext
+    ) -> [AquinasGroundingReference] {
+        let references = groundingProvider.references(
+            for: Self.latestUserQuestion(in: context.transcript) + " " + term.trimmed,
+            limit: 3
+        )
+        return Self.definitionEvidence(for: term, in: references)
+    }
+
     private func generateDefinition(
         _ term: String,
-        context: ConversationContext
+        context: ConversationContext,
+        references: [AquinasGroundingReference]
     ) async throws -> ConceptDefinition {
         let cleanedTerm = term.trimmed
         guard !cleanedTerm.isEmpty else {
             throw AquinasModelActionError.invalidRequest
         }
-        let groundingQuery = Self.latestUserQuestion(in: context.transcript)
-            + " " + cleanedTerm
-        let groundingReferences = groundingProvider.references(
-            for: groundingQuery,
-            limit: 3
-        )
-        let groundedContext = groundingReferences.isEmpty
-            ? "(no trusted reference notes retrieved)"
-            : groundingReferences.map(\.promptText).joined(separator: "\n\n")
+        let groundedContext = references.isEmpty
+            ? "(no passage explicitly defining this term was retrieved)"
+            : references.map(\.promptText).joined(separator: "\n\n")
         let prompt = """
         <TASK:CONTEXTUAL_DEFINITION>
         Define the requested term according to its meaning in the supplied context. Prefer the
@@ -752,17 +915,14 @@ struct LiteRTAquinasModel: AquinasModel {
         repeated restatements. Return only the definition prose.
 
         Term: \(cleanedTerm)
-        Reference passages retrieved automatically by semantic similarity (may be loosely
-        relevant or not applicable):
+        Reference passages that explicitly mention the requested term:
         \(groundedContext)
 
         Use a passage only where it genuinely bears on the term's meaning here; do not force-fit
-        one that doesn't. When no passage is relevant, define the term from your own general
-        knowledge as an ordinary dictionary or encyclopedia entry would — the absence of a
-        retrieved passage does not by itself mean the term is unknown or disputed. Reserve saying
-        you are uncertain for cases where the specific fact requested (a date, attribution, or
-        disputed claim) is genuinely not something you can state confidently, not for ordinary
-        vocabulary or well-established concepts.
+        one that doesn't. When no passage explicitly defines the term, give its ordinary
+        general-knowledge definition. Never answer that the term is undefined, absent, or not in
+        the provided context. Reserve uncertainty for a specific date, attribution, or disputed
+        claim, not for ordinary vocabulary or well-established concepts.
 
         Context:
         \(Self.plainTranscript(context.transcript))
@@ -958,6 +1118,10 @@ struct LiteRTAquinasModel: AquinasModel {
         that the answer addresses the exact question, respects negation, keeps similarly named
         people and works distinct, and does not overstate a disputed conclusion.
 
+        A source title or locator is optional. When you include one, it must exactly match a title
+        or source name printed in the evidence above. Never invent, complete, or alter a section,
+        verse, page number, or citation from memory; omit the locator instead.
+
         Never address the user about the draft, the audit, or a discrepancy you found (for
         example: "there has been a mistake", "the draft answer refers to", "please clarify which
         ..."). Silently fix any error you find and hand back the corrected answer as if it were
@@ -986,6 +1150,8 @@ struct LiteRTAquinasModel: AquinasModel {
 }
 
 private extension LiteRTAquinasModel {
+    static let corpusScopeAbstentionText = "I don't have a reliable passage about that in the texts loaded on this device, so I can't responsibly guess. Try a question grounded in the bundled sources."
+
     struct ConversationRequest {
         let history: [Message]
         let latest: Message
@@ -1078,20 +1244,44 @@ private extension LiteRTAquinasModel {
         groundingReferences: [AquinasGroundingReference] = []
     ) -> String {
         let authorityEvidenceFirst = hasAuthoritySectionReference(groundingReferences)
+        if authorityEvidenceFirst {
+            let evidence = groundingReferences
+                .filter { $0.id.hasPrefix("authority-section-") }
+                .map(\.promptText)
+                .joined(separator: "\n\n")
+            return """
+            Answer the user's question about this named authority from the primary-source passages below.
+            State only what these passages directly say or plainly entail. Do not use general background
+            knowledge, describe another tradition's view, or add a related doctrine. Give a concise answer
+            in no more than three sentences. If the passages do not establish a requested detail, say so.
+
+            Primary-source passages:
+            \(evidence)
+            """
+        }
         let groundingQualification = authorityEvidenceFirst
             ? "These include an exact primary-source section for the named authority and topic."
             : "These were retrieved automatically by semantic similarity and may be only loosely relevant, incomplete excerpts, or not actually applicable to this question."
         let groundedContext = groundingReferences.isEmpty
-            ? "No trusted reference notes were retrieved for this question."
+            ? """
+            No corpus passage was retrieved for this question. Give a normal, useful answer from
+            your general knowledge when the question is a definition, reflection, practical
+            discussion, or hypothetical. Do not present general knowledge as a quotation or as
+            source-backed evidence, and state uncertainty only when a particular claim is truly
+            uncertain.
+            """
             : """
             Reference passages retrieved for this question, each labeled with its source title:
             \(groundingReferences.map(\.promptText).joined(separator: "\n\n"))
 
             \(groundingQualification) Use a passage only where it genuinely bears on the question,
             and do not force-fit or invent a connection when it does not. When a passage materially
-            grounds a claim, you may name its source title in prose. Never merge distinct councils
-            or works, replace an exact name with a guessed name, or fabricate a citation, quotation,
-            or detail not present in the passage. If the passages do not establish a requested fact
+            grounds a claim, you may name its source title in prose. If you identify a source, copy
+            its title or source name exactly as shown above; do not infer or add a section, verse,
+            page, or other locator from memory. Prefer plain prose without a citation when one is
+            unnecessary. Never merge distinct councils or works, replace an exact name with a
+            guessed name, or fabricate a citation, quotation, or detail not present in the passage.
+            If the passages do not establish a requested fact
             and you are uncertain, say so plainly instead of inventing an answer. Do not mention
             retrieval or these internal notes unless the user asks about sources.
             """
@@ -1144,7 +1334,7 @@ private extension LiteRTAquinasModel {
         separate key-term list, or a thinking summary. Never echo input control markup. The
         requested double-curly Insight markers are the sole output-markup exception.
 
-        \(insightAnnotationInstruction)
+        \(groundingReferences.isEmpty ? "Do not add Insight markers to this response." : insightAnnotationInstruction)
 
         Finish the complete answer before stopping.
         """
@@ -1177,6 +1367,17 @@ private extension LiteRTAquinasModel {
                 || normalized.hasPrefix("was ")
                 || normalized.hasPrefix("is "))
         guard asksDirectly else { return nil }
+        if let primarySource = references.first(where: {
+            $0.id.hasPrefix("authority-section-")
+        }), let excerpt = primarySourceExcerpt(from: primarySource.facts) {
+            return ModelResponse(
+                text: "From \(primarySource.title): \u{201C}\(excerpt)\u{201D}",
+                thinkingSummary: thinkingEnabled ? [
+                    "Showing the exact primary-source passage selected for the named authority and topic."
+                ] : [],
+                keyTerms: []
+            )
+        }
         let referenceIDs = Set(references.map(\.id))
 
         if normalized.contains("second ecumenical council"),
@@ -1256,6 +1457,45 @@ private extension LiteRTAquinasModel {
         }
 
         return nil
+    }
+
+    /// Named-authority questions carry an exact corpus section. The compact on-device model has
+    /// shown that it can contradict that text while attempting a paraphrase, so render a bounded
+    /// excerpt directly instead of inventing a summary. This is source extraction, not a curated
+    /// answer: every word remains in the bundled primary source selected for the user's question.
+    static func primarySourceExcerpt(from text: String) -> String? {
+        var body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        for _ in 0..<2 {
+            guard let headingEnd = body.firstIndex(where: { $0 == "." || $0 == "!" || $0 == "?" }),
+                  body.distance(from: body.startIndex, to: headingEnd) < 240
+            else { break }
+            let leadingSentence = body[..<body.index(after: headingEnd)]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let looksLikeHeading = leadingSentence.hasPrefix("chap")
+                || leadingSentence.hasPrefix("chapter")
+                || leadingSentence.hasPrefix("article")
+                || leadingSentence.hasPrefix("question")
+                || leadingSentence.hasPrefix("what ")
+            guard looksLikeHeading else { break }
+            body = String(body[body.index(after: headingEnd)...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !body.isEmpty else { return nil }
+
+        let maximumCharacters = 420
+        let end = body.index(
+            body.startIndex,
+            offsetBy: min(maximumCharacters, body.count)
+        )
+        var excerpt = String(body[..<end])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if end < body.endIndex,
+           let sentenceEnd = excerpt.lastIndex(where: { $0 == "." || $0 == "!" || $0 == "?" }) {
+            excerpt = String(excerpt[..<body.index(after: sentenceEnd)])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return excerpt.isEmpty ? nil : excerpt
     }
 
     static func validatedKeyTerms(
@@ -1835,6 +2075,23 @@ private extension LiteRTAquinasModel {
             }
         }
         return lines
+    }
+
+    /// The same retrieval result `groundingSourceSummary` narrates, kept structured so the
+    /// loading UI can show each source's actual retrieved passage on tap.
+    static func groundingSourceDetails(
+        for references: [AquinasGroundingReference]
+    ) -> [GroundingSourceSummary] {
+        var seen = Set<String>()
+        return references.compactMap { reference in
+            guard seen.insert(reference.id).inserted else { return nil }
+            return GroundingSourceSummary(
+                id: reference.id,
+                title: reference.title,
+                sourceName: reference.sourceName,
+                passage: reference.facts.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
     }
 
     static func sanitizedVisibleText(_ raw: String) -> String {

@@ -260,6 +260,7 @@ struct AquinasSideMenu: View {
     var onDeleteConversation: (InquiryConversation) -> Void
     var newInsightsCount: Int = 0
     var onOpenHome: () -> Void
+    var onOpenLibrary: () -> Void
     var onOpenConversations: () -> Void
     var onOpenInsights: () -> Void
     var onOpenStudyTopics: () -> Void
@@ -311,6 +312,14 @@ struct AquinasSideMenu: View {
                                 isPresented: isPresented,
                                 delay: 0.20,
                                 action: onOpenHome
+                            )
+                            SideMenuRow(
+                                icon: "books.vertical",
+                                title: "Library",
+                                isActive: activePage == .library,
+                                isPresented: isPresented,
+                                delay: 0.225,
+                                action: onOpenLibrary
                             )
                             SideMenuRow(
                                 icon: "brain.head.profile",

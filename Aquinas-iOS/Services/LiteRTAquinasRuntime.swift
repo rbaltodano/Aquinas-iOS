@@ -60,6 +60,14 @@ actor LiteRTAquinasRuntime: ModelRuntimeDriver {
     let supportsUnloading = true
 
     private let modelStore: LiteRTModelStore
+#if DEBUG
+    private var evidenceExperimentUsesCPU = false
+
+    func configureEvidenceExperimentCPU() {
+        precondition(engine == nil)
+        evidenceExperimentUsesCPU = true
+    }
+#endif
     private var engine: Engine?
     private var activeConversation: Conversation?
     private var lastLoadError: Error?
@@ -276,9 +284,13 @@ actor LiteRTAquinasRuntime: ModelRuntimeDriver {
     private func initializeEngine() async throws {
         let modelURL = try modelStore.installedModelURL()
         let cacheURL = try modelStore.cacheDirectory()
+        var backend: Backend = .gpu
+#if DEBUG
+        if evidenceExperimentUsesCPU { backend = .cpu() }
+#endif
         let config = try EngineConfig(
             modelPath: modelURL.path,
-            backend: .gpu,
+            backend: backend,
             visionBackend: Self.visionBackend,
             maxNumTokens: 4_096,
             cacheDir: cacheURL.path

@@ -514,7 +514,8 @@ private extension ModelResponse {
             text: text,
             thinkingSummary: [],
             keyTerms: keyTerms,
-            insight: insight
+            insight: insight,
+            evidenceBasis: evidenceBasis
         )
     }
 }

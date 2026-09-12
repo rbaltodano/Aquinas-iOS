@@ -277,6 +277,7 @@ struct StreamingMessageView: View {
     let queuedInsightKeys: Set<String>
     let savedInsightIDs: Set<UUID>
     let showsResponseActions: Bool
+    let evidenceBasis: ResponseEvidenceBasis?
     var onQuote: ((String) -> Void)? = nil
     var onRegenerate: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil
@@ -326,6 +327,7 @@ struct StreamingMessageView: View {
         queuedInsightKeys: Set<String> = [],
         savedInsightIDs: Set<UUID> = [],
         showsResponseActions: Bool = true,
+        evidenceBasis: ResponseEvidenceBasis? = nil,
         onQuote: ((String) -> Void)? = nil,
         onRegenerate: (() -> Void)? = nil,
         onBranch: (() -> Void)? = nil,
@@ -348,6 +350,7 @@ struct StreamingMessageView: View {
         self.queuedInsightKeys = queuedInsightKeys
         self.savedInsightIDs = savedInsightIDs
         self.showsResponseActions = showsResponseActions
+        self.evidenceBasis = evidenceBasis
         self.onQuote = onQuote
         self.onRegenerate = onRegenerate
         self.onBranch = onBranch
@@ -469,6 +472,7 @@ struct StreamingMessageView: View {
     private var responseFooter: some View {
         ModelResponseFooter(
             copyText: InlineInsightMarkup.plainText(from: fullText),
+            evidenceBasis: evidenceBasis,
             responseTextAlignment: responseTextAlignment,
             onRegenerate: onRegenerate,
             onBranch: onBranch

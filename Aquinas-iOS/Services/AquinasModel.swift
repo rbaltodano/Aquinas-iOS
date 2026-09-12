@@ -122,7 +122,9 @@ extension AquinasModel {
         return ModelResponse(
             text: response.text,
             thinkingSummary: [],
-            keyTerms: response.keyTerms
+            keyTerms: response.keyTerms,
+            insight: response.insight,
+            evidenceBasis: response.evidenceBasis
         )
     }
 
@@ -322,10 +324,62 @@ struct KeyTerm {
     }
 }
 
+/// One retrieved grounding passage, surfaced while generation is still running as a tappable
+/// "Source" row. `passage` is the retrieved text itself, never a generated summary of it.
+struct GroundingSourceSummary: Identifiable, Codable, Equatable {
+    let id: String
+    let title: String
+    let sourceName: String
+    let passage: String
+
+    /// Identifies the narrated retrieval lines that accompany these sources in a thinking
+    /// summary, so the live loading UI can replace them with the expandable Source rows rather
+    /// than reporting the same retrieval twice.
+    static func isNarratedSourceLine(_ line: String) -> Bool {
+        line.hasPrefix("Consulting ") || line.hasPrefix("Cross-checking against ")
+    }
+}
+
+struct LibraryNavigationRequest: Equatable {
+    let sourceTitle: String
+    let sourceName: String
+}
+
 enum ModelResponseUpdate {
     case generationStarted
     case thinkingSummary([String])
+    case groundingSources([GroundingSourceSummary])
     case responseText(String)
+}
+
+/// Explains the evidence basis for a response. `nil` is reserved for older saved answers and
+/// recovery paths that do not report a basis.
+enum ResponseEvidenceBasis: String, Codable, Equatable {
+    case corpusGrounded
+    case generalKnowledge
+    case sourceRequired
+
+    var disclosureTitle: String {
+        switch self {
+        case .corpusGrounded:
+            "Corpus Grounded"
+        case .generalKnowledge:
+            "General Knowledge"
+        case .sourceRequired:
+            "Source Required"
+        }
+    }
+
+    var disclosureDescription: String {
+        switch self {
+        case .corpusGrounded:
+            "This answer uses passages retrieved from the texts on this device."
+        case .generalKnowledge:
+            "This answer uses the model’s general knowledge because no relevant passage was retrieved."
+        case .sourceRequired:
+            "This question needs a reliable passage from the texts on this device."
+        }
+    }
 }
 
 /// The model's answer to a conversation turn: plain prose plus the terms worth defining within
@@ -336,17 +390,20 @@ struct ModelResponse {
     let thinkingSummary: [String]
     let keyTerms: [KeyTerm]
     let insight: ConceptDefinition?
+    let evidenceBasis: ResponseEvidenceBasis?
 
     init(
         text: String,
         thinkingSummary: [String] = [],
         keyTerms: [KeyTerm] = [],
-        insight: ConceptDefinition? = nil
+        insight: ConceptDefinition? = nil,
+        evidenceBasis: ResponseEvidenceBasis? = nil
     ) {
         self.text = text
         self.thinkingSummary = thinkingSummary
         self.keyTerms = keyTerms
         self.insight = insight
+        self.evidenceBasis = evidenceBasis
     }
 
     /// `text` with each key term wrapped as `[term](aq://slug)` — the markup
@@ -432,6 +489,16 @@ struct ModelResponse {
             in: text,
             range: searchRange ?? NSRange(text.startIndex..., in: text)
         )?.range ?? NSRange(location: NSNotFound, length: 0)
+    }
+
+    func withEvidenceBasis(_ evidenceBasis: ResponseEvidenceBasis) -> ModelResponse {
+        ModelResponse(
+            text: text,
+            thinkingSummary: thinkingSummary,
+            keyTerms: keyTerms,
+            insight: insight,
+            evidenceBasis: evidenceBasis
+        )
     }
 }
 

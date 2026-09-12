@@ -56,7 +56,7 @@ struct LiteRTProductionRuntimeTests {
     }
 
     @MainActor
-    @Test("Natural definition questions trigger the inline Insight contract")
+    @Test("Natural definition questions are recognized")
     func detectsDefinitionRequests() {
         #expect(
             definitionTerm(in: "What does prudence mean?") == "prudence"
@@ -83,24 +83,133 @@ struct LiteRTProductionRuntimeTests {
         #expect(definitionTerm(in: "What is natural law?") == "natural law")
     }
 
-    @Test("Validated direct definitions render an inline Insight card")
-    func validatedDefinitionRendersInlineCard() {
-        let insight = ConceptDefinition(
-            word: "Prudence",
-            partOfSpeech: "noun",
-            pronunciation: "",
-            meaning: "Right reason applied to action.",
-            example: "",
-            context: "Virtue"
-        )
+    @Test("General-knowledge definitions remain ordinary conversation")
+    func generalKnowledgeDefinitionDoesNotCreateInsightMetadata() {
+        #expect(!LiteRTAquinasModel.requiresCorpusEvidence("What does moral obligation mean?"))
+
         let response = ModelResponse(
-            text: "Prudence guides practical judgment.",
-            keyTerms: [KeyTerm(displayText: "Prudence")],
-            insight: insight
+            text: "Infralapsarianism is a theological ordering of the divine decrees.",
+            evidenceBasis: .generalKnowledge
         )
 
-        #expect(InlineInsightMarkup.insights(in: response.annotatedText) == [insight])
-        #expect(response.annotatedText.contains("[Prudence](aq://prudence)"))
+        #expect(response.evidenceBasis == .generalKnowledge)
+        #expect(response.keyTerms.isEmpty)
+        #expect(response.insight == nil)
+        #expect(InlineInsightMarkup.insights(in: response.annotatedText).isEmpty)
+    }
+
+    @Test("Definition evidence must name the requested term")
+    func definitionEvidenceRejectsSemanticNearMatches() {
+        let nearMatch = AquinasGroundingReference(
+            id: "near-match",
+            title: "Predestination",
+            sourceName: "Test source",
+            facts: "This passage discusses divine providence and election.",
+            retrievalAliases: []
+        )
+        let directMatch = AquinasGroundingReference(
+            id: "direct-match",
+            title: "Infralapsarianism",
+            sourceName: "Test source",
+            facts: "Infralapsarianism orders the divine decrees after the fall.",
+            retrievalAliases: []
+        )
+
+        #expect(
+            LiteRTAquinasModel.definitionEvidence(
+                for: "infralapsarianism",
+                in: [nearMatch]
+            ).isEmpty
+        )
+        #expect(
+            LiteRTAquinasModel.definitionEvidence(
+                for: "infralapsarianism",
+                in: [nearMatch, directMatch]
+            ) == [directMatch]
+        )
+    }
+
+    @Test("Unmatched specialist definitions require corpus evidence")
+    func specialistDefinitionEvidenceRequirement() {
+        #expect(LiteRTAquinasModel.requiresCorpusEvidence("What is infralapsarianism?"))
+        #expect(LiteRTAquinasModel.requiresCorpusEvidence("What is utilitarianism?"))
+        #expect(!LiteRTAquinasModel.requiresCorpusEvidence("What is moral obligation?"))
+        #expect(!LiteRTAquinasModel.requiresCorpusEvidence("What is courage?"))
+    }
+
+    @Test("Response evidence bases have user-facing disclosure titles")
+    func responseEvidenceBasisDisclosureTitles() {
+        #expect(ResponseEvidenceBasis.generalKnowledge.disclosureTitle == "General Knowledge")
+        #expect(ResponseEvidenceBasis.corpusGrounded.disclosureTitle == "Corpus Grounded")
+        #expect(ResponseEvidenceBasis.sourceRequired.disclosureTitle == "Source Required")
+        #expect(ResponseEvidenceBasis.generalKnowledge.disclosureDescription.contains("general knowledge"))
+        #expect(ResponseEvidenceBasis.corpusGrounded.disclosureDescription.contains("passages"))
+        #expect(ResponseEvidenceBasis.sourceRequired.disclosureDescription.contains("reliable passage"))
+    }
+
+    @Test("Evidence-required requests abstain when no passage is retrieved")
+    func evidenceRequirementSelection() {
+        #expect(LiteRTAquinasModel.requiresCorpusEvidence("Who is the current pope?"))
+        #expect(LiteRTAquinasModel.requiresCorpusEvidence("What did Nicaea decide?"))
+        #expect(LiteRTAquinasModel.requiresCorpusEvidence("What is the Nicene Creed?"))
+        #expect(LiteRTAquinasModel.requiresCorpusEvidence("Define the Council of Nicaea."))
+        #expect(LiteRTAquinasModel.requiresCorpusEvidence("What does the Nicene Creed say?"))
+        #expect(LiteRTAquinasModel.requiresCorpusEvidence("Who wrote the Didache?"))
+        #expect(LiteRTAquinasModel.requiresCorpusEvidence("Quote Session VI of the Council of Trent."))
+        #expect(LiteRTAquinasModel.requiresCorpusEvidence("Can you quote the Gospel of John?"))
+        #expect(LiteRTAquinasModel.requiresCorpusEvidence("When was the Council of Trent?"))
+
+        #expect(!LiteRTAquinasModel.requiresCorpusEvidence("Can Spider-Man be a good role model even if he is not real?"))
+        #expect(!LiteRTAquinasModel.requiresCorpusEvidence("I feel stuck and need some perspective."))
+        #expect(!LiteRTAquinasModel.requiresCorpusEvidence("What does moral obligation mean?"))
+        #expect(!LiteRTAquinasModel.requiresCorpusEvidence("Please define moral obligation."))
+        #expect(!LiteRTAquinasModel.requiresCorpusEvidence("Imagine how a parent might teach courage."))
+    }
+
+    @Test("A reflective reply retrieves through its unanswered study prompt")
+    func reflectiveFollowUpRetainsStudyPromptForGrounding() {
+        let prompt = "How does the understanding of justification as a gift received through faith and charity inform one's practical life and moral action?"
+        let reflection = "Well it has me thinking that I should be gracious to others since I have been shown grace."
+        let query = LiteRTAquinasModel.groundingQuery(
+            for: ConversationContext(
+                transcript: [
+                    .user(prompt, nil, []),
+                    .user(reflection, nil, [])
+                ]
+            )
+        )
+
+        #expect(query.contains(prompt))
+        #expect(query.contains(reflection))
+    }
+
+    @Test("A normal follow-up still retrieves from only its latest question")
+    func answeredConversationDoesNotReusePriorQuestionForGrounding() {
+        let latestQuestion = "What is infralapsarianism?"
+        let query = LiteRTAquinasModel.groundingQuery(
+            for: ConversationContext(
+                transcript: [
+                    .user("What is justification?", nil, []),
+                    .text("Justification is God's gracious work of making a person righteous."),
+                    .user(latestQuestion, nil, [])
+                ]
+            )
+        )
+
+        #expect(query == latestQuestion)
+    }
+
+    @Test("Direct-definition responses remain plain conversation")
+    func directDefinitionDoesNotRenderInlineInsightCard() {
+        let response = ModelResponse(
+            text: "Prudence guides practical judgment.",
+            evidenceBasis: .corpusGrounded
+        )
+
+        #expect(response.keyTerms.isEmpty)
+        #expect(response.insight == nil)
+        #expect(InlineInsightMarkup.insights(in: response.annotatedText).isEmpty)
+        #expect(!response.annotatedText.contains("aq://"))
     }
 
     @Test("Ordinary responses never render an inline Insight card")
@@ -473,7 +582,7 @@ struct LiteRTProductionRuntimeTests {
 
         #expect(references.first?.id == "john-14")
         #expect(references.first?.facts.contains("Farewell Discourse") == true)
-        #expect(references.first?.facts.contains("John 4") == true)
+        #expect(references.first?.facts.contains("John 4") == false)
     }
 
     @Test("Local grounding retrieves other curated Scripture stopgap entries")
@@ -652,7 +761,8 @@ struct LiteRTProductionRuntimeTests {
             ResponsePresentationMetadata(
                 responseIndex: 1,
                 showsThinking: true,
-                thinkingSummary: ["Comparing the two councils by date and doctrine."]
+                thinkingSummary: ["Comparing the two councils by date and doctrine."],
+                evidenceBasis: .generalKnowledge
             )
         )
 
@@ -662,6 +772,20 @@ struct LiteRTProductionRuntimeTests {
             decoded.responsePresentation(at: 1)?.thinkingSummary
                 == ["Comparing the two councils by date and doctrine."]
         )
+        #expect(decoded.responsePresentation(at: 1)?.evidenceBasis == .generalKnowledge)
+
+        var presentationObject = try #require(
+            (try JSONSerialization.jsonObject(with: encoded) as? [String: Any])?["responsePresentations"]
+                as? [[String: Any]]
+        )
+        presentationObject[0].removeValue(forKey: "evidenceBasis")
+        var noBasisObject = try #require(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        noBasisObject["responsePresentations"] = presentationObject
+        let noBasisData = try JSONSerialization.data(withJSONObject: noBasisObject)
+        let noBasisBranch = try JSONDecoder().decode(ChatBranch.self, from: noBasisData)
+        #expect(noBasisBranch.responsePresentation(at: 1)?.evidenceBasis == nil)
 
         var legacyObject = try #require(
             JSONSerialization.jsonObject(with: encoded) as? [String: Any]

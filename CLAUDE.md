@@ -52,11 +52,29 @@ retrieves the intended primary formulation.
 authority-section pointer supplies the grounding, normal generation receives a
 primary-source-only instruction and its required factual audit sees only those
 section chunks. Both passes must remove claims not stated or plainly entailed
-by the text; they must not fill gaps from general model knowledge. This is a
-generation constraint, not a curated answer and not yet an end-to-end
-generation-quality score. The prompt contract has a focused retrieval test;
-the iPhone 17 simulator currently launches test suites but reports zero tests
-executed with an unknown result, so validate the actual wording on device.
+by the text; they must not fill gaps from general model knowledge. For short,
+direct questions with that exact pointer, `verifiedGroundedResponse` now
+returns a bounded excerpt of the selected primary-source text before Gemma
+generates anything. It skips document headings and is source extraction, not a
+curated answer. This closes the observed failure where Gemma contradicted a
+correct retrieved council passage while paraphrasing it. The regression test
+requires the real Trent retrieval and its “not remission of sins merely”
+wording; on a physical iPhone 17, both Trent and Nicaea returned their selected
+source text. `LiteRTDeviceProbe` explicitly instantiates `MiniLMGroundingProvider`
+for its conversation-quality probe, so a probe result measures real retrieval
+rather than the local placeholder provider. The iPhone 17 simulator currently
+launches test suites but reports zero tests executed with an unknown result, so
+validate changed answer wording on device.
+
+**Evidence-required retrieval, September 10, 2026:** retrieval still runs for every
+question, but an empty result only stops claims that require verifiable source material:
+quotations, authorship, dates, historical events, named councils/documents/creeds,
+Scripture passages, statistics, and current facts. Definitions, reflections, practical
+discussion, and hypotheticals may receive a normal model answer marked **General knowledge**
+when no passage applies. Those general-knowledge answers carry no inline Insight metadata and
+are excluded from automatic Insight Tree analysis. A source-dependent question with no passage
+returns the fixed-corpus abstention, also without linked terms or tree analysis. This applies to
+the fixed local corpus; it is not a claim that the term or question is universally unknowable.
 
 Before changing any model-facing code, read
 [MODEL-INTEGRATION.md](../Aquinas-Foundations/MODEL-INTEGRATION.md). It is the cross-repo source of

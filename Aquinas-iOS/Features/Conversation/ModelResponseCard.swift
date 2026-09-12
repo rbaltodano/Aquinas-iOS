@@ -21,6 +21,10 @@ struct ModelResponseCard: View {
     let isQueuedForModel: Bool
     let usesNetworkStream: Bool
     let thinkingSummary: [String]
+    /// Retrieved grounding passages for the turn currently generating, rendered as expandable
+    /// Source rows in the loading state. Empty once the response is complete.
+    let groundingSources: [GroundingSourceSummary]
+    let evidenceBasis: ResponseEvidenceBasis?
     let funStatusText: String?
     let responseTextAlignment: ResponseTextAlignmentOption
     let responseFont: ConversationFontOption
@@ -52,8 +56,11 @@ struct ModelResponseCard: View {
     @State private var isResponseFullyRevealed: Bool = false
 
     let brandBrown = AquinasTheme.Colors.primaryReadable
+    /// The narrated "Consulting …" lines are dropped once the same retrieval is listed as
+    /// structured Source rows, so **Show Thinking** reports each source exactly once.
     private var thinkingSummaryLines: [String] {
-        thinkingSummary
+        guard !groundingSources.isEmpty else { return thinkingSummary }
+        return thinkingSummary.filter { !GroundingSourceSummary.isNarratedSourceLine($0) }
     }
     private var presentsThinkingUI: Bool {
         showsThinkingIntro || !thinkingSummary.isEmpty
@@ -72,6 +79,15 @@ struct ModelResponseCard: View {
             && showResponseContent
     }
 
+    private var responseBasisTitle: String {
+        evidenceBasis?.disclosureTitle ?? "Response Details"
+    }
+
+    private var responseBasisDescription: String {
+        evidenceBasis?.disclosureDescription
+            ?? "Details about how this response was prepared."
+    }
+
     init(
         title: String,
         fullText: String,
@@ -82,6 +98,8 @@ struct ModelResponseCard: View {
         isQueuedForModel: Bool = false,
         usesNetworkStream: Bool = false,
         thinkingSummary: [String] = [],
+        groundingSources: [GroundingSourceSummary] = [],
+        evidenceBasis: ResponseEvidenceBasis? = nil,
         funStatusText: String? = nil,
         responseTextAlignment: ResponseTextAlignmentOption = .center,
         responseFont: ConversationFontOption = .sans,
@@ -108,6 +126,8 @@ struct ModelResponseCard: View {
         self.isQueuedForModel = isQueuedForModel
         self.usesNetworkStream = usesNetworkStream
         self.thinkingSummary = thinkingSummary
+        self.groundingSources = groundingSources
+        self.evidenceBasis = evidenceBasis
         self.funStatusText = funStatusText
         self.responseTextAlignment = responseTextAlignment
         self.responseFont = responseFont
@@ -152,6 +172,7 @@ struct ModelResponseCard: View {
                     if isThinking {
                         LiveThinkingProgressView(
                             summaryLines: thinkingSummary,
+                            groundingSources: groundingSources,
                             isWritingResponse: isShowingWritingStatus,
                             isQueuedForModel: isQueuedForModel,
                             funStatusText: funStatusText,
@@ -199,6 +220,27 @@ struct ModelResponseCard: View {
                 if presentsThinkingUI && !isThinking && isThinkingExpanded {
                     VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 16) {
                         VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 8) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "questionmark.circle")
+                                    .font(.system(size: conversationFontSize.pointSize, weight: .semibold))
+                                    .symbolEffect(.drawOn, isActive: isThinkingExpanded)
+                                Text(responseBasisTitle)
+                                    .font(responseFont.textFont(size: conversationFontSize).weight(.bold))
+                            }
+                            .foregroundStyle(AquinasTheme.Colors.headingText)
+                                .frame(
+                                    maxWidth: .infinity,
+                                    alignment: responseTextAlignment.frameAlignment
+                                )
+                            Text(responseBasisDescription)
+                                .font(responseFont.textFont(size: conversationFontSize))
+                                .lineSpacing(5)
+                                .multilineTextAlignment(responseTextAlignment.textAlignment)
+                                .foregroundStyle(AquinasTheme.Colors.placeholderText)
+                                .frame(
+                                    maxWidth: .infinity,
+                                    alignment: responseTextAlignment.frameAlignment
+                                )
                             ForEach(Array(thinkingSummaryLines.enumerated()), id: \.offset) { index, line in
                                 Text(line)
                                     .font(responseFont.textFont(size: conversationFontSize))
@@ -210,6 +252,25 @@ struct ModelResponseCard: View {
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
+
+                        if !groundingSources.isEmpty {
+                            VStack(
+                                alignment: responseTextAlignment.horizontalAlignment,
+                                spacing: 8
+                            ) {
+                                ForEach(groundingSources) { source in
+                                    GroundingSourceRow(
+                                        source: source,
+                                        responseTextAlignment: responseTextAlignment
+                                    )
+                                }
+                            }
+                            .frame(
+                                maxWidth: .infinity,
+                                alignment: responseTextAlignment.frameAlignment
+                            )
+                            .opacity(visibleThinkingLineCount >= thinkingSummaryLines.count ? 1 : 0)
+                        }
 
                         Button(action: {
                             collapseThinking()
@@ -235,6 +296,12 @@ struct ModelResponseCard: View {
                         try? await Task.sleep(for: .milliseconds(250))
                         guard !Task.isCancelled, !isThinkingCollapsing else { return }
 
+                        guard !thinkingSummaryLines.isEmpty else {
+                            withAnimation(.easeInOut(duration: 0.35)) {
+                                visibleThinkingLineCount = 0
+                            }
+                            return
+                        }
                         for lineCount in 1...thinkingSummaryLines.count {
                             withAnimation(.easeInOut(duration: 0.35)) {
                                 visibleThinkingLineCount = lineCount
@@ -270,6 +337,7 @@ struct ModelResponseCard: View {
                         queuedInsightKeys: queuedInsightKeys,
                         savedInsightIDs: savedInsightIDs,
                         showsResponseActions: showsResponseActions,
+                        evidenceBasis: evidenceBasis,
                         onRegenerate: onRegenerate,
                         onBranch: onDuplicateBranch,
                         onInsightTap: onInsightTap,
@@ -446,6 +514,7 @@ struct ModelResponseCard: View {
 
 private struct LiveThinkingProgressView: View {
     let summaryLines: [String]
+    let groundingSources: [GroundingSourceSummary]
     let isWritingResponse: Bool
     let isQueuedForModel: Bool
     let funStatusText: String?
@@ -454,8 +523,21 @@ private struct LiveThinkingProgressView: View {
     let startedAt: Date
     var responseTextAlignment: ResponseTextAlignmentOption = .left
 
+    /// The narrated "Consulting …" lines are dropped once the same retrieval is available as
+    /// structured Source rows, so the loading state reports each source exactly once.
+    private var visibleSummaryLines: [String] {
+        guard !groundingSources.isEmpty else { return summaryLines }
+        return summaryLines.filter { !GroundingSourceSummary.isNarratedSourceLine($0) }
+    }
+
     private var showsDetailedProgress: Bool {
-        !summaryLines.isEmpty || isWritingResponse
+        !summaryLines.isEmpty || !groundingSources.isEmpty || isWritingResponse
+    }
+
+    /// Streaming can begin a beat after source retrieval finishes. Once sources are visible,
+    /// show the writing state immediately instead of waiting for that later stream flag.
+    private var showsWritingResponse: Bool {
+        isWritingResponse || !groundingSources.isEmpty
     }
 
     /// Rough word-count-based proxy for tokens spent so far — this build has no live model API
@@ -473,7 +555,7 @@ private struct LiveThinkingProgressView: View {
             Group {
                 if showsDetailedProgress {
                     VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 8) {
-                        ForEach(Array(summaryLines.enumerated()), id: \.offset) { index, line in
+                        ForEach(Array(visibleSummaryLines.enumerated()), id: \.offset) { index, line in
                             Text(line)
                                 .font(font)
                                 .lineSpacing(8)
@@ -481,24 +563,23 @@ private struct LiveThinkingProgressView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                                 .modifier(
                                     ThinkingShimmer(
-                                        isActive: !isWritingResponse && index == summaryLines.count - 1,
+                                        isActive: !isWritingResponse
+                                            && groundingSources.isEmpty
+                                            && index == visibleSummaryLines.count - 1,
                                         color: color
                                     )
                                 )
                                 .transition(.glideFadeUp)
                         }
 
-                        if isWritingResponse {
-                            Text(funStatusText ?? "Writing response...")
-                                .font(font)
-                                .fontWeight(.bold)
-                                .lineSpacing(8)
-                                .multilineTextAlignment(responseTextAlignment.textAlignment)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .modifier(ThinkingShimmer(isActive: true, color: color))
-                                .transition(.glideFadeUp)
-                                .accessibilityLabel("Writing response")
+                        ForEach(groundingSources) { source in
+                            GroundingSourceRow(
+                                source: source,
+                                responseTextAlignment: responseTextAlignment
+                            )
+                            .transition(.glideFadeUp)
                         }
+
                     }
                     .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
@@ -523,8 +604,6 @@ private struct LiveThinkingProgressView: View {
                 }
             }
 
-            // Waits for the initial "Thinking..." line to give way to the actual chain-of-thought
-            // (or "Writing response...") before showing — not present during the plain intro line.
             if showsDetailedProgress {
                 ThinkingMetricsFooter(
                     startedAt: startedAt,
@@ -534,10 +613,198 @@ private struct LiveThinkingProgressView: View {
                 .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
                 .transition(.opacity)
             }
+
+            // This is intentionally below the source rows: it becomes visible as soon as
+            // retrieval results are rendered, even if the stream flag has not arrived yet.
+            if showsWritingResponse {
+                HStack(alignment: .center, spacing: 10) {
+                    WritingResponseQuill(color: color)
+
+                    Text("Writing Response...")
+                        .font(font)
+                        .fontWeight(.bold)
+                        .lineSpacing(8)
+                        .multilineTextAlignment(responseTextAlignment.textAlignment)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .modifier(ThinkingShimmer(isActive: true, color: color))
+                }
+                .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
+                .transition(.glideFadeUp)
+                .accessibilityLabel("Writing response")
+            }
         }
         .animation(.easeOut(duration: 0.3), value: summaryLines.count)
+        .animation(.easeOut(duration: 0.3), value: groundingSources.count)
         .animation(.easeOut(duration: 0.3), value: isWritingResponse)
         .animation(.easeInOut(duration: 0.25), value: isQueuedForModel)
+    }
+}
+
+/// One retrieved source shown while the model is generating. Collapsed it is just the source
+/// title; tapped it expands into a bordered card showing the passage retrieval actually pulled,
+/// so the grounding claim is inspectable rather than asserted.
+private struct GroundingSourceRow: View {
+    let source: GroundingSourceSummary
+    var responseTextAlignment: ResponseTextAlignmentOption = .left
+
+    @State private var isExpanded: Bool = false
+    @State private var visiblePassageSegmentCount: Int = 0
+
+    /// The passage broken into the units it reveals in, matching how **Show Thinking** steps
+    /// through its summary lines. Explicit line breaks win where the source has them (verse and
+    /// heading text); otherwise the passage is split into sentences so continuous prose still
+    /// arrives in readable pieces rather than all at once.
+    private var passageSegments: [String] {
+        let lines = source.passage
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard lines.count == 1, let paragraph = lines.first else { return lines }
+
+        var sentences: [String] = []
+        paragraph.enumerateSubstrings(
+            in: paragraph.startIndex..<paragraph.endIndex,
+            options: [.bySentences, .localized]
+        ) { substring, _, _, _ in
+            let sentence = substring?.trimmingCharacters(in: .whitespaces) ?? ""
+            if !sentence.isEmpty { sentences.append(sentence) }
+        }
+        return sentences.isEmpty ? lines : sentences
+    }
+
+    var body: some View {
+        VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 8) {
+            Button {
+                // Revealing always restarts from nothing, so collapsing and reopening a source
+                // plays the same staged entrance rather than snapping straight to full text.
+                visiblePassageSegmentCount = 0
+                withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(source.title)
+                        .font(.figtreeParagraph)
+                        .lineSpacing(6)
+                        .multilineTextAlignment(responseTextAlignment.textAlignment)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                }
+                .foregroundColor(
+                    isExpanded
+                        ? AquinasTheme.Colors.headingText
+                        : AquinasTheme.Colors.placeholderText
+                )
+                .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: responseTextAlignment.horizontalAlignment, spacing: 12) {
+                    // Corpus passages carry the same string as both title and source name; only
+                    // the curated layer names a distinct edition worth repeating here.
+                    if source.sourceName != source.title {
+                        Text(source.sourceName)
+                            .font(.custom("Figtree-Regular", size: 12))
+                            .foregroundColor(AquinasTheme.Colors.placeholderText)
+                            .multilineTextAlignment(responseTextAlignment.textAlignment)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .opacity(visiblePassageSegmentCount > 0 ? 1 : 0)
+                    }
+
+                    ForEach(Array(passageSegments.enumerated()), id: \.offset) { index, segment in
+                        Text(segment)
+                            .font(.figtreeParagraph)
+                            .lineSpacing(6)
+                            .foregroundColor(AquinasTheme.Colors.paragraphText)
+                            .multilineTextAlignment(responseTextAlignment.textAlignment)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .opacity(index < visiblePassageSegmentCount ? 1 : 0)
+                    }
+
+                    HStack {
+                        Button {
+                            NotificationCenter.default.post(
+                                name: .openGroundingSourceInLibrary,
+                                object: LibraryNavigationRequest(sourceTitle: source.title, sourceName: source.sourceName)
+                            )
+                        } label: {
+                            Label("Read More", systemImage: "arrow.up.right")
+                                .font(.figtreeParagraph)
+                                .foregroundStyle(AquinasTheme.Colors.lightGreen)
+                        }
+                        .buttonStyle(.plain)
+                        Spacer(minLength: 0)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+                .task {
+                    // Hold until the card's own padding/background/border spring has settled,
+                    // then step the passage in, same cadence as the Show Thinking summary.
+                    try? await Task.sleep(for: .milliseconds(250))
+                    guard !Task.isCancelled, isExpanded else { return }
+
+                    for segmentCount in passageSegments.indices.map({ $0 + 1 }) {
+                        withAnimation(.easeInOut(duration: 0.35)) {
+                            visiblePassageSegmentCount = segmentCount
+                        }
+                        try? await Task.sleep(for: .milliseconds(50))
+                        guard !Task.isCancelled, isExpanded else { return }
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
+        .padding(isExpanded ? 16 : 0)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(
+                    isExpanded
+                        ? AquinasTheme.Colors.canvasSecondary
+                        : Color.clear
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(
+                    isExpanded ? AquinasTheme.Colors.border : Color.clear,
+                    lineWidth: 1
+                )
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Source: \(source.title)")
+        .accessibilityHint(isExpanded ? "Hide retrieved passage" : "Show retrieved passage")
+    }
+}
+
+/// Small animated writing mark shown only while the model is composing its response.
+private struct WritingResponseQuill: View {
+    let color: Color
+
+    var body: some View {
+        TimelineView(.animation) { context in
+            let cycle = context.date.timeIntervalSinceReferenceDate
+                .truncatingRemainder(dividingBy: 2.0)
+            let progress = cycle / 2.0
+            let angle = sin(progress * 2.0 * .pi * 6.0) * 6.0
+            let x = 49.0 + ((progress < 0.833 ? progress / 0.833 : (1.0 - progress) / 0.167) * 22.0)
+            let y = 28.0 + abs(sin(progress * 2.0 * .pi * 7.2)) * 2.0
+
+            Image("Quill")
+                .renderingMode(.template)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 16, height: 16)
+                .foregroundStyle(color)
+                .rotationEffect(.radians(angle * .pi / 180.0), anchor: .bottomLeading)
+                .offset(x: CGFloat((x - 49.0) * 0.25), y: CGFloat((y - 28.0) * 0.35))
+                .accessibilityHidden(true)
+        }
+        .frame(width: 16, height: 16)
     }
 }
 
