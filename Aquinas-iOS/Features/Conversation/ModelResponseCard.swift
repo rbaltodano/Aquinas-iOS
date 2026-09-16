@@ -48,6 +48,8 @@ struct ModelResponseCard: View {
     @State private var showTitle: Bool
     @State private var showResponseContent: Bool
     @State private var isThinkingExpanded: Bool = false
+    @State private var isThinkingBasisVisible: Bool = false
+    @State private var isThinkingDescriptionVisible: Bool = false
     @State private var visibleThinkingLineCount: Int = 0
     @State private var isThinkingCollapsing: Bool = false
     @State private var hasStartedFinishThinking: Bool = false
@@ -188,6 +190,8 @@ struct ModelResponseCard: View {
                                 collapseThinking()
                             } else {
                                 isThinkingCollapsing = false
+                                isThinkingBasisVisible = false
+                                isThinkingDescriptionVisible = false
                                 visibleThinkingLineCount = 0
                                 withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
                                     isThinkingExpanded = true
@@ -223,15 +227,15 @@ struct ModelResponseCard: View {
                             HStack(spacing: 4) {
                                 Image(systemName: "questionmark.circle")
                                     .font(.system(size: conversationFontSize.pointSize, weight: .semibold))
-                                    .symbolEffect(.drawOn, isActive: isThinkingExpanded)
                                 Text(responseBasisTitle)
                                     .font(responseFont.textFont(size: conversationFontSize).weight(.bold))
                             }
-                            .foregroundStyle(AquinasTheme.Colors.headingText)
-                                .frame(
-                                    maxWidth: .infinity,
-                                    alignment: responseTextAlignment.frameAlignment
-                                )
+                            .foregroundStyle(AquinasTheme.Colors.placeholderText)
+                            .frame(
+                                maxWidth: .infinity,
+                                alignment: responseTextAlignment.frameAlignment
+                            )
+                            .opacity(isThinkingBasisVisible ? 1 : 0)
                             Text(responseBasisDescription)
                                 .font(responseFont.textFont(size: conversationFontSize))
                                 .lineSpacing(5)
@@ -241,6 +245,7 @@ struct ModelResponseCard: View {
                                     maxWidth: .infinity,
                                     alignment: responseTextAlignment.frameAlignment
                                 )
+                                .opacity(isThinkingDescriptionVisible ? 1 : 0)
                             ForEach(Array(thinkingSummaryLines.enumerated()), id: \.offset) { index, line in
                                 Text(line)
                                     .font(responseFont.textFont(size: conversationFontSize))
@@ -269,7 +274,11 @@ struct ModelResponseCard: View {
                                 maxWidth: .infinity,
                                 alignment: responseTextAlignment.frameAlignment
                             )
-                            .opacity(visibleThinkingLineCount >= thinkingSummaryLines.count ? 1 : 0)
+                            .opacity(
+                                isThinkingDescriptionVisible
+                                    && visibleThinkingLineCount >= thinkingSummaryLines.count
+                                    ? 1 : 0
+                            )
                         }
 
                         Button(action: {
@@ -293,6 +302,15 @@ struct ModelResponseCard: View {
                     .padding(.bottom, 40)
                     .transition(.opacity.combined(with: .move(edge: .top)))
                     .task {
+                        withAnimation(.easeInOut(duration: 0.35)) {
+                            isThinkingBasisVisible = true
+                        }
+                        try? await Task.sleep(for: .milliseconds(180))
+                        guard !Task.isCancelled, !isThinkingCollapsing else { return }
+
+                        withAnimation(.easeInOut(duration: 0.35)) {
+                            isThinkingDescriptionVisible = true
+                        }
                         try? await Task.sleep(for: .milliseconds(250))
                         guard !Task.isCancelled, !isThinkingCollapsing else { return }
 
@@ -435,6 +453,8 @@ struct ModelResponseCard: View {
         thinkingStartedAt = Date()
         hasStartedFinishThinking = false
         isThinkingExpanded = false
+        isThinkingBasisVisible = false
+        isThinkingDescriptionVisible = false
         visibleThinkingLineCount = 0
         isThinkingCollapsing = false
         revealedResponseWordCount = 0
@@ -499,6 +519,8 @@ struct ModelResponseCard: View {
     private func collapseThinking() {
         isThinkingCollapsing = true
         withAnimation(.easeOut(duration: 0.1)) {
+            isThinkingBasisVisible = false
+            isThinkingDescriptionVisible = false
             visibleThinkingLineCount = 0
         }
 
@@ -617,7 +639,7 @@ private struct LiveThinkingProgressView: View {
             // This is intentionally below the source rows: it becomes visible as soon as
             // retrieval results are rendered, even if the stream flag has not arrived yet.
             if showsWritingResponse {
-                HStack(alignment: .center, spacing: 10) {
+                HStack(alignment: .center, spacing: 14) {
                     WritingResponseQuill(color: color)
 
                     Text("Writing Response...")
@@ -725,20 +747,21 @@ private struct GroundingSourceRow: View {
                             .opacity(index < visiblePassageSegmentCount ? 1 : 0)
                     }
 
-                    HStack {
-                        Button {
-                            NotificationCenter.default.post(
-                                name: .openGroundingSourceInLibrary,
-                                object: LibraryNavigationRequest(sourceTitle: source.title, sourceName: source.sourceName)
-                            )
-                        } label: {
-                            Label("Read More", systemImage: "arrow.up.right")
-                                .font(.figtreeParagraph)
-                                .foregroundStyle(AquinasTheme.Colors.lightGreen)
-                        }
-                        .buttonStyle(.plain)
-                        Spacer(minLength: 0)
+                    Button {
+                        NotificationCenter.default.post(
+                            name: .openGroundingSourceInLibrary,
+                            object: LibraryNavigationRequest(sourceTitle: source.title, sourceName: source.sourceName)
+                        )
+                    } label: {
+                        Label("Read More", systemImage: "arrow.up.right")
+                            .font(.figtreeParagraph)
+                            .foregroundStyle(AquinasTheme.Colors.lightGreen)
                     }
+                    .buttonStyle(.plain)
+                    .frame(
+                        maxWidth: .infinity,
+                        alignment: responseTextAlignment.frameAlignment
+                    )
                 }
                 .frame(maxWidth: .infinity, alignment: responseTextAlignment.frameAlignment)
                 .transition(.opacity.combined(with: .move(edge: .top)))
@@ -790,8 +813,8 @@ private struct WritingResponseQuill: View {
             let cycle = context.date.timeIntervalSinceReferenceDate
                 .truncatingRemainder(dividingBy: 2.0)
             let progress = cycle / 2.0
-            let angle = sin(progress * 2.0 * .pi * 6.0) * 6.0
-            let x = 49.0 + ((progress < 0.833 ? progress / 0.833 : (1.0 - progress) / 0.167) * 22.0)
+            let angle = sin(progress * 2.0 * .pi * 6.0) * 4.0
+            let x = 49.0 + ((progress < 0.833 ? progress / 0.833 : (1.0 - progress) / 0.167) * 26.0)
             let y = 28.0 + abs(sin(progress * 2.0 * .pi * 7.2)) * 2.0
 
             Image("Quill")
@@ -801,7 +824,7 @@ private struct WritingResponseQuill: View {
                 .frame(width: 16, height: 16)
                 .foregroundStyle(color)
                 .rotationEffect(.radians(angle * .pi / 180.0), anchor: .bottomLeading)
-                .offset(x: CGFloat((x - 49.0) * 0.25), y: CGFloat((y - 28.0) * 0.35))
+                .offset(x: CGFloat((x - 49.0) * 0.28), y: CGFloat((y - 28.0) * 0.35))
                 .accessibilityHidden(true)
         }
         .frame(width: 16, height: 16)

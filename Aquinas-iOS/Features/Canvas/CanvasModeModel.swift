@@ -30,6 +30,12 @@ final class CanvasModeModel {
     var canvasClearSelectionRequest: Int = 0
     var canvasDismissHoverRequest: Int = 0
     var canvasCreateConceptRequest: Int = 0
+    /// Opens the focused Insight in the single-concept Study experience.
+    var canvasStudyRequest: Int = 0
+    /// Returns Study to its selected Insight without leaving the tree.
+    var canvasStudyExitRequest: Int = 0
+    var isCanvasStudyMode: Bool = false
+    var canvasStudyBranchCount: Int = 2
     var canvasInquireConnectionRequest: Int = 0
 
     /// The concepts selected for a connection inquiry.

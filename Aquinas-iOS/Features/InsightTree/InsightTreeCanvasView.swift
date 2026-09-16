@@ -287,7 +287,7 @@ struct InsightTreeCanvasView: View {
     }
 
     private func focusAnchor(in size: CGSize) -> CGPoint {
-        CGPoint(x: size.width / 2, y: size.height * 0.36)
+        CGPoint(x: size.width / 2, y: size.height * 0.40)
     }
 
     var body: some View {
@@ -997,8 +997,9 @@ struct InsightTreeCanvasView: View {
             ForEach(Array(visibleInsights.enumerated()), id: \.element.id) { index, insight in
                 if revealedInsightConnectorIDs.contains(insight.id) {
                     let start = depthScreenPosition(node.position, nodeID: node.id, camera: camera, size: size)
-                    let end = depthScreenPosition(
+                    let end = insightScreenPosition(
                         insightWorldPosition(for: node, index: index, count: visibleInsights.count),
+                        insightID: insight.id,
                         nodeID: node.id,
                         camera: camera,
                         size: size
@@ -1953,7 +1954,13 @@ struct InsightTreeCanvasView: View {
         // While unsplayed, render at the node center so the child appears to splay out from it.
         let atCenter      = unsplayedInsightIDs.contains(insight.id)
         let renderWorld   = atCenter ? node.position : worldPosition
-        let position      = depthScreenPosition(renderWorld, nodeID: node.id, camera: camera, size: size)
+        let position      = insightScreenPosition(
+            renderWorld,
+            insightID: insight.id,
+            nodeID: node.id,
+            camera: camera,
+            size: size
+        )
         // Stable per-chip delay (0.05–0.25s) so the title collapse/expand staggers across chips.
 
         return ZStack(alignment: .leading) {
@@ -2271,6 +2278,22 @@ struct InsightTreeCanvasView: View {
         p.x += activeOffset.width * lag
         p.y += activeOffset.height * lag
         return p
+    }
+
+    /// The active hover shares its unshifted camera position with the selection reticle and
+    /// dot-grid ripple. Depth parallax remains on every other chip, but must not displace the
+    /// focal chip away from the feedback that describes its selection.
+    private func insightScreenPosition(
+        _ world: CGPoint,
+        insightID: UUID,
+        nodeID: UUID,
+        camera: InsightTreeCamera,
+        size: CGSize
+    ) -> CGPoint {
+        if focusedInsightID == insightID {
+            return camera.worldToScreen(world, in: size)
+        }
+        return depthScreenPosition(world, nodeID: nodeID, camera: camera, size: size)
     }
 
     /// The node whose orbit an insight chip belongs to (for depth lookups by insight id).
@@ -2930,14 +2953,13 @@ struct InsightTreeCanvasView: View {
 
                 switch target {
                 case .insight(let insight):
-                    _ = withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
+                    withAnimation(
+                        .spring(response: 0.6, dampingFraction: 0.75),
+                        completionCriteria: .logicallyComplete
+                    ) {
                         revealedInsightIDs.insert(insight.id)
-                    }
-                    // Let the chip's spring finish before introducing its connector. The line
-                    // view then animates its own trim from the related Node toward the Insight.
-                    try? await Task.sleep(for: .milliseconds(620))
-                    guard !Task.isCancelled else { return }
-                    withAnimation(.easeInOut(duration: 0.62)) {
+                    } completion: {
+                        guard !Task.isCancelled else { return }
                         revealedInsightConnectorIDs.insert(insight.id)
                     }
                 case .node(let nodeID):
@@ -2956,15 +2978,14 @@ struct InsightTreeCanvasView: View {
             zoomToFit(worldPositions: positions, in: size)
             try? await Task.sleep(for: .milliseconds(1_100))
             guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.22)) {
+            withAnimation(
+                .easeOut(duration: 0.22),
+                completionCriteria: .logicallyComplete
+            ) {
                 revealedNodeIDs.formUnion(newNodeIDs)
                 revealedInsightIDs.formUnion(insightIDs)
-            }
-            // The group reveal uses the same post-chip delay, so all new connectors enter
-            // together after the Insights have fully animated in.
-            try? await Task.sleep(for: .milliseconds(620))
-            guard !Task.isCancelled else { return }
-            withAnimation(.easeInOut(duration: 0.62)) {
+            } completion: {
+                guard !Task.isCancelled else { return }
                 revealedInsightConnectorIDs.formUnion(insightIDs)
             }
             let center = CGPoint(
@@ -3145,12 +3166,15 @@ struct InsightTreeCanvasView: View {
                 zoomToInsight(insight, in: size)
                 try? await Task.sleep(nanoseconds: 950_000_000)   // spring settle ~0.95 s
                 guard !Task.isCancelled else { return }
-                _ = withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
+                withAnimation(
+                    .spring(response: 0.6, dampingFraction: 0.75),
+                    completionCriteria: .logicallyComplete
+                ) {
                     revealedInsightIDs.insert(insight.id)
+                } completion: {
+                    guard !Task.isCancelled else { return }
+                    revealedInsightConnectorIDs.insert(insight.id)
                 }
-                try? await Task.sleep(nanoseconds: 620_000_000)
-                guard !Task.isCancelled else { return }
-                revealedInsightConnectorIDs.insert(insight.id)
                 // Fire a ripple from this insight's world position as it springs in.
                 if let worldPos = worldPosition(forInsightID: insight.id) {
                     rippleTrigger = RippleTrigger(worldOrigin: worldPos,
@@ -3164,12 +3188,15 @@ struct InsightTreeCanvasView: View {
             zoomToFitInsights(newInsights, in: size)
             try? await Task.sleep(nanoseconds: 1_100_000_000)
             guard !Task.isCancelled else { return }
-            withAnimation(.spring(response: 0.6, dampingFraction: 0.75)) {
+            withAnimation(
+                .spring(response: 0.6, dampingFraction: 0.75),
+                completionCriteria: .logicallyComplete
+            ) {
                 revealedInsightIDs.formUnion(newIDs)
+            } completion: {
+                guard !Task.isCancelled else { return }
+                revealedInsightConnectorIDs.formUnion(newIDs)
             }
-            try? await Task.sleep(nanoseconds: 620_000_000)
-            guard !Task.isCancelled else { return }
-            revealedInsightConnectorIDs.formUnion(newIDs)
             // Single ripple at the centroid of all new insights.
             let positions = newInsights.compactMap { worldPosition(forInsightID: $0.id) }
             if !positions.isEmpty {
@@ -3278,12 +3305,12 @@ private struct AnimatableLine: Shape {
     }
 }
 
-/// A connector that reveals from its related Node toward the newly revealed Insight.
+/// A connector between a Node and one of its Insights. The parent controls when this view is
+/// inserted, so the line itself stays stateless while the camera is moving its endpoints.
 private struct InsightConnectorLine: View {
     var start: CGPoint
     var end: CGPoint
     var color: Color
-    @State private var drawProgress: CGFloat = 0
 
     init(start: CGPoint, end: CGPoint, color: Color) {
         self.start = start
@@ -3293,14 +3320,7 @@ private struct InsightConnectorLine: View {
 
     var body: some View {
         AnimatableLine(start: start, end: end)
-            .trim(from: 0, to: drawProgress)
             .stroke(color, style: StrokeStyle(lineWidth: 1, lineCap: .round))
-            .onAppear {
-                drawProgress = 0
-                withAnimation(.easeInOut(duration: 0.62)) {
-                    drawProgress = 1
-                }
-            }
     }
 }
 

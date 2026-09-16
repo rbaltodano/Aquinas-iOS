@@ -97,6 +97,9 @@ struct ChatThreadColumn: View {
     /// Height available above the bottom model controls. The pristine new-conversation
     /// prompt uses this to center its heading and composer as one unit.
     var newConversationViewportHeight: CGFloat = 0
+    /// A landscape phone has far less vertical space. Keep the first prompt comfortably
+    /// readable without forcing its heading and composer into opposite ends of the screen.
+    var usesCompactVerticalLayout: Bool = false
     /// The conversation's study topic name, if it belongs to one — takes priority over
     /// `emptyStateEyebrow` in the header eyebrow, and makes it tappable to change the topic.
     var studyTopicTitle: String? = nil
@@ -1092,7 +1095,7 @@ struct ChatThreadColumn: View {
                         .frame(height: 1)
                         .id(branchAnchor)
 
-                    VStack(alignment: .center, spacing: 48) {
+                    VStack(alignment: .center, spacing: usesCompactVerticalLayout ? 28 : 48) {
                         newConversationPromptHeader
 
                         newConversationQuestionField

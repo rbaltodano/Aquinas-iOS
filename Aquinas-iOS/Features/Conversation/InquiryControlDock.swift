@@ -477,9 +477,13 @@ private struct ModelControlsStack<Controls: View>: View {
     let confirmationTitle: String?
     let onConfirm: () -> Void
     let onDecline: () -> Void
+    let controlsUpdateKey: String
     let controls: Controls
     @Environment(\.modelCompletionNotifications) private var completionNotifications
     @State private var controlsWidth: CGFloat = 315
+    @State private var controlsScale: CGFloat = 1
+    @State private var hasMeasuredControls = false
+    @State private var controlsPulseTask: Task<Void, Never>?
 
     init(
         showsScrollToBottom: Bool = false,
@@ -497,6 +501,7 @@ private struct ModelControlsStack<Controls: View>: View {
         confirmationTitle: String? = nil,
         onConfirm: @escaping () -> Void = {},
         onDecline: @escaping () -> Void = {},
+        controlsUpdateKey: String = "",
         @ViewBuilder controls: () -> Controls
     ) {
         self.showsScrollToBottom = showsScrollToBottom
@@ -514,6 +519,7 @@ private struct ModelControlsStack<Controls: View>: View {
         self.confirmationTitle = confirmationTitle
         self.onConfirm = onConfirm
         self.onDecline = onDecline
+        self.controlsUpdateKey = controlsUpdateKey
         self.controls = controls()
     }
 
@@ -568,6 +574,7 @@ private struct ModelControlsStack<Controls: View>: View {
             }
 
             controls
+                .scaleEffect(controlsScale)
                 .background {
                     GeometryReader { geometry in
                         Color.clear.preference(
@@ -580,7 +587,18 @@ private struct ModelControlsStack<Controls: View>: View {
         .frame(maxWidth: .infinity, alignment: .center)
         .onPreferenceChange(ModelControlsWidthPreferenceKey.self) { width in
             guard width > 0, abs(controlsWidth - width) > 0.5 else { return }
+            let shouldPulseForSizeChange = hasMeasuredControls
+            hasMeasuredControls = true
             controlsWidth = width
+            if shouldPulseForSizeChange {
+                pulseControls()
+            }
+        }
+        .onChange(of: controlsUpdateKey) { _, _ in
+            pulseControls()
+        }
+        .onDisappear {
+            controlsPulseTask?.cancel()
         }
         .animation(
             .spring(response: 0.42, dampingFraction: 0.86),
@@ -606,6 +624,20 @@ private struct ModelControlsStack<Controls: View>: View {
             .spring(response: 0.42, dampingFraction: 0.86),
             value: confirmationTitle
         )
+    }
+
+    private func pulseControls() {
+        controlsPulseTask?.cancel()
+        withAnimation(.spring(response: 0.18, dampingFraction: 0.72)) {
+            controlsScale = 1.05
+        }
+        controlsPulseTask = Task {
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.78)) {
+                controlsScale = 1
+            }
+        }
     }
 }
 
@@ -940,7 +972,6 @@ struct PageModelControls: View {
     var onDecline: () -> Void = {}
     var action: () -> Void = {}
 
-    @State private var controlScale: CGFloat = 1
     @State private var isControlButtonPressed = false
     @AppStorage(SettingsStorageKey.modelActivityDisplay)
     private var activityDisplay: ModelActivityDisplayOption = .detailed
@@ -966,7 +997,8 @@ struct PageModelControls: View {
             modelTasks: modelTasks,
             confirmationTitle: confirmationTitle,
             onConfirm: onConfirm,
-            onDecline: onDecline
+            onDecline: onDecline,
+            controlsUpdateKey: controlLayoutKey
         ) {
             if showsControlPill {
                 HStack(
@@ -1005,7 +1037,6 @@ struct PageModelControls: View {
                 .background(AquinasTheme.Colors.canvasSecondary)
                 .clipShape(Capsule())
                 .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
-                .scaleEffect(controlScale)
                 .modifier(FloatingControlPressFeedback(isButtonPressed: isControlButtonPressed))
                 .transition(.scale(scale: 0.4).combined(with: .opacity))
                 .animation(.spring(response: 0.38, dampingFraction: 0.78), value: controlLayoutKey)
@@ -1023,12 +1054,6 @@ struct PageModelControls: View {
             )
             .ignoresSafeArea(edges: .bottom)
             .allowsHitTesting(false)
-        }
-        .onChange(of: controlLayoutKey) { _, _ in
-            controlScale = 1.05
-            withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
-                controlScale = 1
-            }
         }
         .onChange(of: modelTasks.isBusy) { _, isBusy in
             guard !isBusy else { return }
@@ -1060,7 +1085,6 @@ struct LibraryModelControls<Contents: View>: View {
     var onNextChapter: () -> Void = {}
     let contents: Contents
     @State private var isControlButtonPressed = false
-    @State private var dockScale: CGFloat = 1
 
     init(
         modelTasks: ModelTaskQueue,
@@ -1087,7 +1111,8 @@ struct LibraryModelControls<Contents: View>: View {
             modelTasksPopupState: modelTasksPopupState,
             modelTasks: modelTasks,
             supplementalPopupIsOpen: isContentsOpen,
-            supplementalPopup: AnyView(contents)
+            supplementalPopup: AnyView(contents),
+            controlsUpdateKey: controlLayoutKey
         ) {
             HStack(spacing: 24) {
                 if let previousChapterTitle {
@@ -1097,6 +1122,7 @@ struct LibraryModelControls<Contents: View>: View {
                         iconFirst: true,
                         action: onPreviousChapter
                     )
+                    .id(previousChapterTitle)
                         .transition(.blurFade)
                 }
 
@@ -1128,6 +1154,7 @@ struct LibraryModelControls<Contents: View>: View {
                         iconFirst: false,
                         action: onNextChapter
                     )
+                    .id(nextChapterTitle)
                         .transition(.blurFade)
                 }
             }
@@ -1137,7 +1164,6 @@ struct LibraryModelControls<Contents: View>: View {
             .background(AquinasTheme.Colors.canvasSecondary)
             .clipShape(Capsule())
             .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
-            .scaleEffect(dockScale)
             .animation(.spring(response: 0.38, dampingFraction: 0.78), value: controlLayoutKey)
         }
         .padding(.bottom, 24)
@@ -1155,9 +1181,6 @@ struct LibraryModelControls<Contents: View>: View {
             if !isBusy {
                 modelTasksPopupState.reset()
             }
-        }
-        .onChange(of: controlLayoutKey) { _, _ in
-            pulseDock()
         }
     }
 
@@ -1182,18 +1205,6 @@ struct LibraryModelControls<Contents: View>: View {
         return "\(previousChapterTitle ?? "")|\(nextChapterTitle ?? "")|\(taskKey)"
     }
 
-    private func pulseDock() {
-        withAnimation(.spring(response: 0.18, dampingFraction: 0.72)) {
-            dockScale = 1.05
-        }
-        Task {
-            try? await Task.sleep(for: .milliseconds(180))
-            guard !Task.isCancelled else { return }
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.78)) {
-                dockScale = 1
-            }
-        }
-    }
 }
 
 private struct ReaderChapterControlButton: View {
@@ -1220,6 +1231,7 @@ private struct ReaderChapterControlButton: View {
     private var iconView: some View {
         Image(systemName: icon)
             .font(.system(size: 11, weight: .semibold))
+            .sfSymbolDrawOn()
     }
 }
 
@@ -1270,6 +1282,7 @@ struct InquiryControlDock: View {
     var onSend: () -> Void = {}
     var onSelectCanvasItem: () -> Void = {}
     var onCreateCanvasConcept: () -> Void = {}
+    var onStudyCanvasInsight: () -> Void = {}
     var onInquireConnection: () -> Void = {}
     var onQuoteCanvasItem: () -> Void = {}
     /// Global and Study Topic trees use a two-step Ask flow instead of quoting immediately.
@@ -1280,6 +1293,10 @@ struct InquiryControlDock: View {
     var onCancelCanvasAsk: () -> Void = {}
     var onMidpointConcepts: () -> Void = {}
     var isMidpointMode: Bool = false
+    /// Study replaces the normal dock contents with Branch's placement controls.
+    var isStudyMode: Bool = false
+    var studyBranchCount: Int = 2
+    var onStudyBranchCountChange: (Int) -> Void = { _ in }
     /// While a placed midpoint insight is generating, the dock hides its canvas actions.
     var isCanvasInsightLoading: Bool = false
     /// Shared serialized model work. Drives both the status control and its task popup.
@@ -1310,7 +1327,6 @@ struct InquiryControlDock: View {
 
     @State private var canvasActionDrawID = UUID()
     @State private var isScrollButtonVisible = false
-    @State private var controlScale: CGFloat = 1
     @State private var isControlButtonPressed = false
     @State private var addFlashOpacity: CGFloat = 1
     @AppStorage(SettingsStorageKey.modelActivityDisplay)
@@ -1344,11 +1360,11 @@ struct InquiryControlDock: View {
     }
 
     private var showsAttachmentControl: Bool {
-        (!isCanvasMode || showsModelControlsInCanvasMode) && !isCanvasAskMode
+        (!isCanvasMode || showsModelControlsInCanvasMode) && !isCanvasAskMode && !isStudyMode
     }
 
     private var showsModelStatusControl: Bool {
-        activityDisplay != .hidden
+        !isStudyMode && activityDisplay != .hidden
             && modelTasks != nil
             && !(isCanvasMode && (
                 hasCanvasInsightHover
@@ -1374,10 +1390,11 @@ struct InquiryControlDock: View {
     }
 
     private var showsContextControl: Bool {
-        !isCanvasMode || (!hasSelectedCanvasItems && !isCanvasAskMode)
+        !isStudyMode && (!isCanvasMode || (!hasSelectedCanvasItems && !isCanvasAskMode))
     }
 
     private var controlCount: Int {
+        if isStudyMode { return 2 }
         if isCanvasMode && isCanvasAskMode {
             return 3
         }
@@ -1421,7 +1438,7 @@ struct InquiryControlDock: View {
     /// keep the same control count but change content width (e.g. the "Add" button ↔ the
     /// "Tap another Insight" hint) — so the capsule resizes with the same spring + scale bump.
     private var controlLayoutKey: String {
-        "\(controlCount)|\(modelTaskCounterKey)|\(isMidpointMode ? 1 : 0)|\(isCanvasInsightLoading ? 1 : 0)|\(hasCanvasHover ? 1 : 0)|\(hasCanvasInsightHover ? 1 : 0)|\(selectedCanvasItemCount)|\(showsSendButton ? 1 : 0)|\(canvasSearchIsActive ? 1 : 0)|\(isCanvasAskMode ? 1 : 0)"
+        "\(controlCount)|\(modelTaskCounterKey)|\(isStudyMode ? 1 : 0)|\(studyBranchCount)|\(isMidpointMode ? 1 : 0)|\(isCanvasInsightLoading ? 1 : 0)|\(hasCanvasHover ? 1 : 0)|\(hasCanvasInsightHover ? 1 : 0)|\(selectedCanvasItemCount)|\(showsSendButton ? 1 : 0)|\(canvasSearchIsActive ? 1 : 0)|\(isCanvasAskMode ? 1 : 0)"
     }
 
     /// Explicitly keys the pill's resize and 5% pulse to the fraction shown by Model Status.
@@ -1444,7 +1461,8 @@ struct InquiryControlDock: View {
             modelTasks: modelTasks,
             confirmationTitle: confirmationTitle,
             onConfirm: onConfirm,
-            onDecline: onDecline
+            onDecline: onDecline,
+            controlsUpdateKey: controlLayoutKey
         ) {
             ZStack(alignment: .top) {
                 HStack(alignment: .center, spacing: isCanvasAskMode ? 12 : 24) {
@@ -1467,7 +1485,13 @@ struct InquiryControlDock: View {
                     .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
 
-                if isCanvasMode && isCanvasAskMode {
+                if isCanvasMode && isStudyMode {
+                    StudyBranchDockControls(
+                        count: studyBranchCount,
+                        onCountChange: onStudyBranchCountChange
+                    )
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                } else if isCanvasMode && isCanvasAskMode {
                     canvasActionButton(
                         title: "New Conversation",
                         icon: "plus.bubble",
@@ -1526,7 +1550,7 @@ struct InquiryControlDock: View {
                         if hasCanvasInsightHover {
                             canvasActionButton(title: usesCanvasAskFlow ? "Ask" : "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
                                 .transition(.scale(scale: 0.4).combined(with: .opacity))
-                            canvasActionButton(title: "Make Node", icon: "move.3d", action: onCreateCanvasConcept)
+                            canvasActionButton(title: "Study", icon: "graph.3d", action: onStudyCanvasInsight)
                                 .transition(.scale(scale: 0.4).combined(with: .opacity))
                         } else if hasCanvasHover {
                             canvasActionButton(title: usesCanvasAskFlow ? "Ask" : "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
@@ -1535,7 +1559,7 @@ struct InquiryControlDock: View {
                     }
                 }
 
-                if isCanvasMode && hasSelectedCanvasItems && !isCanvasAskMode {
+                if isCanvasMode && hasSelectedCanvasItems && !isCanvasAskMode && !isStudyMode {
                     clearCanvasSelectionButton
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
@@ -1550,13 +1574,12 @@ struct InquiryControlDock: View {
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
                 }
-                .padding(.horizontal, isCanvasAskMode ? 16 : 32)
-                .padding(.vertical, 24)
+                .padding(.horizontal, isStudyMode ? 0 : (isCanvasAskMode ? 16 : 32))
+                .padding(.vertical, isStudyMode ? 0 : 24)
                 .fixedSize(horizontal: true, vertical: true)
-                .background(AquinasTheme.Colors.canvasSecondary)
+                .background(isStudyMode ? Color.clear : AquinasTheme.Colors.canvasSecondary)
                 .clipShape(Capsule())
-                .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
-                .scaleEffect(controlScale)
+                .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder.opacity(isStudyMode ? 0 : 1), lineWidth: 1))
                 .modifier(FloatingControlPressFeedback(isButtonPressed: isControlButtonPressed))
                 .animation(.spring(response: 0.38, dampingFraction: 0.78), value: controlLayoutKey)
                 .opacity(canvasSearchIsActive ? 0 : 1)
@@ -1592,12 +1615,6 @@ struct InquiryControlDock: View {
         .onReceive(NotificationCenter.default.publisher(for: .aquinasMiniScrollButtonVisibilityChanged)) { notification in
             guard let isVisible = notification.userInfo?["isVisible"] as? Bool else { return }
             isScrollButtonVisible = isVisible
-        }
-        .onChange(of: controlLayoutKey) { _, _ in
-            controlScale = 1.05
-            withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
-                controlScale = 1
-            }
         }
         .onChange(of: hasCanvasHover) { _, selected in
             if selected { canvasActionDrawID = UUID() }
@@ -1649,12 +1666,12 @@ struct InquiryControlDock: View {
         HStack(spacing: 16) {
             HStack(spacing: 8) {
                 Button(action: dismissCanvasSearch) {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 14, weight: .regular))
+                    Image(systemName: "xmark")
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(AquinasTheme.Colors.placeholderText)
                 }
                 .buttonStyle(FloatingControlButtonStyle(isPressed: $isControlButtonPressed))
-                .accessibilityLabel("Close Insight search")
+                .accessibilityLabel("Dismiss Insight search")
 
                 TextField(
                     "",

@@ -189,6 +189,7 @@ struct ContentView: View {
     @Environment(\.aquinasModel) private var aquinasModel
     @Environment(\.embeddingProvider) private var embeddingProvider
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     @State private var questionText: String = ""
     @State private var isAtBottom: Bool = false
@@ -267,6 +268,9 @@ struct ContentView: View {
     @State private var globalInsightClearSelectionRequest: Int = 0
     @State private var globalInsightDismissHoverRequest: Int = 0
     @State private var globalInsightCreateConceptRequest: Int = 0
+    @State private var globalInsightStudyRequest: Int = 0
+    @State private var globalInsightIsStudyMode: Bool = false
+    @State private var globalInsightStudyBranchCount: Int = 2
     @State private var globalInsightPromotedIDs: [UUID] =
         GlobalInsightPromotedIDsStore.load()
     @State private var globalInsightInquireConnectionRequest: Int = 0
@@ -441,7 +445,9 @@ struct ContentView: View {
     /// when switching between internal conversation pages. The conversation page keeps its own
     /// composer dock (`InquiryControlDock`), which is far more than a status/action pill and stays
     /// owned by `CurrentConversationView`.
-    @ViewBuilder private var globalModelControlsBar: some View {
+    @ViewBuilder private func globalModelControlsBar(
+        usesLandscapeInsightSplit: Bool
+    ) -> some View {
         switch displayedPage {
         case .home:
             PageModelControls(
@@ -502,6 +508,9 @@ struct ContentView: View {
                 hasSelectedCanvasItems: globalInsightSelectedItemCount > 0,
                 selectedCanvasItemCount: globalInsightSelectedItemCount,
                 isMidpointMode: globalInsightIsMidpointMode,
+                isStudyMode: globalInsightIsStudyMode,
+                studyBranchCount: globalInsightStudyBranchCount,
+                onStudyBranchCountChange: { globalInsightStudyBranchCount = $0 },
                 isCanvasInsightLoading: globalInsightIsGenerating,
                 contextWordCount: globalInsightContextWordCount,
                 modelTasks: modelTasks,
@@ -512,6 +521,7 @@ struct ContentView: View {
                 searchResultCount: globalInsightSearchResultCount,
                 onSelectCanvasItem: { globalInsightSelectionRequest += 1 },
                 onCreateCanvasConcept: { globalInsightCreateConceptRequest += 1 },
+                onStudyCanvasInsight: { globalInsightStudyRequest += 1 },
                 onInquireConnection: { globalInsightInquireConnectionRequest += 1 },
                 onQuoteCanvasItem: {
                     guard globalInsightQuoteTarget != nil else { return }
@@ -550,6 +560,11 @@ struct ContentView: View {
                 onDeclineUpdate: dismissGlobalInsightTreeUpdate,
                 contextCard: globalInsightsContextCardState
             )
+            .frame(maxWidth: usesLandscapeInsightSplit ? 420 : .infinity)
+            .frame(
+                maxWidth: .infinity,
+                alignment: usesLandscapeInsightSplit ? .trailing : .center
+            )
         case .studyTopics:
             if studyTopicsControls.isVisible {
                 PageModelControls(
@@ -574,6 +589,10 @@ struct ContentView: View {
             clearSelectionRequest: globalInsightClearSelectionRequest,
             dismissHoverRequest: globalInsightDismissHoverRequest,
             createConceptRequest: globalInsightCreateConceptRequest,
+            studyRequest: globalInsightStudyRequest,
+            studyBranchCount: globalInsightStudyBranchCount,
+            onStudyModeChange: { globalInsightIsStudyMode = $0 },
+            onStudyBranchCountChange: { globalInsightStudyBranchCount = $0 },
             restoreSelectedInsightID: globalInsightRestoreSelectionID,
             restoreSelectedNodeID: globalInsightHighlightedNodeID,
             nodeSelectionRequest: globalInsightNodeFocusRequest,
@@ -613,22 +632,18 @@ struct ContentView: View {
                 globalInsightPromotedIDs = $0
                 GlobalInsightPromotedIDsStore.save($0)
             },
-            savedConceptIDs: Set(collectedDefinitions.map(\.id)),
+            // Every item in the Global Insight Tree is, by definition, something the user chose
+            // to save. Keep the bookmark state tied to the tree snapshot rather than the broader
+            // collected-definition cache, which can also contain pending updates.
+            savedConceptIDs: Set(globalTreeInsights.map(\.id)),
             onToggleSavedConcept: { concept in
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                    if collectedDefinitions.contains(where: { $0.id == concept.id }) {
-                        collectedDefinitions.removeAll { $0.id == concept.id }
-                        // Un-saving must disappear from the global tree's own persisted
-                        // snapshot too, not just the bookmark list — otherwise relaunching
-                        // reloads the stale snapshot and the "removed" insight comes back.
-                        // Mirrors onRemoveInsight's immediate removal+persist above; only the
-                        // add direction is deliberately gated behind the "Update Tree" prompt.
-                        globalTreeInsights.removeAll { $0.id == concept.id }
-                        GlobalInsightTreeStore.save(globalTreeInsights)
-                    } else {
-                        collectedDefinitions.append(concept)
-                    }
+                    collectedDefinitions.removeAll { $0.id == concept.id }
+                    // Un-saving must disappear from the global tree's persisted snapshot too;
+                    // otherwise relaunching reloads the stale insight and the bookmark returns.
+                    globalTreeInsights.removeAll { $0.id == concept.id }
                 }
+                GlobalInsightTreeStore.save(globalTreeInsights)
             },
             onBookmarkConcepts: { concepts in
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
@@ -988,7 +1003,10 @@ struct ContentView: View {
                     // the page itself. `.safeAreaInset` also gives every page's scroll content the
                     // same automatic bottom clearance it always had, without hand-measuring heights.
                     .safeAreaInset(edge: .bottom) {
-                        globalModelControlsBar
+                        globalModelControlsBar(
+                            usesLandscapeInsightSplit: displayedPage == .insights
+                                && verticalSizeClass == .compact
+                        )
                             .animation(.easeInOut(duration: 0.22), value: displayedPage)
                     }
                 }
@@ -1718,15 +1736,69 @@ struct ContentView: View {
     }
 
     private func updateGlobalInsightTree() {
+        let reconciledInsights = reconcileGlobalInsights(
+            existing: globalTreeInsights,
+            incoming: collectedDefinitions
+        )
         withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
-            globalTreeInsights = collectedDefinitions.uniquedByWord()
+            globalTreeInsights = reconciledInsights
             isGlobalTreeUpdatePromptVisible = false
             suppressGlobalTreePromptUntilExternalModelCompletion = true
         }
-        GlobalInsightTreeStore.save(globalTreeInsights)
+        GlobalInsightTreeStore.save(reconciledInsights)
         globalInsightsContextCardState.reset()
         modelTasksPopupState.reset()
         UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.7)
+    }
+
+    /// Reconciles newly collected Insights against the existing global library without doing an
+    /// all-pairs comparison. Only the nearest existing candidate is considered, and only a very
+    /// high similarity is treated as the same underlying Insight. Unrelated Insights are retained
+    /// unchanged; parent/child and merely related concepts remain separate.
+    private func reconcileGlobalInsights(
+        existing: [ConceptDefinition],
+        incoming: [ConceptDefinition]
+    ) -> [ConceptDefinition] {
+        let existingByID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
+        var result = Array(existingByID.values)
+        let threshold = 0.86
+
+        for candidate in incoming.uniquedByWord() {
+            guard let candidateEmbedding = computeEmbedding(
+                for: "\(candidate.word). \(candidate.semanticDefinition)"
+            ) else { continue }
+
+            let nearest = result.compactMap { saved -> (ConceptDefinition, Double)? in
+                guard let savedEmbedding = computeEmbedding(
+                    for: "\(saved.word). \(saved.semanticDefinition)"
+                ) else { return nil }
+                return (saved, cosineSimilarity(candidateEmbedding, savedEmbedding))
+            }.max { $0.1 < $1.1 }
+
+            guard let (saved, similarity) = nearest, similarity >= threshold else {
+                if !result.contains(where: { $0.id == candidate.id }) { result.append(candidate) }
+                continue
+            }
+
+            // Keep the shorter title as the canonical display name. Prefer the more informative
+            // definition when one is clearly longer, avoiding duplicate chips while retaining the
+            // existing Insight's stable identity.
+            let canonicalTitle = candidate.word.split(separator: " ").count < saved.word.split(separator: " ").count
+                ? candidate.word : saved.word
+            let canonicalDefinitions = candidate.semanticDefinition.count > saved.semanticDefinition.count
+                ? candidate.contextualDefinitions : saved.contextualDefinitions
+            let merged = ConceptDefinition(
+                id: saved.id,
+                word: canonicalTitle,
+                partOfSpeech: saved.partOfSpeech,
+                pronunciation: saved.pronunciation,
+                meaning: canonicalDefinitions.first?.meaning ?? saved.meaning,
+                example: saved.example,
+                definitions: canonicalDefinitions
+            )
+            if let index = result.firstIndex(where: { $0.id == saved.id }) { result[index] = merged }
+        }
+        return result
     }
 
     private func dismissGlobalInsightTreeUpdate() {
@@ -1857,6 +1929,9 @@ private struct GlobalInsightsModelControls: View {
     let hasSelectedCanvasItems: Bool
     let selectedCanvasItemCount: Int
     let isMidpointMode: Bool
+    var isStudyMode: Bool = false
+    var studyBranchCount: Int = 2
+    var onStudyBranchCountChange: (Int) -> Void = { _ in }
     let isCanvasInsightLoading: Bool
     let contextWordCount: Int
     let modelTasks: ModelTaskQueue
@@ -1867,6 +1942,7 @@ private struct GlobalInsightsModelControls: View {
     let searchResultCount: Int
     var onSelectCanvasItem: () -> Void
     var onCreateCanvasConcept: () -> Void
+    var onStudyCanvasInsight: () -> Void
     var onInquireConnection: () -> Void
     var onQuoteCanvasItem: () -> Void
     let usesCanvasAskFlow: Bool
@@ -1905,6 +1981,7 @@ private struct GlobalInsightsModelControls: View {
             onOpenInsights: {},
             onSelectCanvasItem: onSelectCanvasItem,
             onCreateCanvasConcept: onCreateCanvasConcept,
+            onStudyCanvasInsight: onStudyCanvasInsight,
             onInquireConnection: onInquireConnection,
             onQuoteCanvasItem: onQuoteCanvasItem,
             usesCanvasAskFlow: usesCanvasAskFlow,
@@ -1914,6 +1991,9 @@ private struct GlobalInsightsModelControls: View {
             onCancelCanvasAsk: onCancelCanvasAsk,
             onMidpointConcepts: onMidpointConcepts,
             isMidpointMode: isMidpointMode,
+            isStudyMode: isStudyMode,
+            studyBranchCount: studyBranchCount,
+            onStudyBranchCountChange: onStudyBranchCountChange,
             isCanvasInsightLoading: isCanvasInsightLoading,
             modelTasks: modelTasks,
             modelTasksPopupState: modelTasksPopupState,

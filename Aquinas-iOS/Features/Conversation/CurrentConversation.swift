@@ -127,6 +127,7 @@ struct CurrentConversationView: View {
     @Environment(\.homeBackendService) private var homeBackendService
     @Environment(\.modelCompletionNotifications) private var modelCompletionNotifications
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     // MARK: Conversation list (source of truth for side menu)
     @State private var conversations: [InquiryConversation] = []
@@ -798,6 +799,11 @@ struct CurrentConversationView: View {
             clearSelectionRequest: canvasMode.canvasClearSelectionRequest,
             dismissHoverRequest: canvasMode.canvasDismissHoverRequest,
             createConceptRequest: canvasMode.canvasCreateConceptRequest,
+            studyRequest: canvasMode.canvasStudyRequest,
+            studyExitRequest: canvasMode.canvasStudyExitRequest,
+            studyBranchCount: canvasMode.canvasStudyBranchCount,
+            onStudyModeChange: { canvasMode.isCanvasStudyMode = $0 },
+            onStudyBranchCountChange: { canvasMode.canvasStudyBranchCount = $0 },
             promotedInsightIDs: canvasMode.promotedCanvasInsightIDs,
             onClose: closeTopicCanvas,
             onRemoveInsight: removeConversationInsight,
@@ -966,6 +972,7 @@ struct CurrentConversationView: View {
             },
             onSelectCanvasItem: { canvasMode.canvasSelectionRequest += 1 },
             onCreateCanvasConcept: { canvasMode.canvasCreateConceptRequest += 1 },
+            onStudyCanvasInsight: { canvasMode.canvasStudyRequest += 1 },
             onInquireConnection: { canvasMode.canvasInquireConnectionRequest += 1 },
             onQuoteCanvasItem: {
                 guard let target = canvasMode.canvasQuoteTarget else { return }
@@ -973,6 +980,9 @@ struct CurrentConversationView: View {
             },
             onMidpointConcepts: { canvasMode.canvasMidpointEnterRequest += 1 },
             isMidpointMode: canvasMode.isCanvasMidpointMode,
+            isStudyMode: canvasMode.isCanvasStudyMode,
+            studyBranchCount: canvasMode.canvasStudyBranchCount,
+            onStudyBranchCountChange: { canvasMode.canvasStudyBranchCount = $0 },
             isCanvasInsightLoading: canvasMode.isCanvasInsightGenerating,
             modelTasks: modelTasks,
             modelTasksPopupState: modelTasksPopupState,
@@ -1013,6 +1023,7 @@ struct CurrentConversationView: View {
     // MARK: Body
     var body: some View {
         GeometryReader { geo in
+            let usesCompactVerticalLayout = verticalSizeClass == .compact
             ZStack(alignment: .top) {
                 AquinasTheme.Colors.canvas.ignoresSafeArea()
 
@@ -1028,7 +1039,7 @@ struct CurrentConversationView: View {
                     startPoint: UnitPoint(x: 0.5, y: 0.33),
                     endPoint: UnitPoint(x: 0.5, y: 1)
                 )
-                .frame(height: 150)
+                .frame(height: usesCompactVerticalLayout ? 96 : 150)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .opacity(topConversationChromeOpacity)
                 .animation(.easeInOut(duration: 0.28), value: topConversationChromeOpacity)
@@ -1044,7 +1055,7 @@ struct CurrentConversationView: View {
                         startPoint: UnitPoint(x: 0.5, y: 0),
                         endPoint: UnitPoint(x: 0.5, y: 0.84)
                     )
-                    .frame(height: geo.size.height * 0.4)
+                    .frame(height: geo.size.height * (usesCompactVerticalLayout ? 0.28 : 0.4))
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     .ignoresSafeArea()
                     .allowsHitTesting(false)
@@ -1079,7 +1090,11 @@ struct CurrentConversationView: View {
                     onCanvasTap: enterCanvasMode,
                     onBackTap: {
                         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                            canvasMode.isTopicCanvasVisible = false
+                            if canvasMode.isCanvasStudyMode {
+                                canvasMode.canvasStudyExitRequest += 1
+                            } else {
+                                canvasMode.isTopicCanvasVisible = false
+                            }
                         }
                     },
                     onCommitTitle: { newTitle in
@@ -1530,7 +1545,10 @@ struct CurrentConversationView: View {
     private func branchPage(branch: Binding<ChatBranch>, geo: GeometryProxy) -> some View {
         let b = branch.wrappedValue
         let stableViewportHeight = max(geo.size.height, viewportSize.height)
-        let bottomRunwayHeight = stableViewportHeight * (isKeyboardOpen ? 0.85 : 0.35)
+        let usesCompactVerticalLayout = verticalSizeClass == .compact
+        let bottomRunwayHeight = stableViewportHeight * (
+            isKeyboardOpen ? (usesCompactVerticalLayout ? 0.55 : 0.85) : (usesCompactVerticalLayout ? 0.22 : 0.35)
+        )
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: false) {
                 Color.clear
@@ -1572,6 +1590,7 @@ struct CurrentConversationView: View {
                     emptyStateUserName: displayUserName,
                     emptyStateEyebrow: activeEmptyPromptEyebrow,
                     newConversationViewportHeight: stableViewportHeight,
+                    usesCompactVerticalLayout: usesCompactVerticalLayout,
                     studyTopicTitle: activeStudyTopicTitle,
                     onTapEyebrow: {
                         conversationForTopicPicker = conversations.first { $0.id == activeConversationID }
@@ -1695,7 +1714,8 @@ struct CurrentConversationView: View {
                         toggleSavedConcept(concept)
                     }
                 )
-                .padding(.horizontal, 36)
+                .padding(.horizontal, usesCompactVerticalLayout ? 48 : 36)
+                .frame(maxWidth: usesCompactVerticalLayout ? 1_120 : .infinity)
 
                 // Extra scroll runway lets focused question fields sit higher on screen,
                 // leaving room to see recent responses above the keyboard.

@@ -1087,17 +1087,18 @@ private struct LibraryDocumentDetail: View {
                             LibraryTextSection(
                                 title: selectedOutline.title,
                                 passages: document.passages.filter { visibleChunks.contains($0.chunkIndex) },
-                                animationID: selectedOutline.id,
                                 isVisible: isPageTextVisible
                             )
                             .id(selectedOutline.id)
                             .transition(.opacity.combined(with: .move(edge: .trailing)))
                         }
                         .padding(.horizontal, 24)
-                        .padding(.bottom, 240)
+                        .padding(.bottom, 24)
                 }
-                .id(selectedOutline.id)
-                    .safeAreaInset(edge: .bottom) {
+                // Keep the dock mounted while chapter text changes. Giving the ScrollView the
+                // outline ID recreated its safe-area inset on every chapter navigation, so the
+                // model controls lost the state that animates their resize and button entrance.
+                .safeAreaInset(edge: .bottom) {
                         LibraryModelControls(
                             modelTasks: modelTasks,
                             modelTasksPopupState: modelTasksPopupState,
@@ -1139,14 +1140,18 @@ private struct LibraryDocumentDetail: View {
             pageTransitionTask?.cancel()
         }
         .task(id: work.id) {
+            isPageTextVisible = false
             document = LibraryDocument.load(work)
             selectedSectionID = document?.sections.first?.id ?? "chapter-1"
             selectedOutlineID = document?.sections.first?.firstReadableDescendant.id ?? "chapter-1"
-            isPageTextVisible = true
             if let targetTitle,
                let match = document?.sections.first(where: { $0.title.caseInsensitiveCompare(targetTitle) == .orderedSame }) {
                 selectedSectionID = match.id
                 selectedOutlineID = match.firstReadableDescendant.id
+            }
+            await Task.yield()
+            withAnimation(.easeIn(duration: 0.25)) {
+                isPageTextVisible = true
             }
         }
     }
@@ -1176,67 +1181,26 @@ private struct LibraryDocumentDetail: View {
 private struct LibraryTextSection: View {
     let title: String
     let passages: [LibraryPassage]
-    let animationID: String
     let isVisible: Bool
-    @State private var visibleSegmentCount = 0
+    @AppStorage("aquinas.settings.conversationFontSize")
+    private var conversationFontSize: ConversationFontSizeOption = .small
+    @AppStorage("aquinas.settings.responseFont")
+    private var responseFont: ConversationFontOption = .sans
 
-    private var segments: [LibraryTextSegment] {
-        let segmentTexts = passages.flatMap { passage in
-            let sourceLines = passage.text
-                .components(separatedBy: .newlines)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-            let units = sourceLines.flatMap { line -> [String] in
-                var sentences: [String] = []
-                line.enumerateSubstrings(
-                    in: line.startIndex..<line.endIndex,
-                    options: [.bySentences, .localized]
-                ) { substring, _, _, _ in
-                    let sentence = substring?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    if !sentence.isEmpty { sentences.append(sentence) }
-                }
-                return sentences.isEmpty ? [line] : sentences
-            }
-            return units.map { (passage.id, $0) }
-        }
-        return segmentTexts.enumerated().map { index, segment in
-            LibraryTextSegment(id: "\(segment.0)-\(index)", text: segment.1, index: index)
-        }
+    private var documentText: String {
+        passages.map(\.text).joined(separator: "\n\n")
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(title).font(.custom("Figtree-Bold", size: 18)).foregroundStyle(AquinasTheme.Colors.headingText)
-            ForEach(segments) { segment in
-                Text(segment.text)
-                    .font(.figtreeParagraph)
-                    .lineSpacing(6)
-                    .foregroundStyle(AquinasTheme.Colors.paragraphText)
-                    .opacity(segment.index < visibleSegmentCount ? 1 : 0)
-                    .offset(x: segment.index < visibleSegmentCount ? 0 : 28)
-            }
+            Text(documentText)
+                .font(responseFont.textFont(size: conversationFontSize))
+                .lineSpacing(8)
+                .foregroundStyle(AquinasTheme.Colors.paragraphText)
         }
         .opacity(isVisible ? 1 : 0)
-        .task(id: animationID) {
-            visibleSegmentCount = 0
-            try? await Task.sleep(for: .milliseconds(180))
-            guard !Task.isCancelled else { return }
-            for count in 1...max(segments.count, 1) {
-                guard count <= segments.count else { break }
-                withAnimation(.easeOut(duration: 0.28)) {
-                    visibleSegmentCount = count
-                }
-                try? await Task.sleep(for: .milliseconds(45))
-                guard !Task.isCancelled else { return }
-            }
-        }
     }
-}
-
-private struct LibraryTextSegment: Identifiable {
-    let id: String
-    let text: String
-    let index: Int
 }
 
 private struct LibraryContentsCard: View {
@@ -1259,7 +1223,7 @@ private struct LibraryContentsCard: View {
                         }
                     }
                 }
-                .frame(maxHeight: 260)
+                .frame(maxHeight: 186)
             } else {
                 ForEach(sections) { section in
                     ContentsRow(title: section.title, isSelected: section.id == selectedOutlineID) { onSelectOutline(section.id) }

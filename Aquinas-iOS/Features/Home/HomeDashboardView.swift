@@ -25,6 +25,11 @@ struct HomeDashboardView: View {
     var onStartTodayInHistory: (TodayInHistoryCard) -> Void = { _ in }
     var onRefresh: () -> Void = {}
     var onLoadHomeSections: () -> Void = {}
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+
+    /// Landscape has ample horizontal room but a much shorter reading lane. This lets the
+    /// dashboard use the extra width while releasing vertical pressure on a phone.
+    private var usesLandscapeLayout: Bool { verticalSizeClass == .compact }
 
     @State private var studyTopics: [StudyTopic] = []
     @State private var usageMonth = MonthlyUsageStore.currentMonth()
@@ -62,8 +67,8 @@ struct HomeDashboardView: View {
                 .ignoresSafeArea()
 
             ScrollView(showsIndicators: false) {
-                VStack(alignment: .center, spacing: 48) {
-                    Color.clear.frame(height: 57)
+                VStack(alignment: .center, spacing: usesLandscapeLayout ? 32 : 48) {
+                    Color.clear.frame(height: usesLandscapeLayout ? 24 : 57)
 
                     VStack(alignment: .leading, spacing: 48) {
                         if let todayInHistory {
@@ -82,6 +87,7 @@ struct HomeDashboardView: View {
                             studyTopicCount: studyTopics.count,
                             unfinishedCount: unfinishedConversations.count,
                             questionOfTheDay: questionOfTheDay,
+                            usesLandscapeLayout: usesLandscapeLayout,
                             hidesGreetingHeader: todayInHistory != nil,
                             onStartQuestion: onStartQuestion
                         )
@@ -147,8 +153,8 @@ struct HomeDashboardView: View {
 
                     Color.clear.frame(height: 40)
                 }
-                .padding(.horizontal, 36)
-                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.horizontal, usesLandscapeLayout ? 48 : 36)
+                .frame(maxWidth: usesLandscapeLayout ? 1_120 : .infinity, alignment: .center)
             }
             .refreshable {
                 refreshContent()
@@ -156,7 +162,7 @@ struct HomeDashboardView: View {
 
             AquinasNavButton(onMenuTap: onOpenMenu)
                 .padding(.leading, 24)
-                .padding(.top, 24)
+                .padding(.top, usesLandscapeLayout ? 12 : 24)
                 .zIndex(2)
         }
         .onAppear {
@@ -192,11 +198,12 @@ private struct HomeFigmaOpeningSection: View {
     let studyTopicCount: Int
     let unfinishedCount: Int
     let questionOfTheDay: HomeQuestionOfTheDay?
+    let usesLandscapeLayout: Bool
     var hidesGreetingHeader: Bool = false
     var onStartQuestion: (HomeQuestionOfTheDay) -> Void
 
     var body: some View {
-        VStack(alignment: .center, spacing: 84) {
+        VStack(alignment: .center, spacing: usesLandscapeLayout ? 36 : 84) {
             VStack(alignment: .center, spacing: 48) {
                 if !hidesGreetingHeader {
                     VStack(alignment: .leading, spacing: 8) {
@@ -217,25 +224,51 @@ private struct HomeFigmaOpeningSection: View {
                     .transition(.opacity)
                 }
 
-                HStack(alignment: .center, spacing: 24) {
-                    HomeFigmaUsageGrid(month: month)
-
-                    HomeFigmaStatsGrid(
-                        conversationCount: conversationCount,
-                        insightCount: insightCount,
-                        studyTopicCount: studyTopicCount,
-                        unfinishedCount: unfinishedCount
-                    )
-                    .frame(maxWidth: .infinity)
-                }
+                HomeFigmaUsageAndStats(
+                    month: month,
+                    conversationCount: conversationCount,
+                    insightCount: insightCount,
+                    studyTopicCount: studyTopicCount,
+                    unfinishedCount: unfinishedCount
+                )
             }
 
-            if let questionOfTheDay {
+            if let questionOfTheDay, !usesLandscapeLayout {
                 HomeFigmaQuestionCard(
                     question: questionOfTheDay.question,
                     action: { onStartQuestion(questionOfTheDay) }
                 )
             }
+
+            if let questionOfTheDay, usesLandscapeLayout {
+                HomeFigmaQuestionCard(
+                    question: questionOfTheDay.question,
+                    action: { onStartQuestion(questionOfTheDay) }
+                )
+                .frame(maxWidth: 520)
+            }
+        }
+    }
+}
+
+private struct HomeFigmaUsageAndStats: View {
+    let month: MonthlyUsageMonth
+    let conversationCount: Int
+    let insightCount: Int
+    let studyTopicCount: Int
+    let unfinishedCount: Int
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 24) {
+            HomeFigmaUsageGrid(month: month)
+
+            HomeFigmaStatsGrid(
+                conversationCount: conversationCount,
+                insightCount: insightCount,
+                studyTopicCount: studyTopicCount,
+                unfinishedCount: unfinishedCount
+            )
+            .frame(maxWidth: .infinity)
         }
     }
 }

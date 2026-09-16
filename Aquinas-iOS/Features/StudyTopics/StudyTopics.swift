@@ -312,7 +312,11 @@ struct StudyTopicsView: View {
                         onBackTap: {
                             withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
                                 if topicCanvasMode.isTopicCanvasVisible {
-                                    topicCanvasMode.isTopicCanvasVisible = false
+                                    if topicCanvasMode.isCanvasStudyMode {
+                                        topicCanvasMode.canvasStudyExitRequest += 1
+                                    } else {
+                                        topicCanvasMode.isTopicCanvasVisible = false
+                                    }
                                 } else {
                                     selectedTopicID = nil
                                 }
@@ -1495,6 +1499,11 @@ struct StudyTopicDetailView: View {
             clearSelectionRequest: canvasMode.canvasClearSelectionRequest,
             dismissHoverRequest: canvasMode.canvasDismissHoverRequest,
             createConceptRequest: canvasMode.canvasCreateConceptRequest,
+            studyRequest: canvasMode.canvasStudyRequest,
+            studyExitRequest: canvasMode.canvasStudyExitRequest,
+            studyBranchCount: canvasMode.canvasStudyBranchCount,
+            onStudyModeChange: { canvasMode.isCanvasStudyMode = $0 },
+            onStudyBranchCountChange: { canvasMode.canvasStudyBranchCount = $0 },
             restoreSelectedInsightID: restoredTreeInsightID,
             promotedInsightIDs: canvasMode.promotedCanvasInsightIDs,
             onClose: closeInsightTree,
@@ -1558,6 +1567,7 @@ struct StudyTopicDetailView: View {
             onOpenInsights: {},
             onSelectCanvasItem: { canvasMode.canvasSelectionRequest += 1 },
             onCreateCanvasConcept: { canvasMode.canvasCreateConceptRequest += 1 },
+            onStudyCanvasInsight: { canvasMode.canvasStudyRequest += 1 },
             onInquireConnection: { canvasMode.canvasInquireConnectionRequest += 1 },
             onQuoteCanvasItem: {
                 guard canvasMode.canvasQuoteTarget != nil else { return }
@@ -1583,6 +1593,9 @@ struct StudyTopicDetailView: View {
             },
             onMidpointConcepts: { canvasMode.canvasMidpointEnterRequest += 1 },
             isMidpointMode: canvasMode.isCanvasMidpointMode,
+            isStudyMode: canvasMode.isCanvasStudyMode,
+            studyBranchCount: canvasMode.canvasStudyBranchCount,
+            onStudyBranchCountChange: { canvasMode.canvasStudyBranchCount = $0 },
             isCanvasInsightLoading: canvasMode.isCanvasInsightGenerating,
             modelTasks: modelTasks,
             modelTasksPopupState: modelTasksPopupState,

@@ -19,6 +19,12 @@ struct InsightTreeView: View {
     var clearSelectionRequest: Int = 0
     var dismissHoverRequest: Int = 0
     var createConceptRequest: Int = 0
+    /// Monotonically increasing request from the shared canvas controls to study the hovered Insight.
+    var studyRequest: Int = 0
+    var studyExitRequest: Int = 0
+    var studyBranchCount: Int = 2
+    var onStudyModeChange: ((Bool) -> Void)? = nil
+    var onStudyBranchCountChange: ((Int) -> Void)? = nil
     var restoreSelectedInsightID: UUID? = nil
     var restoreSelectedNodeID: UUID? = nil
     var nodeSelectionRequest: Int = 0
@@ -64,6 +70,13 @@ struct InsightTreeView: View {
     let reconcilesPersistedSavedInsights: Bool
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+
+    /// On a landscape phone the tree becomes a true left-hand workspace. The detail dock and
+    /// shared model controls use the matching right-hand pane instead of floating over the map.
+    private var usesLandscapeSplitLayout: Bool {
+        verticalSizeClass == .compact
+    }
 
     @StateObject private var viewModel: InsightTreeViewModel
     @State private var selectedInsight: InsightModel?
@@ -118,6 +131,13 @@ struct InsightTreeView: View {
     @State private var persistedTreeLoadGeneration: Int = 0
     @State private var isModelActionErrorPresented: Bool = false
     @State private var pendingModelActionRetry: (() -> Void)? = nil
+    /// The selected Insight stays selected beneath this overlay, so Exit can restore the exact
+    /// hover state the user entered from.
+    @State private var studyInsight: InsightModel?
+    @State private var isExitingStudy: Bool = false
+    /// Kept separate from `studyInsight` so the hovered card is reinserted with its normal
+    /// dock transition after Study clears, rather than merely becoming visible underneath it.
+    @State private var showsDockedCardAfterStudy: Bool = true
 
     init(
         insights: [ConceptDefinition],
@@ -127,6 +147,11 @@ struct InsightTreeView: View {
         clearSelectionRequest: Int = 0,
         dismissHoverRequest: Int = 0,
         createConceptRequest: Int = 0,
+        studyRequest: Int = 0,
+        studyExitRequest: Int = 0,
+        studyBranchCount: Int = 2,
+        onStudyModeChange: ((Bool) -> Void)? = nil,
+        onStudyBranchCountChange: ((Int) -> Void)? = nil,
         restoreSelectedInsightID: UUID? = nil,
         restoreSelectedNodeID: UUID? = nil,
         nodeSelectionRequest: Int = 0,
@@ -180,6 +205,11 @@ struct InsightTreeView: View {
         self.clearSelectionRequest = clearSelectionRequest
         self.dismissHoverRequest   = dismissHoverRequest
         self.createConceptRequest  = createConceptRequest
+        self.studyRequest          = studyRequest
+        self.studyExitRequest      = studyExitRequest
+        self.studyBranchCount      = studyBranchCount
+        self.onStudyModeChange     = onStudyModeChange
+        self.onStudyBranchCountChange = onStudyBranchCountChange
         self.restoreSelectedInsightID = restoreSelectedInsightID
         self.restoreSelectedNodeID = restoreSelectedNodeID
         self.nodeSelectionRequest  = nodeSelectionRequest
@@ -271,7 +301,24 @@ struct InsightTreeView: View {
     }
 
     var body: some View {
-        ZStack {
+        GeometryReader { geometry in
+            let treePaneWidth = usesLandscapeSplitLayout ? geometry.size.width / 2 : geometry.size.width
+            ZStack(alignment: .leading) {
+                if usesLandscapeSplitLayout {
+                    HStack(spacing: 0) {
+                        Color.clear
+                            .frame(width: treePaneWidth)
+
+                        AquinasTheme.Colors.canvas
+                            .overlay(alignment: .leading) {
+                                Rectangle()
+                                    .fill(AquinasTheme.Colors.quietBorder)
+                                    .frame(width: 1)
+                            }
+                    }
+                    .ignoresSafeArea()
+                }
+
             InsightTreeCanvasView(
                 nodes: viewModel.nodes,
                 edges: viewModel.edges,
@@ -347,8 +394,9 @@ struct InsightTreeView: View {
                     onUndiscoveredInsightCountChange?(count)
                 }
             )
-                .ignoresSafeArea()
-                .background(insightTreeCanvasColor)
+            .frame(width: treePaneWidth, height: geometry.size.height, alignment: .leading)
+            .background(insightTreeCanvasColor)
+            .allowsHitTesting(studyInsight == nil)
 
             if viewModel.nodes.isEmpty {
                 EmptyInsightTreeView()
@@ -357,7 +405,7 @@ struct InsightTreeView: View {
             VStack {
                 HStack {
                     if let onClose {
-                        Button(action: onClose) {
+                        Button(action: { studyInsight == nil ? onClose() : exitStudy() }) {
                             Image(systemName: "xmark")
                                 .font(.system(size: 12, weight: .semibold))
                                 .sfSymbolDrawOn()
@@ -373,6 +421,19 @@ struct InsightTreeView: View {
                 .padding(.top, 24)
 
                 Spacer()
+            }
+            .zIndex(11)
+
+            if let studyInsight {
+                StudyModeView(
+                    insight: studyInsight,
+                    branchCount: studyBranchCount,
+                    isExiting: isExitingStudy,
+                    onBranchCountChange: onStudyBranchCountChange ?? { _ in }
+                )
+                    .transition(.opacity)
+                    .zIndex(10)
+            }
             }
         }
         // safeAreaInset moves with the keyboard automatically — no manual observation needed.
@@ -411,7 +472,7 @@ struct InsightTreeView: View {
                         .gesture(dockedCardDismissGesture)
                         .transition(.bottomDockCard)
                         .padding(.horizontal, 10)
-                    } else if let selectedInsight {
+                    } else if showsDockedCardAfterStudy, let selectedInsight {
                         DockedInsightTreeCard(
                             insight: selectedInsight,
                             isSaved: savedConceptIDs.contains(selectedInsight.id),
@@ -535,11 +596,14 @@ struct InsightTreeView: View {
                 }
             }
             .padding(.bottom, 16)
+            .frame(maxWidth: usesLandscapeSplitLayout ? 420 : .infinity)
+            .frame(maxWidth: .infinity, alignment: usesLandscapeSplitLayout ? .trailing : .center)
             .animation(.spring(response: 0.42, dampingFraction: 0.86), value: selectedInsight?.id)
             .animation(.spring(response: 0.42, dampingFraction: 0.86), value: selectedNode?.id)
             .animation(.spring(response: 0.42, dampingFraction: 0.86), value: hoveredConcept?.id)
             .animation(.spring(response: 0.42, dampingFraction: 0.86), value: isMidpointMode)
             .animation(.spring(response: 0.34, dampingFraction: 0.86), value: undoInsight != nil)
+            .opacity(studyInsight == nil ? 1 : 0)
         }
         .onChange(of: insights) { oldValue, newValue in
             viewModel.updateInsights(newValue, promotedInsightIDs: promotedInsightIDs)
@@ -591,6 +655,13 @@ struct InsightTreeView: View {
         }
         .onChange(of: createConceptRequest) { _, _ in
             promoteHoveredInsightToConcept()
+        }
+        .onChange(of: studyRequest) { _, _ in
+            enterStudy()
+        }
+        .onChange(of: studyExitRequest) { _, _ in
+            guard studyInsight != nil else { return }
+            exitStudy()
         }
         .onChange(of: restoreSelectedInsightID) { _, _ in
             restoreRequestedInsightSelection()
@@ -745,6 +816,43 @@ struct InsightTreeView: View {
             selectedInsight = insight
             hoveredConcept = showQuestionBar ? nil : concept(for: insight)
             questionBarContextInsight = insight
+        }
+    }
+
+    private func enterStudy() {
+        guard let selectedInsight,
+              selectedCanvasTargets.isEmpty,
+              !isMidpointMode else {
+            return
+        }
+        onStudyBranchCountChange?(2)
+        isExitingStudy = false
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.72)
+        withAnimation(.easeOut(duration: 0.3)) {
+            showsDockedCardAfterStudy = false
+            studyInsight = selectedInsight
+        }
+        onStudyModeChange?(true)
+    }
+
+    private func exitStudy() {
+        guard studyInsight != nil, !isExitingStudy else { return }
+        withAnimation(.spring(response: 0.58, dampingFraction: 0.82)) {
+            isExitingStudy = true
+        }
+        Task {
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.16)) {
+                studyInsight = nil
+                isExitingStudy = false
+            }
+            try? await Task.sleep(for: .milliseconds(60))
+            guard !Task.isCancelled else { return }
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                showsDockedCardAfterStudy = true
+            }
+            onStudyModeChange?(false)
         }
     }
 

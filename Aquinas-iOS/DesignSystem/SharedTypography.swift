@@ -147,10 +147,17 @@ extension Animation {
 extension AnyTransition {
     /// Shared entrance/removal for cards presented immediately above the bottom control dock.
     /// The bottom anchor and vertical transform make the card feel connected to its trigger.
+    /// Giving each direction its own animation keeps removals from falling back to an
+    /// opacity-only fade when their state is cleared outside an explicit transaction.
     static var bottomDockCard: AnyTransition {
-        .scale(scale: 0.35, anchor: .bottom)
+        let cardTransform = AnyTransition.scale(scale: 0.35, anchor: .bottom)
             .combined(with: .offset(y: 24))
             .combined(with: .opacity)
+
+        return .asymmetric(
+            insertion: cardTransform.animation(.spring(response: 0.42, dampingFraction: 0.86)),
+            removal: cardTransform.animation(.spring(response: 0.34, dampingFraction: 0.86))
+        )
     }
 }
 
