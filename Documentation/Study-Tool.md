@@ -9,8 +9,8 @@ The view is intentionally reusable. Today it is presented from a hovered Insight
 ## Entry and exit
 
 1. The user hovers an Insight in the tree and selects **Study** (`graph.3d`).
-2. The Study overlay fades in over the canvas, preserving the sense that it sits in front of the tree rather than replacing the navigation hierarchy.
-3. The Insight title fades and deblurs into the top position. The dot matrix then resolves over its randomized entrance sequence, and the Insight symbol appears at its center.
+2. The selected Insight chip contracts to its bubble icon as the Study overlay fades in above the canvas. This preserves the sense that Study is a focused state of the same object, rather than a replacement navigation hierarchy.
+3. The title fades and deblurs above a matrix whose center remains at the canvas focal point. The dot matrix resolves over its randomized entrance sequence; the center symbol is already present when Study is entered from the tree, while standalone callers may opt into its distinct entrance.
 4. The existing **Back** control exits Study and returns to the hovered Insight in the tree. Pressing Back again follows the existing conversation navigation behavior.
 
 No duplicate Return or Exit control is introduced for Study. This keeps the navigation model consistent across the app.
@@ -23,7 +23,7 @@ No duplicate Return or Exit control is introduced for Study. This keeps the navi
 2. 300 × 300 point circular dot matrix
 3. Tool switcher and short explanation
 
-The major sections use a 48-point gap. The matrix has a fixed frame so switching tools does not cause the rest of the screen to move or resize.
+The title and matrix use a 20-point gap and are positioned as one cluster around the fixed matrix center. The carousel remains below the matrix. The matrix has a fixed frame so switching tools does not cause the rest of the screen to move or resize.
 
 ## Tool switcher
 
@@ -32,10 +32,10 @@ The switcher currently contains three tools:
 | Tool | Intent | Current matrix behavior |
 | --- | --- | --- |
 | Branch | Generate nearby related Insights | Shows selectable outer-ring destinations for 2–6 new Insights. |
-| Decompose | Break an Insight into semantic parts | Forms a fourth-ring decomposition band, then transfers its 2 o’clock marker outward. |
+| Deconstruct | Break an Insight into semantic parts | Forms a fourth-ring decomposition band, then transfers its 2 o’clock marker outward. |
 | Traverse | Move through a semantic direction | Copy and interaction shell only; visual behavior is reserved for vector-space traversal. |
 
-Users can use the arrow controls or swipe horizontally in the switcher below the dot matrix to change the active tool. Matrix gestures are reserved for the active tool, preventing a Branch count rotation from accidentally changing tools. Copy slides in from the direction of travel while the outgoing copy leaves in the opposite direction. Tool changes do not currently emit a generic haptic; tool-specific haptics are reserved for meaningful interactions.
+Users can use the arrow controls or swipe horizontally in the switcher below the dot matrix to change the active tool. The last selected tool is retained for the next Study session. Matrix gestures are reserved for the active tool, preventing a Branch count rotation from accidentally changing tools. Copy slides in from the direction of travel while the outgoing copy leaves in the opposite direction. Tool changes do not currently emit a generic haptic; tool-specific haptics are reserved for meaningful interactions.
 
 ## Dot matrix
 
@@ -80,9 +80,9 @@ When the count changes, the selected Branch dots reveal in a randomized 80–320
 
 The Place action currently provides tactile confirmation only. Its eventual responsibility is to commit the generated related Insights into the tree.
 
-## Decompose
+## Deconstruct
 
-Decompose begins by highlighting every dot in the fourth ring from the center. Those dots reveal in a shuffled order, using the same individual haptic-arrival treatment as Branch markers. After the ring has had time to complete, its 2 o’clock dot returns to the normal base-dot treatment while the matching 2 o’clock dot on the sixth (outer) ring grows into a persistent highlighted marker and registers a haptic.
+Deconstruct begins by highlighting every dot in the fourth ring from the center. Those dots reveal in a shuffled order, using the same individual haptic-arrival treatment as Branch markers. After the ring has had time to complete, its 2 o’clock dot returns to the normal base-dot treatment while the matching 2 o’clock dot on the sixth (outer) ring grows into a persistent highlighted marker and registers a haptic.
 
 This outward transfer is the first visual metaphor for decomposition: a selected semantic component separates from the Insight’s local structure and becomes available for further inspection.
 
@@ -107,7 +107,7 @@ This outward transfer is the first visual metaphor for decomposition: a selected
 
 ## Planned extensions
 
-- Extend Decompose from this visual structure into a token-level semantic decomposition of the selected Insight.
+- Extend Deconstruct from this visual structure into a token-level semantic decomposition of the selected Insight.
 - Implement Traverse as a directional vector-space exploration tool.
 - Make Place create and position the requested related Insights.
 - Reuse `StudyModeView` unchanged from the standalone Insights page.

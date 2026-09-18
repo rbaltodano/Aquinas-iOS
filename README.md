@@ -14,6 +14,9 @@ developing over time.
 It is being built for people who want room to think: students, seekers, teachers, and anyone
 working through questions of faith, meaning, truth, or human flourishing.
 
+> **Project status:** active development. Aquinas is not a hosted chat product or a finished
+> consumer release. The app is being refined as a private, local-first study environment.
+
 ## What it does
 
 - **Supports sustained inquiry.** Start a conversation, follow an idea into a branch, and return
@@ -26,6 +29,16 @@ working through questions of faith, meaning, truth, or human flourishing.
 - **Stays local by design.** The intended product keeps conversations, retrieval, and model work
   under the user's control rather than requiring an account or a cloud conversation history.
 
+## Highlights
+
+| Area | Experience |
+| --- | --- |
+| Conversation | Branch a line of inquiry, return to it later, compact older context, and keep the visible transcript intact. |
+| Study | Open contextual definitions, save durable Insights, and explore relationships in the Insight Tree. |
+| Sources | Retrieve relevant passages from a bundled local library for source-dependent questions. |
+| Reflection | Return to a Question of the Day, loose threads, historical prompts, and other optional study cues. |
+| Privacy | Keep the intended production experience local-first, with no account or cloud conversation history requirement. |
+
 ## A note on privacy and current development
 
 Aquinas is a local-first project, not a hosted chat service. The iOS app is designed to use an
@@ -36,6 +49,21 @@ intended production data boundary.
 This repository is an active development project. The local model and grounding assets are large
 and intentionally excluded from source control, so a full on-device experience requires the
 corresponding development assets.
+
+## For contributors
+
+The app is one part of a three-repository project. The backend supports development-time model,
+retrieval, and Insight Tree integration; the Foundations repository holds the shared product and
+architecture contracts.
+
+| Repository | Role |
+| --- | --- |
+| [Aquinas Backend](https://github.com/rbaltodano/Aquinas_Backend) | Local FastAPI/MLX development service, corpus tooling, evaluation, and persistent conversation-tree data. |
+| [Aquinas Foundations](https://github.com/rbaltodano/Aquinas-Foundations) | Shared product, design, model-integration, and Insight Tree documentation. |
+
+Before contributing, read [`AGENTS.md`](AGENTS.md). It routes implementation work to the focused
+architecture, runtime, workflow, and cross-repository documents without making the README carry
+internal development detail.
 
 ## Repository guide
 
@@ -58,6 +86,5 @@ xcodebuild -project Aquinas-iOS.xcodeproj -scheme Aquinas-iOS \
   -destination 'platform=iOS Simulator,name=iPhone 17' build
 ```
 
-For contributor architecture notes, implementation guardrails, and test guidance, see
-[`Aquinas-iOS/AGENTS.md`](Aquinas-iOS/AGENTS.md). The broader product and technical documentation
-is maintained alongside this project in the Aquinas Foundations repository.
+The README is intentionally public-facing. Detailed architecture, runtime constraints, and agent
+guidance are routed from [`AGENTS.md`](AGENTS.md).
