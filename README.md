@@ -39,6 +39,18 @@ working through questions of faith, meaning, truth, or human flourishing.
 | Reflection | Return to a Question of the Day, loose threads, historical prompts, and other optional study cues. |
 | Privacy | Keep the intended production experience local-first, with no account or cloud conversation history requirement. |
 
+## Screenshots
+
+<p align="center">
+  <img src="Documentation/Screenshots/home-dashboard.jpg" alt="Aquinas Home dashboard" width="23%">
+  <img src="Documentation/Screenshots/conversation-ecumenical-councils.jpg" alt="Aquinas conversation with annotated Insights" width="23%">
+  <img src="Documentation/Screenshots/insight-tree-church-doctrine-authority.jpg" alt="Aquinas Insight Tree" width="23%">
+  <img src="Documentation/Screenshots/study-branch.jpg" alt="Aquinas Study mode Branch tool" width="23%">
+</p>
+
+From left to right: the Home dashboard, a source-oriented conversation with contextual Insights,
+the Insight Tree, and focused Study mode.
+
 ## A note on privacy and current development
 
 Aquinas is a local-first project, not a hosted chat service. The iOS app is designed to use an
