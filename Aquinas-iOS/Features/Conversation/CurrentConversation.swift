@@ -1021,6 +1021,263 @@ struct CurrentConversationView: View {
 
     // MARK: Body
     var body: some View {
+        conversationWithStateSync
+        .onDisappear {
+            persistenceTask?.cancel()
+            insightTreeQueueRetryTask?.cancel()
+            insightTreeIdleDebounceTask?.cancel()
+            localInsightTreeSeedDebounceTask?.cancel()
+            saveCurrentConversation()
+            persistConversations()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                scheduleInsightTreeUpdateAfterIdle()
+                scheduleLocalInsightTreeSeedingAfterIdle()
+            } else {
+                insightTreeQueueRetryTask?.cancel()
+                insightTreeIdleDebounceTask?.cancel()
+                localInsightTreeSeedDebounceTask?.cancel()
+            }
+        }
+        // aq:// insight links
+        .environment(\.openURL, OpenURLAction { url in
+            guard url.scheme == "aq", let host = url.host else { return .systemAction }
+            let word = host.removingPercentEncoding ?? host
+            openDynamicDefinition(word: word, sourceResponseBlock: nil)
+            return .handled
+        })
+        // aq:// word insight sheet
+        .sheet(item: $definitionState.activeWord, onDismiss: presentNextCompletedDefinition) { sheetData in
+            insightSheet(for: sheetData)
+        }
+        // Insight library sheet (opened from "Insights" in the + menu)
+        .sheet(isPresented: $isInsightLibraryOpen) {
+            InsightLibraryPopup(
+                currentConversationInsights: currentConversationInsights(),
+                allInsights: collectedDefinitions,
+                savedInsights: $collectedDefinitions,
+                onQuote: { concept in
+                    withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
+                        attachedConcept = concept
+                        if focusedBranchID == nil {
+                            focusedBranchID = activeBranches.first?.id
+                        }
+                    }
+                    isInsightLibraryOpen = false
+                    Task {
+                        try? await Task.sleep(for: .milliseconds(180))
+                        scrollToBottomRequest += 1
+                    }
+                },
+                onFork: { concept in
+                    let parentID = focusedBranchID ?? activeBranches.first?.id
+                    let newBranch = ChatBranch(
+                        startingConcept: concept,
+                        parentBranchID: parentID,
+                        parentResponseIndex: targetSpawnResponseIndex,
+                        yOffset: targetSpawnY
+                    )
+                    withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
+                        insertBranch(newBranch, after: parentID)
+                    }
+                    isInsightLibraryOpen = false
+                },
+                onToggleSaved: { concept in
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                        if collectedDefinitions.contains(where: { $0.word.caseInsensitiveCompare(concept.word) == .orderedSame }) {
+                            collectedDefinitions.removeAll { $0.word.caseInsensitiveCompare(concept.word) == .orderedSame }
+                        } else {
+                            collectedDefinitions.append(concept)
+                        }
+                    }
+                }
+            )
+            .onPreferenceChange(InsightLibraryPopupHeightKey.self) { height in
+                insightLibraryPopupHeight = height
+            }
+            .presentationDetents([.height(insightLibrarySheetHeight)])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(AquinasTheme.Colors.canvas)
+        }
+    }
+
+    /// Split out of `body` so each piece stays small enough to type-check quickly; the
+    /// modifiers are applied in the same order as a single chain.
+    private var conversationWithStateSync: some View {
+        conversationScaffold
+        .onChange(of: focusedBranchID) { _, _ in
+            refreshDisplayedContextWordCount()
+        }
+        .onChange(of: activeBranches.count) { oldCount, newCount in
+            guard newCount > oldCount else { return }
+            let target = pendingFocusBranchTarget()
+            pendingFocusBranchID = nil
+            guard let target else { return }
+            let targetID = target.id
+            Task {
+                try? await Task.sleep(for: .milliseconds(100))
+                withAnimation(.spring(response: 0.5, dampingFraction: 0.78)) {
+                    focusedBranchID = targetID
+                }
+            }
+        }
+        .onChange(of: modelTasks.latestCompletedTask) { _, completedTask in
+            guard let completedTask,
+                  case .userQuestion(let branchID, _) = completedTask.kind,
+                  completedTask.conversationID == activeConversationID,
+                  let snapshot = CurrentConversationsStore.load(),
+                  let persistedConversation = snapshot.conversations.first(where: {
+                      $0.id == completedTask.conversationID
+                  }),
+                  let persistedBranch = persistedConversation.branches.first(where: {
+                      $0.id == branchID
+                  }) else {
+                return
+            }
+
+            // A conversation view mounted while this task was already running has its own local
+            // value state. Pull in only the completed branch, preserving drafts and edits on all
+            // other branches while making the finished answer appear immediately.
+            if let branchIndex = activeBranches.firstIndex(where: { $0.id == branchID }) {
+                activeBranches[branchIndex] = persistedBranch
+            }
+            if let conversationIndex = conversations.firstIndex(where: {
+                $0.id == persistedConversation.id
+            }) {
+                conversations[conversationIndex].branches = persistedConversation.branches
+                conversations[conversationIndex].title = persistedConversation.title
+            }
+            refreshDisplayedContextWordCount()
+            // Keep the reader's viewport stable when the completed response appears.
+            // Scrolling to the response remains an explicit action through the dock.
+        }
+        // MARK: - Persistence / conversation management
+        .onAppear {
+            let loadedSnapshot = CurrentConversationsStore.load()
+            if let snapshot = loadedSnapshot, !snapshot.conversations.isEmpty {
+                conversations = snapshot.conversations
+                // `openModelTaskPage` (tapping a task in the Model Tasks popup from a different
+                // page) sets `requestedConversationID` *before* this view is even created, so
+                // the `.onChange(of: requestedConversationID)` below never fires for it — that
+                // only catches a value set while this view is already mounted. Without this
+                // check, a fresh mount always fell back to whatever was last persisted as
+                // active, silently ignoring which conversation the tapped task actually belongs
+                // to (surfacing as "tapping the task opens a different/blank conversation").
+                let requestedID = requestedConversationID
+                if let requestedID {
+                    requestedConversationID = nil
+                }
+                let targetID = requestedID
+                    ?? snapshot.activeConversationID
+                    ?? snapshot.conversations.first?.id
+                if let id = targetID, let convo = snapshot.conversations.first(where: { $0.id == id }) {
+                    activeConversationID = id
+                    activeBranches = convo.branches.isEmpty ? [ChatBranch(startingConcept: nil)] : convo.branches
+                    canvasMode.promotedCanvasInsightIDs = convo.promotedInsightIDs
+                } else if let first = snapshot.conversations.first {
+                    activeConversationID = first.id
+                    activeBranches = first.branches.isEmpty ? [ChatBranch(startingConcept: nil)] : first.branches
+                    canvasMode.promotedCanvasInsightIDs = first.promotedInsightIDs
+                }
+            } else {
+                let initial = InquiryConversation()
+                conversations = [initial]
+                activeConversationID = initial.id
+                activeBranches = [ChatBranch(startingConcept: nil)]
+                canvasMode.promotedCanvasInsightIDs = []
+            }
+            focusedBranchID = activeBranches.first?.id
+            refreshDisplayedContextWordCount(animated: false)
+            if let activeConversationID {
+                manuallySavedConversationInsightIDs =
+                    ConversationInsightMembershipStore.insightIDs(for: activeConversationID)
+            }
+            studyTopics = StudyTopicStore.load()
+            publishShellMenuState()
+            scrollToBottomAfterLayout()
+
+            // A new-conversation request may have been fired while this view was
+            // unmounted (e.g. from the Study Topics page). Handle it now so the
+            // correct topic-tagged conversation is created instead of showing the
+            // most-recently saved one.
+            if newConversationRequest != handledNewConversationRequest {
+                handledNewConversationRequest = newConversationRequest
+                startNewConversation()
+            }
+            scheduleInsightTreeUpdateAfterIdle()
+            if let request = insightConversationQuoteRequest {
+                openInsightConversationQuote(request)
+            }
+        }
+        // Save branches back into the active conversation on every change, then persist.
+        // saveCurrentConversation + publishShellMenuState are cheap (memory only).
+        // persistConversations is debounced so UserDefaults isn't hit on every keystroke.
+        .onChange(of: activeBranches) { _, _ in
+            saveCurrentConversation()
+            // publishShellMenuState() intentionally omitted — side menu data doesn't
+            // change while typing, so calling it here causes a full AquinasSideMenu +
+            // StreamingMessageView re-render on every keystroke (the source of lag).
+            // It is called from onConversationTitleChange (post-submit), switchToConversation,
+            // startNewConversation, and .onAppear instead.
+            persistenceTask?.cancel()
+            persistenceTask = Task {
+                do { try await Task.sleep(for: .seconds(1.5)) } catch { return }
+                persistConversations()
+            }
+        }
+        // Side menu selected a conversation.
+        .onChange(of: requestedConversationID) { _, id in
+            guard let id, let convo = conversations.first(where: { $0.id == id }) else { return }
+            requestedConversationID = nil
+            switchToConversation(convo)
+        }
+        .onChange(of: insightConversationQuoteRequest) { _, request in
+            guard let request else { return }
+            openInsightConversationQuote(request)
+        }
+        // "New Conversation" button in side menu.
+        .onChange(of: newConversationRequest) { _, new in
+            guard new != handledNewConversationRequest else { return }
+            handledNewConversationRequest = new
+            startNewConversation()
+        }
+        // Conversation deleted from side menu / Conversations page.
+        .onChange(of: deletedConversationID) { _, id in
+            guard let id else { return }
+            deletedConversationID = nil
+            ConversationInsightMembershipStore.removeConversation(id)
+            LocalInsightTreeSeedStore.removeConversation(id)
+            conversations.removeAll { $0.id == id }
+            if activeConversationID == id {
+                if let first = conversations.first {
+                    switchToConversation(first)
+                } else {
+                    startNewConversation()
+                }
+            }
+            persistConversations()
+        }
+        // Sync title renames that ContentView applies directly to the sideMenuConversations binding.
+        .onChange(of: sideMenuConversations) { _, updated in
+            var changed = false
+            for mc in updated {
+                if let idx = conversations.firstIndex(where: { $0.id == mc.id }) {
+                    if conversations[idx].title != mc.title {
+                        conversations[idx].title = mc.title
+                        changed = true
+                    }
+                    if conversations[idx].studyTopicID != mc.studyTopicID {
+                        conversations[idx].studyTopicID = mc.studyTopicID
+                        changed = true
+                    }
+                }
+            }
+            if changed { persistConversations() }
+        }
+    }
+
+    private var conversationScaffold: some View {
         GeometryReader { geo in
             let usesCompactVerticalLayout = verticalSizeClass == .compact
             ZStack(alignment: .top) {
@@ -1260,253 +1517,6 @@ struct CurrentConversationView: View {
                 }
             }
             .ignoresSafeArea()
-        }
-        .onChange(of: focusedBranchID) { _, _ in
-            refreshDisplayedContextWordCount()
-        }
-        .onChange(of: activeBranches.count) { oldCount, newCount in
-            guard newCount > oldCount else { return }
-            let target = pendingFocusBranchTarget()
-            pendingFocusBranchID = nil
-            guard let target else { return }
-            let targetID = target.id
-            Task {
-                try? await Task.sleep(for: .milliseconds(100))
-                withAnimation(.spring(response: 0.5, dampingFraction: 0.78)) {
-                    focusedBranchID = targetID
-                }
-            }
-        }
-        .onChange(of: modelTasks.latestCompletedTask) { _, completedTask in
-            guard let completedTask,
-                  case .userQuestion(let branchID, _) = completedTask.kind,
-                  completedTask.conversationID == activeConversationID,
-                  let snapshot = CurrentConversationsStore.load(),
-                  let persistedConversation = snapshot.conversations.first(where: {
-                      $0.id == completedTask.conversationID
-                  }),
-                  let persistedBranch = persistedConversation.branches.first(where: {
-                      $0.id == branchID
-                  }) else {
-                return
-            }
-
-            // A conversation view mounted while this task was already running has its own local
-            // value state. Pull in only the completed branch, preserving drafts and edits on all
-            // other branches while making the finished answer appear immediately.
-            if let branchIndex = activeBranches.firstIndex(where: { $0.id == branchID }) {
-                activeBranches[branchIndex] = persistedBranch
-            }
-            if let conversationIndex = conversations.firstIndex(where: {
-                $0.id == persistedConversation.id
-            }) {
-                conversations[conversationIndex].branches = persistedConversation.branches
-                conversations[conversationIndex].title = persistedConversation.title
-            }
-            refreshDisplayedContextWordCount()
-            // Keep the reader's viewport stable when the completed response appears.
-            // Scrolling to the response remains an explicit action through the dock.
-        }
-        // MARK: - Persistence / conversation management
-        .onAppear {
-            let loadedSnapshot = CurrentConversationsStore.load()
-            if let snapshot = loadedSnapshot, !snapshot.conversations.isEmpty {
-                conversations = snapshot.conversations
-                // `openModelTaskPage` (tapping a task in the Model Tasks popup from a different
-                // page) sets `requestedConversationID` *before* this view is even created, so
-                // the `.onChange(of: requestedConversationID)` below never fires for it — that
-                // only catches a value set while this view is already mounted. Without this
-                // check, a fresh mount always fell back to whatever was last persisted as
-                // active, silently ignoring which conversation the tapped task actually belongs
-                // to (surfacing as "tapping the task opens a different/blank conversation").
-                let requestedID = requestedConversationID
-                if let requestedID {
-                    requestedConversationID = nil
-                }
-                let targetID = requestedID
-                    ?? snapshot.activeConversationID
-                    ?? snapshot.conversations.first?.id
-                if let id = targetID, let convo = snapshot.conversations.first(where: { $0.id == id }) {
-                    activeConversationID = id
-                    activeBranches = convo.branches.isEmpty ? [ChatBranch(startingConcept: nil)] : convo.branches
-                    canvasMode.promotedCanvasInsightIDs = convo.promotedInsightIDs
-                } else if let first = snapshot.conversations.first {
-                    activeConversationID = first.id
-                    activeBranches = first.branches.isEmpty ? [ChatBranch(startingConcept: nil)] : first.branches
-                    canvasMode.promotedCanvasInsightIDs = first.promotedInsightIDs
-                }
-            } else {
-                let initial = InquiryConversation()
-                conversations = [initial]
-                activeConversationID = initial.id
-                activeBranches = [ChatBranch(startingConcept: nil)]
-                canvasMode.promotedCanvasInsightIDs = []
-            }
-            focusedBranchID = activeBranches.first?.id
-            refreshDisplayedContextWordCount(animated: false)
-            if let activeConversationID {
-                manuallySavedConversationInsightIDs =
-                    ConversationInsightMembershipStore.insightIDs(for: activeConversationID)
-            }
-            studyTopics = StudyTopicStore.load()
-            publishShellMenuState()
-            scrollToBottomAfterLayout()
-
-            // A new-conversation request may have been fired while this view was
-            // unmounted (e.g. from the Study Topics page). Handle it now so the
-            // correct topic-tagged conversation is created instead of showing the
-            // most-recently saved one.
-            if newConversationRequest != handledNewConversationRequest {
-                handledNewConversationRequest = newConversationRequest
-                startNewConversation()
-            }
-            scheduleInsightTreeUpdateAfterIdle()
-            if let request = insightConversationQuoteRequest {
-                openInsightConversationQuote(request)
-            }
-        }
-        // Save branches back into the active conversation on every change, then persist.
-        // saveCurrentConversation + publishShellMenuState are cheap (memory only).
-        // persistConversations is debounced so UserDefaults isn't hit on every keystroke.
-        .onChange(of: activeBranches) { _, _ in
-            saveCurrentConversation()
-            // publishShellMenuState() intentionally omitted — side menu data doesn't
-            // change while typing, so calling it here causes a full AquinasSideMenu +
-            // StreamingMessageView re-render on every keystroke (the source of lag).
-            // It is called from onConversationTitleChange (post-submit), switchToConversation,
-            // startNewConversation, and .onAppear instead.
-            persistenceTask?.cancel()
-            persistenceTask = Task {
-                do { try await Task.sleep(for: .seconds(1.5)) } catch { return }
-                persistConversations()
-            }
-        }
-        // Side menu selected a conversation.
-        .onChange(of: requestedConversationID) { _, id in
-            guard let id, let convo = conversations.first(where: { $0.id == id }) else { return }
-            requestedConversationID = nil
-            switchToConversation(convo)
-        }
-        .onChange(of: insightConversationQuoteRequest) { _, request in
-            guard let request else { return }
-            openInsightConversationQuote(request)
-        }
-        // "New Conversation" button in side menu.
-        .onChange(of: newConversationRequest) { _, new in
-            guard new != handledNewConversationRequest else { return }
-            handledNewConversationRequest = new
-            startNewConversation()
-        }
-        // Conversation deleted from side menu / Conversations page.
-        .onChange(of: deletedConversationID) { _, id in
-            guard let id else { return }
-            deletedConversationID = nil
-            ConversationInsightMembershipStore.removeConversation(id)
-            LocalInsightTreeSeedStore.removeConversation(id)
-            conversations.removeAll { $0.id == id }
-            if activeConversationID == id {
-                if let first = conversations.first {
-                    switchToConversation(first)
-                } else {
-                    startNewConversation()
-                }
-            }
-            persistConversations()
-        }
-        // Sync title renames that ContentView applies directly to the sideMenuConversations binding.
-        .onChange(of: sideMenuConversations) { _, updated in
-            var changed = false
-            for mc in updated {
-                if let idx = conversations.firstIndex(where: { $0.id == mc.id }) {
-                    if conversations[idx].title != mc.title {
-                        conversations[idx].title = mc.title
-                        changed = true
-                    }
-                    if conversations[idx].studyTopicID != mc.studyTopicID {
-                        conversations[idx].studyTopicID = mc.studyTopicID
-                        changed = true
-                    }
-                }
-            }
-            if changed { persistConversations() }
-        }
-        .onDisappear {
-            persistenceTask?.cancel()
-            insightTreeQueueRetryTask?.cancel()
-            insightTreeIdleDebounceTask?.cancel()
-            localInsightTreeSeedDebounceTask?.cancel()
-            saveCurrentConversation()
-            persistConversations()
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
-                scheduleInsightTreeUpdateAfterIdle()
-                scheduleLocalInsightTreeSeedingAfterIdle()
-            } else {
-                insightTreeQueueRetryTask?.cancel()
-                insightTreeIdleDebounceTask?.cancel()
-                localInsightTreeSeedDebounceTask?.cancel()
-            }
-        }
-        // aq:// insight links
-        .environment(\.openURL, OpenURLAction { url in
-            guard url.scheme == "aq", let host = url.host else { return .systemAction }
-            let word = host.removingPercentEncoding ?? host
-            openDynamicDefinition(word: word, sourceResponseBlock: nil)
-            return .handled
-        })
-        // aq:// word insight sheet
-        .sheet(item: $definitionState.activeWord, onDismiss: presentNextCompletedDefinition) { sheetData in
-            insightSheet(for: sheetData)
-        }
-        // Insight library sheet (opened from "Insights" in the + menu)
-        .sheet(isPresented: $isInsightLibraryOpen) {
-            InsightLibraryPopup(
-                currentConversationInsights: currentConversationInsights(),
-                allInsights: collectedDefinitions,
-                savedInsights: $collectedDefinitions,
-                onQuote: { concept in
-                    withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
-                        attachedConcept = concept
-                        if focusedBranchID == nil {
-                            focusedBranchID = activeBranches.first?.id
-                        }
-                    }
-                    isInsightLibraryOpen = false
-                    Task {
-                        try? await Task.sleep(for: .milliseconds(180))
-                        scrollToBottomRequest += 1
-                    }
-                },
-                onFork: { concept in
-                    let parentID = focusedBranchID ?? activeBranches.first?.id
-                    let newBranch = ChatBranch(
-                        startingConcept: concept,
-                        parentBranchID: parentID,
-                        parentResponseIndex: targetSpawnResponseIndex,
-                        yOffset: targetSpawnY
-                    )
-                    withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
-                        insertBranch(newBranch, after: parentID)
-                    }
-                    isInsightLibraryOpen = false
-                },
-                onToggleSaved: { concept in
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                        if collectedDefinitions.contains(where: { $0.word.caseInsensitiveCompare(concept.word) == .orderedSame }) {
-                            collectedDefinitions.removeAll { $0.word.caseInsensitiveCompare(concept.word) == .orderedSame }
-                        } else {
-                            collectedDefinitions.append(concept)
-                        }
-                    }
-                }
-            )
-            .onPreferenceChange(InsightLibraryPopupHeightKey.self) { height in
-                insightLibraryPopupHeight = height
-            }
-            .presentationDetents([.height(insightLibrarySheetHeight)])
-            .presentationDragIndicator(.visible)
-            .presentationBackground(AquinasTheme.Colors.canvas)
         }
     }
 
