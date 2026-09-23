@@ -107,3 +107,8 @@ xcodebuild -project Aquinas-iOS.xcodeproj -scheme Aquinas-iOS \
 
 The README is intentionally public-facing. Detailed architecture, runtime constraints, and agent
 guidance are routed from [`AGENTS.md`](AGENTS.md).
+
+## License
+
+Copyright © 2026 Ryan Baltodano. All rights reserved. The source is public for reference and
+review; see [`LICENSE`](LICENSE) for details.
