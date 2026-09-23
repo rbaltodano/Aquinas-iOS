@@ -1979,14 +1979,6 @@ private extension LiteRTAquinasModel {
             return ["Checking the relevant distinctions and evidence before answering."]
         }
         var lines: [String] = []
-        let concepts = topicWords(in: rawQuestion)
-            .sorted()
-            .prefix(4)
-        if concepts.count >= 2 {
-            lines.append(
-                "Reading the question to identify its key concepts: \(concepts.joined(separator: ", "))."
-            )
-        }
         let question = rawQuestion.lowercased()
         if question.contains("council")
             || question.contains("nicaea")
