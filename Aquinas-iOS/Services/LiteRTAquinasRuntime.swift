@@ -4,7 +4,7 @@
 //
 
 import Foundation
-import LiteRTLM
+@preconcurrency import LiteRTLM
 import OSLog
 
 /// Resumes a `CheckedContinuation` at most once, whichever of two racing unstructured `Task`s
