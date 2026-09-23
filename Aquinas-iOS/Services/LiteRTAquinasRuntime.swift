@@ -4,7 +4,7 @@
 //
 
 import Foundation
-@preconcurrency import LiteRTLM
+import LiteRTLM
 import OSLog
 
 /// Resumes a `CheckedContinuation` at most once, whichever of two racing unstructured `Task`s
@@ -407,7 +407,7 @@ actor LiteRTAquinasRuntime: ModelRuntimeDriver {
     /// activity keeps resetting the clock and only a true no-progress stall fires the timeout.
     private static func abandoningStall<T: Sendable>(
         pollingAgainst runtime: LiteRTAquinasRuntime,
-        _ operation: @escaping @Sendable () async throws -> T,
+        _ operation: @escaping @Sendable @concurrent () async throws -> T,
         onTimeout: @escaping @Sendable () -> Void
     ) async throws -> T {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
@@ -455,7 +455,7 @@ actor LiteRTAquinasRuntime: ModelRuntimeDriver {
     /// (a single-worker pool) permanently stuck on DEADLINE_EXCEEDED, wedging every later
     /// generation for the rest of the process — far worse than just abandoning the call.
     private func racingStall<T: Sendable>(
-        _ operation: @escaping @Sendable () async throws -> T
+        _ operation: @escaping @Sendable @concurrent () async throws -> T
     ) async throws -> T {
         lastTokenAt = .now
         return try await Self.abandoningStall(pollingAgainst: self, operation, onTimeout: {})
