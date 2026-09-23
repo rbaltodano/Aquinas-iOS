@@ -915,7 +915,6 @@ struct CurrentConversationView: View {
         }
     }
 
-    @ViewBuilder
     /// The slash-command card shows while the keyboard is up and the composer holds a
     /// bare "/token", in Branch mode (not the topic canvas).
     private var showSlashCommandMenu: Bool {
