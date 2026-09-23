@@ -6,6 +6,13 @@
 
 **A private, local-first space for serious questions.**
 
+<p>
+  <img src="https://img.shields.io/badge/platform-iOS%2026.4%2B-2b2b2b?logo=apple" alt="Platform: iOS 26.4+">
+  <img src="https://img.shields.io/badge/UI-SwiftUI-F05138?logo=swift&logoColor=white" alt="UI: SwiftUI">
+  <img src="https://img.shields.io/badge/inference-on--device%20LiteRT-4b6e8a" alt="Inference: on-device LiteRT">
+  <img src="https://img.shields.io/badge/status-active%20development-8a6d3b" alt="Status: active development">
+</p>
+
 Aquinas is an iOS study and conversation app for exploring philosophy, theology, Scripture, and
 the questions that deserve more than a quick answer. Inspired by the Thomistic tradition, it pairs
 thoughtful conversation with source-grounded study and a visual map of the ideas a person is
@@ -70,7 +77,7 @@ architecture contracts.
 
 | Repository | Role |
 | --- | --- |
-| [Aquinas Backend](https://github.com/rbaltodano/Aquinas_Backend) | Local FastAPI/MLX development service, corpus tooling, evaluation, and persistent conversation-tree data. |
+| [Aquinas Backend](https://github.com/rbaltodano/Aquinas-Backend) | Local FastAPI/MLX development service, corpus tooling, evaluation, and persistent conversation-tree data. |
 | [Aquinas Foundations](https://github.com/rbaltodano/Aquinas-Foundations) | Shared product, design, model-integration, and Insight Tree documentation. |
 
 Before contributing, read [`AGENTS.md`](AGENTS.md). It routes implementation work to the focused
@@ -100,3 +107,8 @@ xcodebuild -project Aquinas-iOS.xcodeproj -scheme Aquinas-iOS \
 
 The README is intentionally public-facing. Detailed architecture, runtime constraints, and agent
 guidance are routed from [`AGENTS.md`](AGENTS.md).
+
+## License
+
+Copyright © 2026 Ryan Baltodano. All rights reserved. The source is public for reference and
+review; see [`LICENSE`](LICENSE) for details.
