@@ -395,7 +395,7 @@ struct InsightTreeCanvasView: View {
             let studyChipTargets = studyReady ? studyTapTargets(layout: layout, camera: camera, size: size) : []
             let studyNodeTarget = studyReady ? studyNodeTapTarget(camera: camera, size: size) : nil
 
-            ZStack {
+            let canvas = ZStack {
                 insightTreeCanvasColor.ignoresSafeArea()
                 AnimatedDotGridBackground(
                     settledOffset: cameraState.offset,
@@ -510,6 +510,14 @@ struct InsightTreeCanvasView: View {
 
                 focusHoveredTarget(at: focusTarget, in: size)
             }
+            canvasRequestObservers(canvasLifecycleObservers(canvas, size: size), size: size)
+        }
+    }
+
+    /// Appearance, topology, and camera-request observers. Split out of `body` so its modifier
+    /// chain stays within the type checker's limits on older toolchains.
+    private func canvasLifecycleObservers<Content: View>(_ content: Content, size: CGSize) -> some View {
+        content
             .onAppear {
                 hasAppeared = true
                 reconcileBodies()   // seed live physics bodies + start the tick
@@ -649,6 +657,11 @@ struct InsightTreeCanvasView: View {
                 guard !newOnes.isEmpty else { return }
                 beginMakeNodeLoading(newOnes, in: newNodes, size: size)
             }
+    }
+
+    /// Loading, midpoint, and pulse observers, split out of `body` like `canvasLifecycleObservers`.
+    private func canvasRequestObservers<Content: View>(_ content: Content, size: CGSize) -> some View {
+        content
             .onChange(of: loadingInsightIDs.isEmpty) { _, empty in
                 if empty {
                     loadingFlashOpacity = 1
@@ -759,7 +772,6 @@ struct InsightTreeCanvasView: View {
                     )
                 }
             }
-        }
     }
 
     /// Single drag gesture that routes to handle movement when the drag starts near the

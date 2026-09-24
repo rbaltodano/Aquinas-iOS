@@ -312,6 +312,12 @@ struct InsightTreeView: View {
     }
 
     var body: some View {
+        treeAlerts(treeRequestObservers(treeScreen))
+    }
+
+    /// The tree, its overlays, and the docked bottom area. The observers and alerts are split
+    /// out so `body`'s modifier chain stays within the type checker's limits on older toolchains.
+    private var treeScreen: some View {
         GeometryReader { geometry in
             let treePaneWidth = usesLandscapeSplitLayout ? geometry.size.width / 2 : geometry.size.width
             ZStack(alignment: .leading) {
@@ -643,6 +649,10 @@ struct InsightTreeView: View {
             .animation(.spring(response: 0.42, dampingFraction: 0.86), value: showsStudyToolCard)
             .animation(.spring(response: 0.42, dampingFraction: 0.86), value: showsDockedCardAfterStudy)
         }
+    }
+
+    private func treeRequestObservers<Content: View>(_ content: Content) -> some View {
+        content
         .onChange(of: insights) { oldValue, newValue in
             viewModel.updateInsights(newValue, promotedInsightIDs: promotedInsightIDs)
             restoreRequestedInsightSelection()
@@ -750,6 +760,10 @@ struct InsightTreeView: View {
                 onMidpointGeneratingChange?(false)
             }
         }
+    }
+
+    private func treeAlerts<Content: View>(_ content: Content) -> some View {
+        content
         .alert("Remove from conversation?", isPresented: Binding(
             get: { pendingRemoveInsight != nil },
             set: { if !$0 { pendingRemoveInsight = nil } }
@@ -1498,7 +1512,9 @@ struct InsightTreeView: View {
     /// position, then generates and swaps in its real content without changing its identity.
     private func placeMidpointInsight(at worldPosition: CGPoint, nearestTarget: CanvasSelectionTarget, weights: [Double]) {
         let sourceTargets = selectedCanvasTargets
-        let sourceConcepts = sourceTargets.compactMap { concept(for: $0) }
+        // `self.` because a local `concept` later in this function shadows the method on
+        // older Swift toolchains.
+        let sourceConcepts = sourceTargets.compactMap { self.concept(for: $0) }
         guard sourceConcepts.count >= 2, sourceConcepts.count == weights.count else { return }
         let cachedSourceEmbeddings = sourceTargets.map { cachedEmbedding(for: $0) }
         // Connect the placed midpoint to every source it was spawned from — to the insight chip
