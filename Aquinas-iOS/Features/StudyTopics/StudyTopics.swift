@@ -305,9 +305,10 @@ struct StudyTopicsView: View {
 
             // Single morphing nav button that floats above both layers.
             VStack {
-                HStack {
+                HStack(spacing: 8) {
                     AquinasNavButton(
-                        isDetailVisible: selectedTopicID != nil,
+                        // In Study the Back becomes the menu, with an Exit beside it.
+                        isDetailVisible: selectedTopicID != nil && !topicCanvasMode.isCanvasStudyMode,
                         onMenuTap: onOpenMenu,
                         onBackTap: {
                             withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
@@ -323,8 +324,17 @@ struct StudyTopicsView: View {
                             }
                         }
                     )
+                    if topicCanvasMode.isCanvasStudyMode {
+                        StudyExitButton {
+                            withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                                topicCanvasMode.canvasStudyExitRequest += 1
+                            }
+                        }
+                        .transition(.studyExitGrow)
+                    }
                     Spacer()
                 }
+                .animation(.spring(response: 0.42, dampingFraction: 0.84), value: topicCanvasMode.isCanvasStudyMode)
                 .padding(.horizontal, 24)
                 .padding(.top, 24)
                 Spacer()

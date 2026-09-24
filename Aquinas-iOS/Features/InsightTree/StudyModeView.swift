@@ -6,76 +6,102 @@
 import SwiftUI
 import UIKit
 
-/// The focused, single-Insight shell for Study. Each tool will eventually give the matrix its
+/// What Study is focused on.
+enum StudySubject {
+    case insight(InsightModel)
+    /// A Node Concept. The tree canvas itself frames the node into the slot in 3D, optionally
+    /// opening with one of its Insights hovered (Study pressed on that Insight).
+    case node(NodeModel, hoveredInsightID: UUID? = nil)
+
+    var id: UUID {
+        switch self {
+        case .insight(let insight): insight.id
+        case .node(let node, _): node.id
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .insight(let insight): insight.title
+        case .node(let node, _): node.conceptLabel
+        }
+    }
+}
+
+/// The focused shell for Study. For an Insight, each tool will eventually give the matrix its
 /// own semantic behavior; this pass establishes Branch's count selection and placement surface.
+/// For a Node Concept there is no matrix and no backdrop: this view only reserves the slot
+/// (reported through `onNodeSlotChange`) while the tree canvas moves its camera to frame the
+/// tree's own node there in 3D. The tool switcher lives in `StudyToolCard`, docked below like
+/// an Insight card; the tools are not yet wired to a Node Concept.
 struct StudyModeView: View {
-    let insight: InsightModel
+    let subject: StudySubject
+    /// The active tool, chosen in `StudyToolCard`.
+    let tool: StudyTool
     let branchCount: Int
     let isExiting: Bool
     /// The Insight Tree already supplies its own focus transition. A standalone Insights page
     /// can opt in to a distinct center-icon entrance when it adopts this shared Study surface.
     var animatesCenterIconEntrance: Bool = true
     let onBranchCountChange: (Int) -> Void
+    /// The node slot's frame in `InsightTreeStackSpace`.
+    var onNodeSlotChange: (CGRect) -> Void = { _ in }
 
-    @AppStorage("study.lastSelectedTool") private var lastSelectedToolRawValue = StudyTool.branch.rawValue
-    @State private var selectedTool: StudyTool = .branch
     @State private var hasEntered: Bool = false
     @State private var showsCenterIcon: Bool = false
-    @State private var toolTransitionDirection: Int = 1
+    /// Height of the removed title row, kept so the slot stays where it was.
+    private static let removedTitleHeight: CGFloat = 22
 
     var body: some View {
         GeometryReader { proxy in
-            let matrixDiameter: CGFloat = 300
-            let titleHeight: CGFloat = 24
-            let titleMatrixSpacing: CGFloat = 20
-            let matrixCenter = CGPoint(x: proxy.size.width / 2, y: proxy.size.height / 2)
-            // The title sits above the matrix without changing its fixed focal point.
-            let titleMatrixClusterCenterY = matrixCenter.y - (titleHeight + titleMatrixSpacing) / 2
-
             ZStack {
-                AquinasTheme.Colors.canvas
-                    .ignoresSafeArea()
-                    .opacity(hasEntered ? 1 : 0)
-
-                VStack(spacing: titleMatrixSpacing) {
-                    StudyInsightTitle(title: insight.title)
-                        .frame(height: titleHeight)
+                // A Node Concept is studied in the tree canvas itself, which fades the rest of the
+                // tree; only the Insight view covers the tree.
+                if case .insight = subject {
+                    AquinasTheme.Colors.canvas
+                        .ignoresSafeArea()
                         .opacity(hasEntered ? 1 : 0)
-                        .blur(radius: hasEntered ? 0 : 8)
-
-                    StudyDotMatrix(
-                        insightID: insight.id,
-                        tool: selectedTool,
-                        branchCount: branchCount,
-                        isVisible: hasEntered,
-                        isExiting: isExiting,
-                        showsCenterIcon: showsCenterIcon,
-                        onBranchCountChange: onBranchCountChange
-                    )
-                    .frame(width: matrixDiameter, height: matrixDiameter)
-                    // Keep the matrix present after the surrounding Study chrome fades so
-                    // its dots can retrace their entrance during the one-second exit.
-                    .opacity(hasEntered || isExiting ? 1 : 0)
-                    .transition(.opacity)
                 }
-                .frame(width: matrixDiameter)
-                .position(x: matrixCenter.x, y: titleMatrixClusterCenterY)
 
-                StudyToolCarousel(
-                    tool: selectedTool,
-                    transitionDirection: toolTransitionDirection,
-                    onPrevious: { select(selectedTool.previous, direction: -1) },
-                    onNext: { select(selectedTool.next, direction: 1) }
-                )
-                .padding(.horizontal, 24)
-                .frame(width: proxy.size.width)
-                .opacity(hasEntered ? 1 : 0)
-                .offset(y: hasEntered ? 0 : 18)
-                .position(x: matrixCenter.x, y: matrixCenter.y + matrixDiameter / 2 + 48 + 36)
+                VStack(spacing: 48) {
+                    // The title row is gone; this keeps the slot at its original height.
+                    Color.clear
+                        .frame(height: Self.removedTitleHeight)
+                        .padding(.top, max(proxy.safeAreaInsets.top, 20) + 28)
+
+                    switch subject {
+                    case .insight(let insight):
+                        StudyDotMatrix(
+                            insightID: insight.id,
+                            tool: tool,
+                            branchCount: branchCount,
+                            isVisible: hasEntered,
+                            isExiting: isExiting,
+                            showsCenterIcon: showsCenterIcon,
+                            onBranchCountChange: onBranchCountChange
+                        )
+                        .frame(width: 300, height: 300)
+                        // Keep the matrix present after the surrounding Study chrome fades so
+                        // its dots can retrace their entrance during the one-second exit.
+                        .opacity(hasEntered || isExiting ? 1 : 0)
+                        .transition(.opacity)
+                    case .node:
+                        // Reserves and reports the slot the canvas frames the node into.
+                        Color.clear
+                            .frame(width: 300, height: 300)
+                            .onGeometryChange(for: CGRect.self) { proxy in
+                                proxy.frame(in: .named(InsightTreeStackSpace.name))
+                            } action: { frame in
+                                onNodeSlotChange(frame)
+                            }
+                    }
+
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
         }
-        .task(id: insight.id) {
-            selectedTool = StudyTool(rawValue: lastSelectedToolRawValue) ?? .branch
+        .task(id: subject.id) {
             hasEntered = false
             showsCenterIcon = !animatesCenterIconEntrance
             withAnimation(.easeOut(duration: 0.2)) {
@@ -96,21 +122,32 @@ struct StudyModeView: View {
             }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Study \(insight.title)")
+        .accessibilityLabel("Study \(subject.title)")
     }
-
-    private func select(_ tool: StudyTool, direction: Int) {
-        guard tool != selectedTool else { return }
-        toolTransitionDirection = direction
-        withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
-            selectedTool = tool
-        }
-        lastSelectedToolRawValue = tool.rawValue
-    }
-
 }
 
-private enum StudyTool: String, CaseIterable, Hashable {
+/// Study's tool switcher in a docked card that matches the Insight card exactly
+/// (`dockedCardChrome`), presented with the same pop-up transition.
+struct StudyToolCard: View {
+    let tool: StudyTool
+    let transitionDirection: Int
+    let onPrevious: () -> Void
+    let onNext: () -> Void
+
+    var body: some View {
+        StudyToolCarousel(
+            tool: tool,
+            transitionDirection: transitionDirection,
+            onPrevious: onPrevious,
+            onNext: onNext
+        )
+        // The Insight card trims its bottom to offset its definition's line spacing; this
+        // card ends in the page dots, so it keeps the full 32 pt for the same visual margin.
+        .dockedCardChrome(bottomPadding: 32)
+    }
+}
+
+enum StudyTool: String, CaseIterable, Hashable {
     case branch
     case deconstruct
     case traverse
@@ -143,18 +180,8 @@ private enum StudyTool: String, CaseIterable, Hashable {
     var previous: Self { Self.allCases[(position - 2 + Self.allCases.count) % Self.allCases.count] }
 }
 
-private struct StudyInsightTitle: View {
-    let title: String
-
-    var body: some View {
-        Label(title, systemImage: "text.bubble.fill")
-            .font(.custom("Figtree-Bold", size: 18, relativeTo: .headline))
-            .foregroundStyle(AquinasTheme.Colors.lightGreen)
-            .lineLimit(1)
-            .padding(.horizontal, 24)
-    }
-}
-
+/// Kept in case it becomes useful again; only Insights without an ordinary parent Node Concept
+/// (placed midpoints) reach it. Remove before launch if still unused (Documentation/Study-Tool.md).
 private struct StudyDotMatrix: View {
     let insightID: UUID
     let tool: StudyTool

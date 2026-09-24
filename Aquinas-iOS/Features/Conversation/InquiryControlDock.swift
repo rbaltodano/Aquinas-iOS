@@ -1300,6 +1300,10 @@ struct InquiryControlDock: View {
     var isMidpointMode: Bool = false
     /// Study replaces the normal dock contents with Branch's placement controls.
     var isStudyMode: Bool = false
+    /// Follows `isStudyMode`, except that leaving Study first tucks Place away (the reverse of
+    /// its entrance) before the normal controls return.
+    @State private var showsStudyControls = false
+    @State private var isLeavingStudy = false
     var studyBranchCount: Int = 2
     var onStudyBranchCountChange: (Int) -> Void = { _ in }
     /// While a placed midpoint insight is generating, the dock hides its canvas actions.
@@ -1369,14 +1373,14 @@ struct InquiryControlDock: View {
     }
 
     private var showsAttachmentControl: Bool {
-        (!isCanvasMode || showsModelControlsInCanvasMode) && !isCanvasAskMode && !isStudyMode
+        (!isCanvasMode || showsModelControlsInCanvasMode) && !isCanvasAskMode && !showsStudyControls
     }
 
     private var showsModelStatusControl: Bool {
-        !isStudyMode && activityDisplay != .hidden
+        !showsStudyControls && activityDisplay != .hidden
             && modelTasks != nil
             && !(isCanvasMode && (
-                hasCanvasInsightHover
+                hasCanvasHover
                     || hasSelectedCanvasItems
                     || isMidpointMode
                     || isCanvasAskMode
@@ -1400,12 +1404,12 @@ struct InquiryControlDock: View {
 
     private var showsContextControl: Bool {
         showsContextWheel
-            && !isStudyMode
+            && !showsStudyControls
             && (!isCanvasMode || (!hasSelectedCanvasItems && !isCanvasAskMode))
     }
 
     private var controlCount: Int {
-        if isStudyMode { return 2 }
+        if showsStudyControls { return 2 }
         if isCanvasMode && isCanvasAskMode {
             return 3
         }
@@ -1432,10 +1436,8 @@ struct InquiryControlDock: View {
             } else {
                 canvasActionCount = 1 // Select only
             }
-        } else if hasCanvasInsightHover {
-            canvasActionCount = 3 // Select + Quote + Make Node
         } else if hasCanvasHover {
-            canvasActionCount = 2 // Select + Quote
+            canvasActionCount = 3 // Select + Quote + Study (Insights and Node Concepts)
         } else {
             canvasActionCount = 0
         }
@@ -1450,7 +1452,7 @@ struct InquiryControlDock: View {
     /// "Tap another Insight" hint) — so the capsule resizes with the same spring + scale bump.
     private var controlLayoutKey: String {
         let statusKey = modelStatusOverride ?? "idle"
-        return "\(controlCount)|\(modelTaskCounterKey)|\(statusKey)|\(isStudyMode ? 1 : 0)|\(studyBranchCount)|\(isMidpointMode ? 1 : 0)|\(isCanvasInsightLoading ? 1 : 0)|\(hasCanvasHover ? 1 : 0)|\(hasCanvasInsightHover ? 1 : 0)|\(selectedCanvasItemCount)|\(showsSendButton ? 1 : 0)|\(canvasSearchIsActive ? 1 : 0)|\(isCanvasAskMode ? 1 : 0)"
+        return "\(controlCount)|\(modelTaskCounterKey)|\(statusKey)|\(showsStudyControls ? 1 : 0)|\(studyBranchCount)|\(isMidpointMode ? 1 : 0)|\(isCanvasInsightLoading ? 1 : 0)|\(hasCanvasHover ? 1 : 0)|\(hasCanvasInsightHover ? 1 : 0)|\(selectedCanvasItemCount)|\(showsSendButton ? 1 : 0)|\(canvasSearchIsActive ? 1 : 0)|\(isCanvasAskMode ? 1 : 0)"
     }
 
     /// Explicitly keys the pill's resize and 5% pulse to the fraction shown by Model Status.
@@ -1507,10 +1509,11 @@ struct InquiryControlDock: View {
                     }
                 }
 
-                if isCanvasMode && isStudyMode {
+                if isCanvasMode && showsStudyControls {
                     StudyBranchDockControls(
                         count: studyBranchCount,
-                        onCountChange: onStudyBranchCountChange
+                        onCountChange: onStudyBranchCountChange,
+                        isLeaving: isLeavingStudy
                     )
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
                 } else if isCanvasMode && isCanvasAskMode {
@@ -1569,19 +1572,17 @@ struct InquiryControlDock: View {
                     } else {
                         // No selection yet — entry point while hovering an insight/node.
                         selectCanvasActionButton
-                        if hasCanvasInsightHover {
+                        // Study opens for a hovered Insight or Node Concept.
+                        if hasCanvasHover {
                             canvasActionButton(title: usesCanvasAskFlow ? "Ask" : "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
                                 .transition(.scale(scale: 0.4).combined(with: .opacity))
                             canvasActionButton(title: "Study", icon: "graph.3d", action: onStudyCanvasInsight)
-                                .transition(.scale(scale: 0.4).combined(with: .opacity))
-                        } else if hasCanvasHover {
-                            canvasActionButton(title: usesCanvasAskFlow ? "Ask" : "Quote", icon: "arrow.turn.down.right", action: onQuoteCanvasItem)
                                 .transition(.scale(scale: 0.4).combined(with: .opacity))
                         }
                     }
                 }
 
-                if isCanvasMode && hasSelectedCanvasItems && !isCanvasAskMode && !isStudyMode {
+                if isCanvasMode && hasSelectedCanvasItems && !isCanvasAskMode && !showsStudyControls {
                     clearCanvasSelectionButton
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
@@ -1596,12 +1597,12 @@ struct InquiryControlDock: View {
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
                 }
-                .padding(.horizontal, isStudyMode ? 0 : (isCanvasAskMode ? 16 : 32))
-                .padding(.vertical, isStudyMode ? 0 : 24)
+                .padding(.horizontal, showsStudyControls ? 0 : (isCanvasAskMode ? 16 : 32))
+                .padding(.vertical, showsStudyControls ? 0 : 24)
                 .fixedSize(horizontal: true, vertical: true)
-                .background(AquinasTheme.Colors.canvasSecondary.opacity(isStudyMode ? 0 : 1))
+                .background(AquinasTheme.Colors.canvasSecondary.opacity(showsStudyControls ? 0 : 1))
                 .clipShape(Capsule())
-                .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder.opacity(isStudyMode ? 0 : 1), lineWidth: 1))
+                .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder.opacity(showsStudyControls ? 0 : 1), lineWidth: 1))
                 .modifier(FloatingControlPressFeedback(isButtonPressed: isControlButtonPressed))
                 .animation(.spring(response: 0.38, dampingFraction: 0.78), value: controlLayoutKey)
                 .opacity(canvasSearchIsActive ? 0 : 1)
@@ -1633,6 +1634,26 @@ struct InquiryControlDock: View {
         }
         .onAppear {
             isScrollButtonVisible = !isAtBottom
+            showsStudyControls = isStudyMode
+        }
+        .onChange(of: isStudyMode) { _, isStudying in
+            if isStudying {
+                isLeavingStudy = false
+                withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
+                    showsStudyControls = true
+                }
+            } else {
+                // Reverse of the entrance: Place tucks away, then the normal controls return.
+                isLeavingStudy = true
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(300))
+                    guard !isStudyMode else { return }
+                    withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
+                        showsStudyControls = false
+                    }
+                    isLeavingStudy = false
+                }
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .aquinasMiniScrollButtonVisibilityChanged)) { notification in
             guard let isVisible = notification.userInfo?["isVisible"] as? Bool else { return }

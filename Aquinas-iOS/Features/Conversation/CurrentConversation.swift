@@ -1086,6 +1086,7 @@ struct CurrentConversationView: View {
                     titleDraft: $titleEditDraft,
                     conversationFontSize: conversationFontSize,
                     isInStudyTopic: activeStudyTopicTitle != nil,
+                    isStudyMode: canvasMode.isCanvasStudyMode,
                     onMenuTap: onOpenMenu,
                     onCanvasTap: enterCanvasMode,
                     onBackTap: {
@@ -2569,6 +2570,8 @@ private struct BranchModeTopBar: View {
     @Binding var titleDraft: String
     let conversationFontSize: ConversationFontSizeOption
     var isInStudyTopic: Bool = false
+    /// In Study the canvas's Back becomes the side-menu button with an Exit beside it.
+    var isStudyMode: Bool = false
     var onMenuTap: () -> Void
     var onCanvasTap: () -> Void
     var onBackTap: () -> Void
@@ -2650,16 +2653,24 @@ private struct BranchModeTopBar: View {
             .allowsHitTesting(!isCanvasMode)
 
             // Canvas mode layout
-            HStack {
-                CanvasModeToggleButton(
-                    isActive: true,
-                    updateSignal: insightTreeUpdateSignal,
-                    action: onBackTap
-                )
-                    .matchedGeometryEffect(id: "canvasModeButton", in: titleNamespace, isSource: isCanvasMode)
-                    .opacity(isCanvasMode ? 1 : 0)
+            HStack(spacing: 8) {
+                if isStudyMode {
+                    AquinasNavButton(onMenuTap: onMenuTap)
+                        .transition(.blurFade)
+                    StudyExitButton(action: onBackTap)
+                        .transition(.studyExitGrow)
+                } else {
+                    CanvasModeToggleButton(
+                        isActive: true,
+                        updateSignal: insightTreeUpdateSignal,
+                        action: onBackTap
+                    )
+                        .matchedGeometryEffect(id: "canvasModeButton", in: titleNamespace, isSource: isCanvasMode)
+                        .opacity(isCanvasMode ? 1 : 0)
+                }
                 Spacer()
             }
+            .animation(.spring(response: 0.42, dampingFraction: 0.84), value: isStudyMode)
             .padding(.horizontal, 24)
             .padding(.top, 24)
             .allowsHitTesting(isCanvasMode)

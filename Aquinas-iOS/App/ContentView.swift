@@ -605,6 +605,23 @@ struct ContentView: View {
         }
     }
 
+    /// The Insights page's side-menu button; in Study it grows an Exit back to the tree.
+    private var globalInsightMenuControls: some View {
+        HStack(spacing: 8) {
+            SideMenuTriggerButton {
+                dismissKeyboard()
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                    isGlobalSideMenuOpen = true
+                }
+            }
+            if globalInsightIsStudyMode {
+                StudyExitButton { globalInsightStudyExitRequest += 1 }
+                    .transition(.studyExitGrow)
+            }
+        }
+        .animation(.spring(response: 0.42, dampingFraction: 0.84), value: globalInsightIsStudyMode)
+    }
+
     @ViewBuilder private var insightTreePage: some View {
         InsightTreeView(
             insights: globalTreeInsights,
@@ -1183,16 +1200,7 @@ struct ContentView: View {
                 // guarantees the panel renders above everything, including page
                 // content that ignores the safe area (e.g. fade gradients).
                 if activePage == .insights && !isGlobalSideMenuOpen {
-                    SideMenuTriggerButton(isBackButton: globalInsightIsStudyMode) {
-                        if globalInsightIsStudyMode {
-                            globalInsightStudyExitRequest += 1
-                        } else {
-                            dismissKeyboard()
-                            withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                isGlobalSideMenuOpen = true
-                            }
-                        }
-                    }
+                    globalInsightMenuControls
                     .padding(.leading, 24)
                     .padding(.top, 24)
                     .transition(.scale(scale: 0.92).combined(with: .opacity))

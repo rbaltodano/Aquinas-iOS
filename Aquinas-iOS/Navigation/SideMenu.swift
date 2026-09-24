@@ -9,12 +9,11 @@ import SwiftUI
 
 /// Always-available top-left trigger for the conversation side panel.
 struct SideMenuTriggerButton: View {
-    var isBackButton: Bool = false
     var action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: isBackButton ? "chevron.left" : "line.3.horizontal.decrease")
+            Image(systemName: "line.3.horizontal.decrease")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(AquinasTheme.Colors.darkGreen)
                 .sfSymbolDrawOn()
@@ -27,7 +26,46 @@ struct SideMenuTriggerButton: View {
                 )
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(isBackButton ? "Return to Insight Tree" : "Open side menu")
+        .accessibilityLabel("Open side menu")
+    }
+}
+
+/// Grows beside the side-menu button while Study is open and returns to the Insight Tree.
+/// Figma: source-of-truth 944:1098 (48 pt tall capsule, × icon, "Exit").
+struct StudyExitButton: View {
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(AquinasTheme.Colors.darkGreen)
+                    .frame(width: 14, height: 14)
+                Text("Exit")
+                    .font(AquinasTheme.Typography.uiSubheading)
+                    .foregroundColor(AquinasTheme.Colors.paragraphText)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .padding(.horizontal, 19)
+            .frame(height: 48)
+            .background(AquinasTheme.Colors.canvasSecondary)
+            .clipShape(Capsule())
+            .overlay(
+                Capsule()
+                    .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Exit Study")
+    }
+}
+
+extension AnyTransition {
+    /// The Exit capsule grows out of the side-menu button beside it.
+    static var studyExitGrow: AnyTransition {
+        .scale(scale: 0.4, anchor: .leading).combined(with: .blurFade)
     }
 }
 
