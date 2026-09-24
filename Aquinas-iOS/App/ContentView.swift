@@ -34,7 +34,7 @@ struct UploadedFile: Identifiable, Equatable, Hashable, Codable {
     }
 }
 
-struct InsightDefinition: Identifiable, Equatable, Hashable, Codable {
+struct InsightDefinition: Identifiable, Equatable, Hashable, Codable, Sendable {
     let id: UUID
     let context: String
     let meaning: String
@@ -54,7 +54,7 @@ struct InsightDefinition: Identifiable, Equatable, Hashable, Codable {
     }
 }
 
-struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable {
+struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable, Sendable {
     let id: UUID
     let word: String
     let partOfSpeech: String
@@ -203,6 +203,7 @@ struct ContentView: View {
     @State private var globalTreeInsights: [ConceptDefinition] =
         GlobalInsightTreeStore.load()
     @State private var isGlobalTreeUpdatePromptVisible: Bool = false
+    @State private var isGlobalTreeReconciling: Bool = false
     /// After accepting an update, Global Insights stays quiet until model work originating on a
     /// different page completes. Global-page actions must not repeatedly re-offer the same sync.
     @State private var suppressGlobalTreePromptUntilExternalModelCompletion: Bool = false
@@ -222,13 +223,12 @@ struct ContentView: View {
     @State private var isSettingsDetailVisible: Bool = false
     @State private var isConversationCanvasMode: Bool = false
     @State private var globalInsightsContextCardState = ContextCardState()
-    // Live drag state for the pull-from-left-edge gesture.
-    @State private var sideMenuDragOffset: CGFloat = 0
-    @State private var isDraggingToOpenMenu: Bool = false
-    @State private var menuOpenHapticFired: Bool = false
     @State private var sideMenuConversations: [InquiryConversation] = []
     @State private var sideMenuActiveConversationID: UUID? = nil
     @State private var sideMenuCurrentTitle: String = "New Conversation"
+    /// Changes only when sidebar content changes. The live drag offset must not
+    /// force the menu's complete row hierarchy to be rebuilt every frame.
+    @State private var sideMenuRenderVersion = 0
     @State private var requestedConversationID: UUID? = nil
     @State private var requestedTopicID: UUID? = nil
     @State private var insightConversationQuoteRequest: InsightConversationQuoteRequest? = nil
@@ -269,6 +269,7 @@ struct ContentView: View {
     @State private var globalInsightDismissHoverRequest: Int = 0
     @State private var globalInsightCreateConceptRequest: Int = 0
     @State private var globalInsightStudyRequest: Int = 0
+    @State private var globalInsightStudyExitRequest: Int = 0
     @State private var globalInsightIsStudyMode: Bool = false
     @State private var globalInsightStudyBranchCount: Int = 2
     @State private var globalInsightPromotedIDs: [UUID] =
@@ -363,6 +364,17 @@ struct ContentView: View {
             .flatMap { [$0.word, $0.meaning, $0.example] }
             .joined(separator: " ")
         return AquinasContextBudget.estimatedTokenCount(in: text)
+    }
+
+    private var usesLandscapeInsightSplit: Bool {
+        displayedPage == .insights && verticalSizeClass == .compact
+    }
+
+    private func presentGlobalSideMenu() {
+        dismissKeyboard()
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+            isGlobalSideMenuOpen = true
+        }
     }
 
     private func openModelTaskPage(_ task: ModelTaskSnapshot) {
@@ -512,6 +524,9 @@ struct ContentView: View {
                 studyBranchCount: globalInsightStudyBranchCount,
                 onStudyBranchCountChange: { globalInsightStudyBranchCount = $0 },
                 isCanvasInsightLoading: globalInsightIsGenerating,
+                modelStatusOverride: isGlobalTreeReconciling
+                    ? String(localized: "Mapping...")
+                    : nil,
                 contextWordCount: globalInsightContextWordCount,
                 modelTasks: modelTasks,
                 modelTasksPopupState: modelTasksPopupState,
@@ -582,6 +597,31 @@ struct ContentView: View {
         }
     }
 
+    /// Kept out of `body`'s modifier chain, which is at the type checker's limit.
+    private func handleGlobalInsightHoverChange(_ isHoveringInsight: Bool) {
+        guard isHoveringInsight else { return }
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+            modelTasksPopupState.reset()
+        }
+    }
+
+    /// The Insights page's side-menu button; in Study it grows an Exit back to the tree.
+    private var globalInsightMenuControls: some View {
+        HStack(spacing: 8) {
+            SideMenuTriggerButton {
+                dismissKeyboard()
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                    isGlobalSideMenuOpen = true
+                }
+            }
+            if globalInsightIsStudyMode {
+                StudyExitButton { globalInsightStudyExitRequest += 1 }
+                    .transition(.studyExitGrow)
+            }
+        }
+        .animation(.spring(response: 0.42, dampingFraction: 0.84), value: globalInsightIsStudyMode)
+    }
+
     @ViewBuilder private var insightTreePage: some View {
         InsightTreeView(
             insights: globalTreeInsights,
@@ -590,6 +630,7 @@ struct ContentView: View {
             dismissHoverRequest: globalInsightDismissHoverRequest,
             createConceptRequest: globalInsightCreateConceptRequest,
             studyRequest: globalInsightStudyRequest,
+            studyExitRequest: globalInsightStudyExitRequest,
             studyBranchCount: globalInsightStudyBranchCount,
             onStudyModeChange: { globalInsightIsStudyMode = $0 },
             onStudyBranchCountChange: { globalInsightStudyBranchCount = $0 },
@@ -723,12 +764,7 @@ struct ContentView: View {
     /// Extracted so the compiler doesn't time out type-checking a single large expression.
     @ViewBuilder private var conversationView: some View {
         CurrentConversationView(
-            onOpenMenu: {
-                dismissKeyboard()
-                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                    isGlobalSideMenuOpen = true
-                }
-            },
+            onOpenMenu: presentGlobalSideMenu,
             onCanvasModeChange: { isConversationCanvasMode = $0 },
             onRequestConversationPage: {
                 activePage = .conversation
@@ -776,8 +812,84 @@ struct ContentView: View {
         )
     }
 
+    private var globalSideMenu: AnyView {
+        AnyView(AquinasSideMenu(
+            currentTitle: sideMenuCurrentTitle,
+            conversations: sideMenuConversations,
+            activeConversationID: sideMenuActiveConversationID,
+            activePage: activePage,
+            modelTasks: modelTasks,
+            selectedPersonality: conversationPersonality.displayName,
+            isPresented: isGlobalSideMenuOpen,
+            renderVersion: sideMenuRenderVersion,
+            onNewChat: { dismissGlobalSideMenu { newConversationRequest += 1; activePage = .conversation } },
+            onSelectConversation: { conversation in dismissGlobalSideMenu { requestedConversationID = conversation.id; activePage = .conversation } },
+            onRenameConversation: { conversation, title in renameConversation(conversation, to: title) },
+            onPinConversation: { pinConversation($0) },
+            onUnpinConversation: { unpinConversation($0) },
+            onAddConversationToStudyTopic: { attachConversation($0, toStudyTopic: $1) },
+            onRemoveConversationFromStudyTopic: { detachConversationFromStudyTopic($0) },
+            onDeleteConversation: { deleteConversation($0) },
+            newInsightsCount: newInsightsCount,
+            onOpenHome: { dismissGlobalSideMenu { activePage = .home } },
+            onOpenLibrary: { dismissGlobalSideMenu { activePage = .library } },
+            onOpenConversations: { dismissGlobalSideMenu { activePage = .openConversations } },
+            onOpenInsights: { dismissGlobalSideMenu { activePage = .insights } },
+            onOpenStudyTopics: { dismissGlobalSideMenu { requestedTopicID = nil; activePage = .studyTopics } },
+            onSelectStudyTopic: { topic in dismissGlobalSideMenu { requestedTopicID = topic.id; activePage = .studyTopics } },
+            onOpenSettings: { dismissGlobalSideMenu { activePage = .settings } },
+            onClose: { dismissGlobalSideMenu() }
+        )
+        .equatable())
+    }
+
     var body: some View {
-        GeometryReader { _ in
+        shellObservers(shellBody)
+    }
+
+    /// The trailing observers, split out of the main modifier chain, which is past the type
+    /// checker's limit in one piece.
+    private func shellObservers<Content: View>(_ content: Content) -> some View {
+        content
+            .onChange(of: scenePhase) { _, phase in handleScenePhaseChange(phase) }
+            .onChange(of: appLockEnabled) { _, isEnabled in
+                appLockController.settingDidChange(isEnabled: isEnabled)
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIApplication.didReceiveMemoryWarningNotification
+                )
+            ) { _ in
+                modelTasks.handleMemoryPressure()
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: ProcessInfo.thermalStateDidChangeNotification
+                )
+            ) { _ in
+                modelTasks.updateThermalPressure(
+                    ProcessInfo.processInfo.thermalState.modelRuntimePressure
+                )
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: .aquinasConversationStoreDidImport
+                )
+            ) { _ in
+                loadShellConversationState()
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(for: .openGroundingSourceInLibrary)
+                    .compactMap { $0.object as? LibraryNavigationRequest }
+            ) { request in
+                libraryNavigationRequest = request
+                activePage = .library
+            }
+            .onChange(of: collectedDefinitions) { _, newValue in handleCollectedDefinitionsChange(newValue) }
+    }
+
+    private var shellBody: some View {
+        AnyView(GeometryReader { _ in
             ZStack(alignment: .top) {
                 rootSafeAreaColor
                     .ignoresSafeArea()
@@ -808,12 +920,7 @@ struct ContentView: View {
                                     todayInHistory: homeTodayInHistory,
                                     glossedTerm: homeGlossedTerm,
                                     yourQuote: homeYourQuote,
-                                    onOpenMenu: {
-                                        dismissKeyboard()
-                                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                            isGlobalSideMenuOpen = true
-                                        }
-                                    },
+                                    onOpenMenu: presentGlobalSideMenu,
                                     onSelectConversation: { conversation in
                                         requestedConversationID = conversation.id
                                         activePage = .conversation
@@ -861,12 +968,7 @@ struct ContentView: View {
                                     savedInsights: $collectedDefinitions,
                                     modelTasks: modelTasks,
                                     modelTasksPopupState: modelTasksPopupState,
-                                    onOpenMenu: {
-                                        dismissKeyboard()
-                                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                            isGlobalSideMenuOpen = true
-                                        }
-                                    },
+                                    onOpenMenu: presentGlobalSideMenu,
                                     onSelectConversation: { conversation in
                                         requestedConversationID = conversation.id
                                         activePage = .conversation
@@ -905,12 +1007,7 @@ struct ContentView: View {
                                     inputFont: $inputFont,
                                     responseFont: $responseFont,
                                     conversationPersonality: $conversationPersonality,
-                                    onOpenMenu: {
-                                        dismissKeyboard()
-                                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                            isGlobalSideMenuOpen = true
-                                        }
-                                    },
+                                    onOpenMenu: presentGlobalSideMenu,
                                     onDetailVisibilityChange: { isSettingsDetailVisible = $0 }
                                 )
                             case .insights:
@@ -922,12 +1019,7 @@ struct ContentView: View {
                                     savedInsights: $collectedDefinitions,
                                     modelTasks: modelTasks,
                                     modelTasksPopupState: modelTasksPopupState,
-                                    onOpenMenu: {
-                                        dismissKeyboard()
-                                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                            isGlobalSideMenuOpen = true
-                                        }
-                                    },
+                                    onOpenMenu: presentGlobalSideMenu,
                                     onSelectConversation: { conversation in
                                         requestedConversationID = conversation.id
                                         activePage = .conversation
@@ -1003,67 +1095,19 @@ struct ContentView: View {
                     // the page itself. `.safeAreaInset` also gives every page's scroll content the
                     // same automatic bottom clearance it always had, without hand-measuring heights.
                     .safeAreaInset(edge: .bottom) {
-                        globalModelControlsBar(
-                            usesLandscapeInsightSplit: displayedPage == .insights
-                                && verticalSizeClass == .compact
-                        )
+                        globalModelControlsBar(usesLandscapeInsightSplit: usesLandscapeInsightSplit)
                             .animation(.easeInOut(duration: 0.22), value: displayedPage)
                     }
+                    .eraseToAnyView()
                 }
-                // ── Full-screen pull-to-open gesture ──────────────────────────
-                // Runs simultaneously with canvas/scroll gestures so it doesn't
-                // intercept taps or vertical scrolls. Horizontal-bias guard
-                // (|x| > |y|) and rightward-only check keep it from firing
-                // during normal vertical scrolling or leftward swipes.
-                .simultaneousGesture(
-                    DragGesture(minimumDistance: 10, coordinateSpace: .local)
-                        .onChanged { value in
-                            guard !isGlobalSideMenuOpen else { return }
-                            // A Study Topic's detail view owns the swipe-to-go-back gesture
-                            // while it's open — don't compete with it for the same drag.
-                            guard !(activePage == .studyTopics && isStudyTopicDetailVisible) else { return }
-                            // Settings submenus use the same leading-edge gesture to navigate
-                            // back within their own NavigationStack.
-                            guard !(activePage == .settings && isSettingsDetailVisible) else { return }
-                            guard abs(value.translation.width) > abs(value.translation.height) else { return }
-                            if !isDraggingToOpenMenu {
-                                guard value.translation.width > 0 else { return }
-                                // Require an edge start anywhere in the conversation page (canvas
-                                // OR reading) so dragging a text-selection handle mid-screen
-                                // doesn't open the menu. Other pages keep the full-screen swipe.
-                                let needsEdgeOnly = activePage == .insights
-                                    || activePage == .conversation
-                                if needsEdgeOnly {
-                                    guard value.startLocation.x < 30 else { return }
-                                }
-                                isDraggingToOpenMenu = true
-                                dismissKeyboard()
-                            }
-                            let clamped = min(345, max(0, value.translation.width))
-                            sideMenuDragOffset = clamped
-                            if clamped >= 175 && !menuOpenHapticFired {
-                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                                menuOpenHapticFired = true
-                            } else if clamped < 175 {
-                                menuOpenHapticFired = false
-                            }
-                        }
-                        .onEnded { value in
-                            guard isDraggingToOpenMenu else { return }
-                            menuOpenHapticFired = false
-                            let shouldOpen = value.translation.width > 175
-                                || value.predictedEndTranslation.width > 250
-                            if shouldOpen {
-                                isDraggingToOpenMenu = false
-                                isGlobalSideMenuOpen = true
-                                sideMenuDragOffset = 0
-                            } else {
-                                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                    isDraggingToOpenMenu = false
-                                    sideMenuDragOffset = 0
-                                }
-                            }
-                        }
+                .sideMenuDragPresentation(
+                    isPresented: $isGlobalSideMenuOpen,
+                    activePage: activePage,
+                    isStudyTopicDetailVisible: isStudyTopicDetailVisible,
+                    isSettingsDetailVisible: isSettingsDetailVisible,
+                    onBeginDrag: dismissKeyboard,
+                    onDismiss: { dismissGlobalSideMenu() },
+                    menu: globalSideMenu
                 )
 
                 // Shared document picker used by the bottom plus button.
@@ -1156,132 +1200,13 @@ struct ContentView: View {
                 // guarantees the panel renders above everything, including page
                 // content that ignores the safe area (e.g. fade gradients).
                 if activePage == .insights && !isGlobalSideMenuOpen {
-                    SideMenuTriggerButton {
-                        dismissKeyboard()
-                        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                            isGlobalSideMenuOpen = true
-                        }
-                    }
+                    globalInsightMenuControls
                     .padding(.leading, 24)
                     .padding(.top, 24)
                     .transition(.scale(scale: 0.92).combined(with: .opacity))
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     .zIndex(2)
                 }
-
-                // Opacity scales from 0→0.16 as the menu is dragged out, so
-                // the backdrop feels physical rather than binary snap-in.
-                let dragProgress = min(345, max(0, sideMenuDragOffset)) / 345
-                let progress: Double = isGlobalSideMenuOpen ? 1.0 : Double(dragProgress)
-                Color.black.opacity(0.16 * progress)
-                    .ignoresSafeArea()
-                    .allowsHitTesting(progress > 0.02)
-                    .onTapGesture {
-                        dismissGlobalSideMenu()
-                    }
-                    .animation(.easeInOut(duration: 0.22), value: isGlobalSideMenuOpen)
-                    .zIndex(3)
-
-                AquinasSideMenu(
-                        currentTitle: sideMenuCurrentTitle,
-                        conversations: sideMenuConversations,
-                        activeConversationID: sideMenuActiveConversationID,
-                        activePage: activePage,
-                        modelTasks: modelTasks,
-                        selectedPersonality: conversationPersonality.displayName,
-                        isPresented: isGlobalSideMenuOpen,
-                        onNewChat: {
-                            dismissGlobalSideMenu {
-                                newConversationRequest += 1
-                                activePage = .conversation
-                            }
-                        },
-                        onSelectConversation: { conversation in
-                            dismissGlobalSideMenu {
-                                requestedConversationID = conversation.id
-                                activePage = .conversation
-                            }
-                        },
-                        onRenameConversation: { conversation, title in
-                            renameConversation(conversation, to: title)
-                        },
-                        onPinConversation: { conversation in
-                            pinConversation(conversation)
-                        },
-                        onUnpinConversation: { conversation in
-                            unpinConversation(conversation)
-                        },
-                        onAddConversationToStudyTopic: { conversation, topicID in
-                            attachConversation(conversation, toStudyTopic: topicID)
-                        },
-                        onRemoveConversationFromStudyTopic: { conversation in
-                            detachConversationFromStudyTopic(conversation)
-                        },
-                        onDeleteConversation: { conversation in
-                            deleteConversation(conversation)
-                        },
-                        newInsightsCount: newInsightsCount,
-                        onOpenHome: {
-                            dismissGlobalSideMenu {
-                                activePage = .home
-                            }
-                        },
-                        onOpenLibrary: {
-                            dismissGlobalSideMenu {
-                                activePage = .library
-                            }
-                        },
-                        onOpenConversations: {
-                            dismissGlobalSideMenu {
-                                activePage = .openConversations
-                            }
-                        },
-                        onOpenInsights: {
-                            dismissGlobalSideMenu {
-                                activePage = .insights
-                            }
-                        },
-                        onOpenStudyTopics: {
-                            dismissGlobalSideMenu {
-                                requestedTopicID = nil
-                                activePage = .studyTopics
-                            }
-                        },
-                        onSelectStudyTopic: { topic in
-                            dismissGlobalSideMenu {
-                                requestedTopicID = topic.id
-                                activePage = .studyTopics
-                            }
-                        },
-                        onOpenSettings: {
-                            dismissGlobalSideMenu {
-                                activePage = .settings
-                            }
-                        },
-                        onClose: {
-                            dismissGlobalSideMenu()
-                        }
-                    )
-                    .frame(width: 325)
-                    // When closed, add the live drag offset so the panel follows
-                    // the finger.  The implicit spring animation only fires when
-                    // isGlobalSideMenuOpen changes, so drag updates are instant
-                    // (finger-tracked) while snap-open/close use the spring.
-                    .offset(x: isGlobalSideMenuOpen
-                        ? 0
-                        : (-345 + min(345, max(0, sideMenuDragOffset))))
-                    .opacity(isGlobalSideMenuOpen || isDraggingToOpenMenu ? 1 : 0.96)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                    // The outer alignment frame covers the whole screen even while the panel is
-                    // translated offscreen. Disable it while closed so it cannot swallow taps
-                    // intended for the visible page underneath.
-                    .allowsHitTesting(isGlobalSideMenuOpen || isDraggingToOpenMenu)
-                    // Guaranteed topmost: a direct ZStack sibling (not a nested
-                    // .overlay()) so this zIndex is actually compared against the
-                    // page content's zIndex, rather than being the sole child of
-                    // its own separate overlay layer.
-                    .zIndex(1000)
-                    .animation(.spring(response: 0.42, dampingFraction: 0.84), value: isGlobalSideMenuOpen)
 
                 if appLockEnabled,
                    appLockController.isLocked || scenePhase != .active {
@@ -1295,25 +1220,21 @@ struct ContentView: View {
 
             }
             .ignoresSafeArea(.container, edges: .bottom)
-        }
+        })
         .environment(
             \.modelCompletionNotifications,
             modelCompletionNotifications
         )
         .environment(\.openModelTaskPage, openModelTaskPage)
         .preferredColorScheme(colorSchemeOverride)
-        .alert(
-            "Couldn’t generate Question of the Day",
-            isPresented: $isDailyQuestionGenerationErrorPresented
-        ) {
-            Button("Cancel", role: .cancel) { }
-            Button("Try Again") {
+        .eraseToAnyView()
+        .dailyQuestionGenerationAlert(
+            isPresented: $isDailyQuestionGenerationErrorPresented,
+            retry: {
                 dailyQuestionGenerationRetryNotBefore = .distantPast
                 scheduleDailyQuestionRefreshIfNeeded(minimumDelay: 0)
             }
-        } message: {
-            Text("No placeholder question was created. Check that the Aquinas backend is available and try again.")
-        }
+        )
         .onAppear {
             modelTasks.setPersonality(conversationPersonality)
             modelTasks.setApplicationActive(scenePhase == .active)
@@ -1336,21 +1257,7 @@ struct ContentView: View {
                 scheduleDailyQuestionRefreshIfNeeded()
             }
         }
-        .onChange(of: activePage) { oldValue, newValue in
-            modelTasksPopupState.reset()
-            if oldValue == .insights, newValue != .insights {
-                isGlobalTreeUpdatePromptVisible = false
-                globalInsightIsSearchActive = false
-                globalInsightSearchQuery = ""
-                globalInsightSearchResultIndex = 0
-                globalInsightSearchResultCount = 0
-            }
-            if newValue == .insights {
-                refreshGlobalInsightTreeUpdatePrompt()
-            }
-            transitionDisplayedPage(to: newValue)
-            scheduleDailyQuestionRefreshIfNeeded()
-        }
+        .onChange(of: activePage) { oldValue, newValue in handleActivePageChange(from: oldValue, to: newValue) }
         .onChange(of: modelTasks.isBusy) { _, _ in
             scheduleDailyQuestionRefreshIfNeeded()
         }
@@ -1358,86 +1265,21 @@ struct ContentView: View {
         // Insight Tree — the Global tree had the same "both open at once" gap since nothing here
         // reacted to a hover starting after the Model Tasks popup was already open.
         .onChange(of: globalInsightHasInsightHover) { _, isHoveringInsight in
-            guard isHoveringInsight else { return }
-            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
-                modelTasksPopupState.reset()
-            }
+            handleGlobalInsightHoverChange(isHoveringInsight)
         }
-        .onChange(of: modelTasks.latestCompletedTask) { _, completedTask in
-            guard let completedTask else { return }
-            postConversationCompletionNotificationIfNeeded(for: completedTask)
-            guard completedTask.originPage != .insights else { return }
-            suppressGlobalTreePromptUntilExternalModelCompletion = false
-            guard activePage == .insights else { return }
-            refreshGlobalInsightTreeUpdatePrompt()
-        }
+        .onChange(of: modelTasks.latestCompletedTask) { _, task in handleCompletedModelTask(task) }
         .onChange(of: conversationPersonality) { _, personality in
             modelTasks.setPersonality(personality)
         }
-        .onChange(of: sideMenuConversations) { _, _ in
-            scheduleDailyQuestionRefreshIfNeeded()
-        }
+        .onChange(of: sideMenuConversations) { _, _ in handleSideMenuConversationsChange() }
         .onChange(of: collectedDefinitions) { _, _ in
             scheduleDailyQuestionRefreshIfNeeded()
-        }
-        .onChange(of: scenePhase) { _, phase in
-            appLockController.scenePhaseDidChange(
-                phase,
-                isEnabled: appLockEnabled,
-                gracePeriod: appLockGracePeriod.duration
-            )
-            modelTasks.setApplicationActive(phase == .active)
-            scheduleDailyQuestionRefreshIfNeeded()
-        }
-        .onChange(of: appLockEnabled) { _, isEnabled in
-            appLockController.settingDidChange(isEnabled: isEnabled)
-        }
-        .onReceive(
-            NotificationCenter.default.publisher(
-                for: UIApplication.didReceiveMemoryWarningNotification
-            )
-        ) { _ in
-            modelTasks.handleMemoryPressure()
-        }
-        .onReceive(
-            NotificationCenter.default.publisher(
-                for: ProcessInfo.thermalStateDidChangeNotification
-            )
-        ) { _ in
-            modelTasks.updateThermalPressure(
-                ProcessInfo.processInfo.thermalState.modelRuntimePressure
-            )
-        }
-        .onReceive(
-            NotificationCenter.default.publisher(
-                for: .aquinasConversationStoreDidImport
-            )
-        ) { _ in
-            loadShellConversationState()
-        }
-        .onReceive(
-            NotificationCenter.default.publisher(for: .openGroundingSourceInLibrary)
-                .compactMap { $0.object as? LibraryNavigationRequest }
-        ) { request in
-            libraryNavigationRequest = request
-            activePage = .library
-        }
-        .onChange(of: collectedDefinitions) { oldValue, newValue in
-            InsightLibraryStore.save(newValue)
-            guard activePage == .insights,
-                  !suppressGlobalTreePromptUntilExternalModelCompletion else { return }
-            isGlobalTreeUpdatePromptVisible = globalTreeNeedsUpdate
         }
     }
 
     private var libraryPage: some View {
         LibraryView(
-            onOpenMenu: {
-                dismissKeyboard()
-                withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                    isGlobalSideMenuOpen = true
-                }
-            },
+            onOpenMenu: presentGlobalSideMenu,
             modelTasks: modelTasks,
             modelTasksPopupState: modelTasksPopupState,
             onReaderVisibilityChange: { isLibraryReaderVisible = $0 },
@@ -1458,7 +1300,6 @@ struct ContentView: View {
             completionCriteria: .logicallyComplete
         ) {
             isGlobalSideMenuOpen = false
-            sideMenuDragOffset = 0
         } completion: {
             action()
         }
@@ -1640,6 +1481,53 @@ struct ContentView: View {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 
+    private func handleScenePhaseChange(_ phase: ScenePhase) {
+        appLockController.scenePhaseDidChange(
+            phase,
+            isEnabled: appLockEnabled,
+            gracePeriod: appLockGracePeriod.duration
+        )
+        modelTasks.setApplicationActive(phase == .active)
+        scheduleDailyQuestionRefreshIfNeeded()
+    }
+
+    private func handleActivePageChange(from oldValue: AppPage, to newValue: AppPage) {
+        modelTasksPopupState.reset()
+        if oldValue == .insights, newValue != .insights {
+            isGlobalTreeUpdatePromptVisible = false
+            globalInsightIsSearchActive = false
+            globalInsightSearchQuery = ""
+            globalInsightSearchResultIndex = 0
+            globalInsightSearchResultCount = 0
+        }
+        if newValue == .insights {
+            refreshGlobalInsightTreeUpdatePrompt()
+        }
+        transitionDisplayedPage(to: newValue)
+        scheduleDailyQuestionRefreshIfNeeded()
+    }
+
+    private func handleCollectedDefinitionsChange(_ definitions: [ConceptDefinition]) {
+        InsightLibraryStore.save(definitions)
+        guard activePage == .insights,
+              !suppressGlobalTreePromptUntilExternalModelCompletion else { return }
+        isGlobalTreeUpdatePromptVisible = globalTreeNeedsUpdate
+    }
+
+    private func handleSideMenuConversationsChange() {
+        sideMenuRenderVersion &+= 1
+        scheduleDailyQuestionRefreshIfNeeded()
+    }
+
+    private func handleCompletedModelTask(_ task: ModelTaskSnapshot?) {
+        guard let task else { return }
+        postConversationCompletionNotificationIfNeeded(for: task)
+        guard task.originPage != .insights else { return }
+        suppressGlobalTreePromptUntilExternalModelCompletion = false
+        guard activePage == .insights else { return }
+        refreshGlobalInsightTreeUpdatePrompt()
+    }
+
     private func loadShellConversationState() {
         guard let snapshot = CurrentConversationsStore.load(),
               !snapshot.conversations.isEmpty else { return }
@@ -1736,32 +1624,65 @@ struct ContentView: View {
     }
 
     private func updateGlobalInsightTree() {
-        let reconciledInsights = reconcileGlobalInsights(
-            existing: globalTreeInsights,
-            incoming: collectedDefinitions
-        )
+        let existingSnapshot = globalTreeInsights
+        let incomingSnapshot = collectedDefinitions
+
+        // Reconciliation calls into NaturalLanguage for every unique Insight. Keep that CPU work
+        // outside the main actor so the canvas remains responsive to panning and zooming.
         withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
-            globalTreeInsights = reconciledInsights
             isGlobalTreeUpdatePromptVisible = false
             suppressGlobalTreePromptUntilExternalModelCompletion = true
+            isGlobalTreeReconciling = true
         }
-        GlobalInsightTreeStore.save(reconciledInsights)
-        globalInsightsContextCardState.reset()
-        modelTasksPopupState.reset()
-        UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.7)
+
+        Task { @MainActor in
+            let reconciledInsights = await Task.detached(priority: .userInitiated) {
+                Self.reconcileGlobalInsights(
+                    existing: existingSnapshot,
+                    incoming: incomingSnapshot
+                )
+            }.value
+
+            // Do not let a completed background pass overwrite edits made while it was running.
+            guard globalTreeInsights == existingSnapshot,
+                  collectedDefinitions == incomingSnapshot else {
+                isGlobalTreeReconciling = false
+                suppressGlobalTreePromptUntilExternalModelCompletion = false
+                refreshGlobalInsightTreeUpdatePrompt()
+                return
+            }
+
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                globalTreeInsights = reconciledInsights
+                isGlobalTreeReconciling = false
+            }
+            GlobalInsightTreeStore.save(reconciledInsights)
+            globalInsightsContextCardState.reset()
+            modelTasksPopupState.reset()
+            UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.7)
+        }
     }
 
     /// Reconciles newly collected Insights against the existing global library without doing an
     /// all-pairs comparison. Only the nearest existing candidate is considered, and only a very
     /// high similarity is treated as the same underlying Insight. Unrelated Insights are retained
     /// unchanged; parent/child and merely related concepts remain separate.
-    private func reconcileGlobalInsights(
+    private nonisolated static func reconcileGlobalInsights(
         existing: [ConceptDefinition],
         incoming: [ConceptDefinition]
     ) -> [ConceptDefinition] {
-        let existingByID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
-        var result = Array(existingByID.values)
+        var result: [ConceptDefinition] = []
+        var resultIDs = Set<UUID>()
+        for insight in existing where resultIDs.insert(insight.id).inserted {
+            result.append(insight)
+        }
         let threshold = 0.86
+        var embeddingsByID: [UUID: [Double]] = [:]
+        for insight in result {
+            embeddingsByID[insight.id] = computeEmbedding(
+                for: "\(insight.word). \(insight.semanticDefinition)"
+            )
+        }
 
         for candidate in incoming.uniquedByWord() {
             guard let candidateEmbedding = computeEmbedding(
@@ -1769,14 +1690,15 @@ struct ContentView: View {
             ) else { continue }
 
             let nearest = result.compactMap { saved -> (ConceptDefinition, Double)? in
-                guard let savedEmbedding = computeEmbedding(
-                    for: "\(saved.word). \(saved.semanticDefinition)"
-                ) else { return nil }
+                guard let savedEmbedding = embeddingsByID[saved.id] else { return nil }
                 return (saved, cosineSimilarity(candidateEmbedding, savedEmbedding))
             }.max { $0.1 < $1.1 }
 
             guard let (saved, similarity) = nearest, similarity >= threshold else {
-                if !result.contains(where: { $0.id == candidate.id }) { result.append(candidate) }
+                if resultIDs.insert(candidate.id).inserted {
+                    result.append(candidate)
+                    embeddingsByID[candidate.id] = candidateEmbedding
+                }
                 continue
             }
 
@@ -1796,7 +1718,12 @@ struct ContentView: View {
                 example: saved.example,
                 definitions: canonicalDefinitions
             )
-            if let index = result.firstIndex(where: { $0.id == saved.id }) { result[index] = merged }
+            if let index = result.firstIndex(where: { $0.id == saved.id }) {
+                result[index] = merged
+                embeddingsByID[saved.id] = computeEmbedding(
+                    for: "\(merged.word). \(merged.semanticDefinition)"
+                )
+            }
         }
         return result
     }
@@ -1933,6 +1860,7 @@ private struct GlobalInsightsModelControls: View {
     var studyBranchCount: Int = 2
     var onStudyBranchCountChange: (Int) -> Void = { _ in }
     let isCanvasInsightLoading: Bool
+    let modelStatusOverride: String?
     let contextWordCount: Int
     let modelTasks: ModelTaskQueue
     let modelTasksPopupState: ModelTasksPopupState
@@ -1995,6 +1923,7 @@ private struct GlobalInsightsModelControls: View {
             studyBranchCount: studyBranchCount,
             onStudyBranchCountChange: onStudyBranchCountChange,
             isCanvasInsightLoading: isCanvasInsightLoading,
+            modelStatusOverride: modelStatusOverride,
             modelTasks: modelTasks,
             modelTasksPopupState: modelTasksPopupState,
             canvasSearchText: $searchText,
@@ -2011,6 +1940,7 @@ private struct GlobalInsightsModelControls: View {
             onMidpointPlace: onMidpointPlace,
             onClearCanvasSelection: onClearCanvasSelection,
             contextWordCount: contextWordCount,
+            showsContextWheel: false,
             onClearConversation: {},
             onContextWillOpen: onContextWillOpen,
             contextCard: contextCard
@@ -2055,6 +1985,134 @@ struct CameraCaptureView: UIViewControllerRepresentable {
 
         func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
             dismiss()
+        }
+    }
+}
+
+private struct SideMenuDragPresentation: ViewModifier {
+    @Binding var isPresented: Bool
+    let activePage: AppPage
+    let isStudyTopicDetailVisible: Bool
+    let isSettingsDetailVisible: Bool
+    let onBeginDrag: () -> Void
+    let onDismiss: () -> Void
+    let menu: AnyView
+
+    @State private var dragOffset: CGFloat = 0
+    @State private var isDragging = false
+    @State private var hasFiredOpenHaptic = false
+
+    func body(content: Content) -> some View {
+        ZStack(alignment: .top) {
+            content.simultaneousGesture(dragGesture)
+
+            let progress = isPresented ? 1.0 : min(1.0, Double(dragOffset / 345))
+            Color.black.opacity(0.16 * progress)
+                .ignoresSafeArea()
+                .allowsHitTesting(progress > 0.02)
+                .onTapGesture(perform: onDismiss)
+                .animation(.easeInOut(duration: 0.22), value: isPresented)
+                .zIndex(3)
+
+            menu
+                .frame(width: 325)
+                .offset(x: isPresented ? 0 : -345 + dragOffset)
+                .opacity(isPresented || isDragging ? 1 : 0.96)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .allowsHitTesting(isPresented || isDragging)
+                .zIndex(1000)
+                .animation(.spring(response: 0.42, dampingFraction: 0.84), value: isPresented)
+        }
+    }
+
+    private var dragGesture: some Gesture {
+        DragGesture(minimumDistance: 10, coordinateSpace: .local)
+            .onChanged { value in
+                guard !isPresented,
+                      !(activePage == .studyTopics && isStudyTopicDetailVisible),
+                      !(activePage == .settings && isSettingsDetailVisible),
+                      abs(value.translation.width) > abs(value.translation.height) else { return }
+                guard value.translation.width > 0 else { return }
+                let requiresLeadingEdge = activePage == .insights || activePage == .conversation
+                guard !requiresLeadingEdge || value.startLocation.x < 30 else { return }
+
+                if !isDragging {
+                    isDragging = true
+                    onBeginDrag()
+                }
+                dragOffset = min(345, value.translation.width)
+                if dragOffset >= 175, !hasFiredOpenHaptic {
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    hasFiredOpenHaptic = true
+                } else if dragOffset < 175 {
+                    hasFiredOpenHaptic = false
+                }
+            }
+            .onEnded { value in
+                guard isDragging else { return }
+                hasFiredOpenHaptic = false
+                let shouldOpen = value.translation.width > 175
+                    || value.predictedEndTranslation.width > 250
+                if shouldOpen {
+                    isDragging = false
+                    dragOffset = 0
+                    isPresented = true
+                } else {
+                    withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+                        isDragging = false
+                        dragOffset = 0
+                    }
+                }
+            }
+    }
+}
+
+private extension View {
+    func eraseToAnyView() -> AnyView {
+        AnyView(self)
+    }
+
+    func dailyQuestionGenerationAlert(
+        isPresented: Binding<Bool>,
+        retry: @escaping () -> Void
+    ) -> some View {
+        modifier(DailyQuestionGenerationAlert(
+            isPresented: isPresented,
+            retry: retry
+        ))
+    }
+
+    func sideMenuDragPresentation(
+        isPresented: Binding<Bool>,
+        activePage: AppPage,
+        isStudyTopicDetailVisible: Bool,
+        isSettingsDetailVisible: Bool,
+        onBeginDrag: @escaping () -> Void,
+        onDismiss: @escaping () -> Void,
+        menu: AnyView
+    ) -> some View {
+        modifier(SideMenuDragPresentation(
+            isPresented: isPresented,
+            activePage: activePage,
+            isStudyTopicDetailVisible: isStudyTopicDetailVisible,
+            isSettingsDetailVisible: isSettingsDetailVisible,
+            onBeginDrag: onBeginDrag,
+            onDismiss: onDismiss,
+            menu: menu
+        ))
+    }
+}
+
+private struct DailyQuestionGenerationAlert: ViewModifier {
+    @Binding var isPresented: Bool
+    let retry: () -> Void
+
+    func body(content: Content) -> some View {
+        content.alert("Couldn’t generate Question of the Day", isPresented: $isPresented) {
+            Button("Cancel", role: .cancel) { }
+            Button("Try Again", action: retry)
+        } message: {
+            Text("No placeholder question was created. Check that the Aquinas backend is available and try again.")
         }
     }
 }

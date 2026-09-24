@@ -1086,6 +1086,7 @@ struct CurrentConversationView: View {
                     titleDraft: $titleEditDraft,
                     conversationFontSize: conversationFontSize,
                     isInStudyTopic: activeStudyTopicTitle != nil,
+                    isStudyMode: canvasMode.isCanvasStudyMode,
                     onMenuTap: onOpenMenu,
                     onCanvasTap: enterCanvasMode,
                     onBackTap: {
@@ -1344,6 +1345,7 @@ struct CurrentConversationView: View {
                 canvasMode.promotedCanvasInsightIDs = []
             }
             focusedBranchID = activeBranches.first?.id
+            restoreEmptyPromptState(from: activeBranches)
             refreshDisplayedContextWordCount(animated: false)
             if let activeConversationID {
                 manuallySavedConversationInsightIDs =
@@ -1436,7 +1438,7 @@ struct CurrentConversationView: View {
             insightTreeQueueRetryTask?.cancel()
             insightTreeIdleDebounceTask?.cancel()
             localInsightTreeSeedDebounceTask?.cancel()
-            saveCurrentConversation()
+            removeActiveConversationIfEmpty()
             persistConversations()
         }
         .onChange(of: scenePhase) { _, phase in
@@ -1982,6 +1984,43 @@ struct CurrentConversationView: View {
         conversations[idx].promotedInsightIDs = canvasMode.promotedCanvasInsightIDs
     }
 
+    /// New conversations exist only while the user is composing them. Once navigation leaves an
+    /// untouched draft, discard it instead of letting an empty card accumulate in the list.
+    /// A quoted Insight is first copied into the branch so it remains available after remounting.
+    private func removeActiveConversationIfEmpty() {
+        guard let id = activeConversationID,
+              let index = conversations.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+
+        if let attachedConcept,
+           let branchIndex = activeBranches.firstIndex(where: { $0.id == focusedBranchID })
+                ?? activeBranches.indices.first {
+            activeBranches[branchIndex].attachedConcept = attachedConcept
+            activeBranches[branchIndex].showBottomInput = true
+            self.attachedConcept = nil
+        }
+        saveCurrentConversation()
+
+        let conversation = conversations[index]
+        let hasSavedInsights = !manuallySavedConversationInsightIDs.isEmpty
+            || !ConversationInsightMembershipStore.insightIDs(for: id).isEmpty
+        guard !ConversationDraftRetention.shouldKeep(
+            conversation,
+            hasSavedInsights: hasSavedInsights
+        ) else {
+            return
+        }
+
+        ConversationInsightMembershipStore.removeConversation(id)
+        LocalInsightTreeSeedStore.removeConversation(id)
+        conversations.remove(at: index)
+        activeConversationID = conversations.first?.id
+        manuallySavedConversationInsightIDs = []
+        canvasMode.promotedCanvasInsightIDs = []
+        publishShellMenuState()
+    }
+
     /// Update the sideMenu bindings from the current conversations list.
     private func publishShellMenuState() {
         sideMenuConversations = conversations
@@ -1995,7 +2034,7 @@ struct CurrentConversationView: View {
         // shell-owned and already carry their conversation ID, so let them finish and route their
         // result back to the originating conversation. Only destructive actions such as Clear or
         // New Conversation intentionally call `resetModelTaskPipeline()`.
-        saveCurrentConversation()
+        removeActiveConversationIfEmpty()
         activeConversationID = conversation.id
         let nextBranches = conversation.branches.isEmpty
             ? [ChatBranch(startingConcept: nil)]
@@ -2006,9 +2045,7 @@ struct CurrentConversationView: View {
             ConversationInsightMembershipStore.insightIDs(for: conversation.id)
         refreshDisplayedContextWordCount(animated: false)
         canvasMode.promotedCanvasInsightIDs = conversation.promotedInsightIDs
-        activeEmptyPromptEyebrow = ""
-        activeEmptyPromptQuestion = ""
-        activeEmptyPromptSubtitle = ""
+        restoreEmptyPromptState(from: nextBranches)
         pendingResponseCount = modelTasks.allTasks.filter { task in
             guard task.conversationID == conversation.id,
                   case .userQuestion = task.kind else {
@@ -2022,6 +2059,39 @@ struct CurrentConversationView: View {
         persistConversations()
         scrollToBottomAfterLayout()
         scheduleInsightTreeUpdateAfterIdle()
+    }
+
+    /// Reconstruct the special empty-conversation presentation after navigation. The visible
+    /// prompt metadata is otherwise view-local, while its source tag and pinned question are
+    /// persisted on the root branch so an unanswered Question of the Day survives remounting.
+    private func restoreEmptyPromptState(from branches: [ChatBranch]) {
+        guard let rootBranch = branches.first(where: { $0.parentBranchID == nil }),
+              rootBranch.activeChatBlocks.isEmpty,
+              !rootBranch.topQuestionSubmitted,
+              let question = rootBranch.pinnedHeaderQuestion?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+              ),
+              !question.isEmpty else {
+            activeEmptyPromptEyebrow = ""
+            activeEmptyPromptQuestion = ""
+            activeEmptyPromptSubtitle = ""
+            return
+        }
+
+        let context = rootBranch.hiddenPromptContext ?? ""
+        if context.localizedCaseInsensitiveContains("<question of the day>") {
+            activeEmptyPromptEyebrow = "QUESTION OF THE DAY"
+            activeEmptyPromptQuestion = question
+            activeEmptyPromptSubtitle = ""
+        } else if context.localizedCaseInsensitiveContains("<today in history>") {
+            activeEmptyPromptEyebrow = "TODAY IN HISTORY"
+            activeEmptyPromptQuestion = question
+            activeEmptyPromptSubtitle = ""
+        } else {
+            activeEmptyPromptEyebrow = ""
+            activeEmptyPromptQuestion = ""
+            activeEmptyPromptSubtitle = ""
+        }
     }
 
     /// Reset the active conversation in place so study-topic membership and the
@@ -2063,7 +2133,7 @@ struct CurrentConversationView: View {
     /// Save current work, then create a fresh conversation and make it active.
     private func startNewConversation() {
         resetModelTaskPipeline(conversationID: activeConversationID)
-        saveCurrentConversation()
+        removeActiveConversationIfEmpty()
         // Consume any pending topic tag set by a "New Conversation inside topic" action.
         let topicID = newConversationTopicID
         newConversationTopicID = nil
@@ -2500,6 +2570,8 @@ private struct BranchModeTopBar: View {
     @Binding var titleDraft: String
     let conversationFontSize: ConversationFontSizeOption
     var isInStudyTopic: Bool = false
+    /// In Study the canvas's Back becomes the side-menu button with an Exit beside it.
+    var isStudyMode: Bool = false
     var onMenuTap: () -> Void
     var onCanvasTap: () -> Void
     var onBackTap: () -> Void
@@ -2581,16 +2653,24 @@ private struct BranchModeTopBar: View {
             .allowsHitTesting(!isCanvasMode)
 
             // Canvas mode layout
-            HStack {
-                CanvasModeToggleButton(
-                    isActive: true,
-                    updateSignal: insightTreeUpdateSignal,
-                    action: onBackTap
-                )
-                    .matchedGeometryEffect(id: "canvasModeButton", in: titleNamespace, isSource: isCanvasMode)
-                    .opacity(isCanvasMode ? 1 : 0)
+            HStack(spacing: 8) {
+                if isStudyMode {
+                    AquinasNavButton(onMenuTap: onMenuTap)
+                        .transition(.blurFade)
+                    StudyExitButton(action: onBackTap)
+                        .transition(.studyExitGrow)
+                } else {
+                    CanvasModeToggleButton(
+                        isActive: true,
+                        updateSignal: insightTreeUpdateSignal,
+                        action: onBackTap
+                    )
+                        .matchedGeometryEffect(id: "canvasModeButton", in: titleNamespace, isSource: isCanvasMode)
+                        .opacity(isCanvasMode ? 1 : 0)
+                }
                 Spacer()
             }
+            .animation(.spring(response: 0.42, dampingFraction: 0.84), value: isStudyMode)
             .padding(.horizontal, 24)
             .padding(.top, 24)
             .allowsHitTesting(isCanvasMode)

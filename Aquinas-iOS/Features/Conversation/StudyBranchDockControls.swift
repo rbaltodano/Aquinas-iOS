@@ -9,7 +9,8 @@ import UIKit
 /// The persistent dock content shown while Branch is the active Study tool.
 struct StudyBranchDockControls: View {
     private enum Layout {
-        static let controlHeight: CGFloat = 68
+        /// Matches the normal dock: 16 pt controls with 24 pt above and below.
+        static let controlHeight: CGFloat = 64
         static let countPillWidth: CGFloat = 230
         static let placePillWidth: CGFloat = 118
         static let interPillSpacing: CGFloat = 8
@@ -17,6 +18,8 @@ struct StudyBranchDockControls: View {
 
     let count: Int
     let onCountChange: (Int) -> Void
+    /// Set when Study is closing, so Place tucks away before the dock changes back.
+    var isLeaving: Bool = false
 
     @State private var showsPlaceAction = false
 
@@ -87,6 +90,11 @@ struct StudyBranchDockControls: View {
             showsPlaceAction = false
             withAnimation(.spring(response: 0.42, dampingFraction: 0.82).delay(0.18)) {
                 showsPlaceAction = true
+            }
+        }
+        .onChange(of: isLeaving) { _, leaving in
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) {
+                showsPlaceAction = !leaving
             }
         }
     }

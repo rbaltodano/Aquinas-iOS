@@ -133,9 +133,20 @@ struct InsightTreeView: View {
     @State private var pendingModelActionRetry: (() -> Void)? = nil
     /// The selected Insight stays selected beneath this overlay, so Exit can restore the exact
     /// hover state the user entered from.
-    @State private var studyInsight: InsightModel?
+    @State private var studySubject: StudySubject?
     @State private var isExitingStudy: Bool = false
-    /// Kept separate from `studyInsight` so the hovered card is reinserted with its normal
+    /// The canvas's origin in `InsightTreeStackSpace`, to hand it the Study slot in its own
+    /// coordinates.
+    @State private var canvasOriginInStack: CGPoint = .zero
+    /// The Node Concept Study slot in `InsightTreeStackSpace`, laid out by `StudyModeView`.
+    @State private var studySlotInStack: CGRect?
+    /// Study's tool card replaces the docked card while Study is open. Kept for the next
+    /// Study session, like the last selected tool.
+    @State private var showsStudyToolCard = false
+    /// The last Study tool, remembered across launches.
+    @AppStorage("study.lastSelectedTool") private var studyToolRawValue = StudyTool.branch.rawValue
+    @State private var studyToolDirection = 1
+    /// Kept separate from `studySubject` so the hovered card is reinserted with its normal
     /// dock transition after Study clears, rather than merely becoming visible underneath it.
     @State private var showsDockedCardAfterStudy: Bool = true
 
@@ -392,11 +403,20 @@ struct InsightTreeView: View {
                 },
                 onUndiscoveredInsightCountChange: { count in
                     onUndiscoveredInsightCountChange?(count)
-                }
+                },
+                studyNodeID: studiedNodeID,
+                studyInitialHoverInsightID: studyInitialHoverID,
+                studySlot: studySlotInStack?.offsetBy(dx: -canvasOriginInStack.x, dy: -canvasOriginInStack.y)
             )
             .frame(width: treePaneWidth, height: geometry.size.height, alignment: .leading)
             .background(insightTreeCanvasColor)
-            .allowsHitTesting(studyInsight == nil)
+            .onGeometryChange(for: CGPoint.self) { proxy in
+                proxy.frame(in: .named(InsightTreeStackSpace.name)).origin
+            } action: { origin in
+                canvasOriginInStack = origin
+            }
+            // A studied Node Concept stays in the canvas, which handles Study's gestures.
+            .allowsHitTesting(studySubject == nil || studiedNodeID != nil)
 
             if viewModel.nodes.isEmpty {
                 EmptyInsightTreeView()
@@ -405,7 +425,7 @@ struct InsightTreeView: View {
             VStack {
                 HStack {
                     if let onClose {
-                        Button(action: { studyInsight == nil ? onClose() : exitStudy() }) {
+                        Button(action: { studySubject == nil ? onClose() : exitStudy() }) {
                             Image(systemName: "xmark")
                                 .font(.system(size: 12, weight: .semibold))
                                 .sfSymbolDrawOn()
@@ -424,17 +444,23 @@ struct InsightTreeView: View {
             }
             .zIndex(11)
 
-            if let studyInsight {
+            if let studySubject {
                 StudyModeView(
-                    insight: studyInsight,
+                    subject: studySubject,
+                    tool: studyTool,
                     branchCount: studyBranchCount,
                     isExiting: isExitingStudy,
-                    onBranchCountChange: onStudyBranchCountChange ?? { _ in }
+                    animatesCenterIconEntrance: false,
+                    onBranchCountChange: onStudyBranchCountChange ?? { _ in },
+                    onNodeSlotChange: { studySlotInStack = $0 }
                 )
                     .transition(.opacity)
                     .zIndex(10)
             }
             }
+            // Shared by the canvas and the Study overlay so a Node Concept can leave the tree
+            // from exactly where the canvas drew it.
+            .coordinateSpace(.named(InsightTreeStackSpace.name))
         }
         // safeAreaInset moves with the keyboard automatically — no manual observation needed.
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -442,9 +468,19 @@ struct InsightTreeView: View {
                 if undoInsight != nil {
                     undoButtonView
                         .transition(.scale(scale: 0.88).combined(with: .opacity))
+                        .opacity(studySubject == nil ? 1 : 0)
                 }
 
-                if isMidpointMode {
+                if showsStudyToolCard {
+                    StudyToolCard(
+                        tool: studyTool,
+                        transitionDirection: studyToolDirection,
+                        onPrevious: { selectStudyTool(studyTool.previous, direction: -1) },
+                        onNext: { selectStudyTool(studyTool.next, direction: 1) }
+                    )
+                    .transition(.bottomDockCard)
+                    .padding(.horizontal, 10)
+                } else if isMidpointMode {
                     MidpointPercentCard(
                         concepts: selectedCanvasTargets.compactMap { concept(for: $0) },
                         weights: midpointWeights,
@@ -457,7 +493,7 @@ struct InsightTreeView: View {
                     .transition(.scale(scale: 0.35, anchor: .bottom).combined(with: .opacity))
                     .padding(.horizontal, 10)
                 } else if !cardShouldHide {
-                    if !showQuestionBar, let concept = hoveredConcept {
+                    if !showQuestionBar, showsDockedCardAfterStudy, let concept = hoveredConcept {
                         DockedConceptCard(
                             concept: concept,
                             isSaved: savedConceptIDs.contains(concept.id),
@@ -493,7 +529,7 @@ struct InsightTreeView: View {
                         .gesture(dockedCardDismissGesture)
                         .transition(.bottomDockCard)
                         .padding(.horizontal, 10)
-                    } else if let selectedNode {
+                    } else if showsDockedCardAfterStudy, let selectedNode {
                         let makeNodeSourceID = viewModel.promotedSourceInsightID(
                             forNodeID: selectedNode.id
                         )
@@ -518,7 +554,7 @@ struct InsightTreeView: View {
                 }
 
                 // Insight chip — appears above the bar when keyboard is open, mirrors card dismiss animation
-                if showQuestionBar, chipShouldShow, let insight = questionBarContextInsight {
+                if showQuestionBar, chipShouldShow, studySubject == nil, let insight = questionBarContextInsight {
                     BranchContextChip(
                         title: insight.title,
                         icon: "text.bubble.fill",
@@ -593,6 +629,7 @@ struct InsightTreeView: View {
                         focusTrigger: questionBarFocusTrigger
                     )
                     .padding(.horizontal, 16)
+                    .opacity(studySubject == nil ? 1 : 0)
                 }
             }
             .padding(.bottom, 16)
@@ -603,7 +640,8 @@ struct InsightTreeView: View {
             .animation(.spring(response: 0.42, dampingFraction: 0.86), value: hoveredConcept?.id)
             .animation(.spring(response: 0.42, dampingFraction: 0.86), value: isMidpointMode)
             .animation(.spring(response: 0.34, dampingFraction: 0.86), value: undoInsight != nil)
-            .opacity(studyInsight == nil ? 1 : 0)
+            .animation(.spring(response: 0.42, dampingFraction: 0.86), value: showsStudyToolCard)
+            .animation(.spring(response: 0.42, dampingFraction: 0.86), value: showsDockedCardAfterStudy)
         }
         .onChange(of: insights) { oldValue, newValue in
             viewModel.updateInsights(newValue, promotedInsightIDs: promotedInsightIDs)
@@ -660,7 +698,7 @@ struct InsightTreeView: View {
             enterStudy()
         }
         .onChange(of: studyExitRequest) { _, _ in
-            guard studyInsight != nil else { return }
+            guard studySubject != nil else { return }
             exitStudy()
         }
         .onChange(of: restoreSelectedInsightID) { _, _ in
@@ -819,40 +857,88 @@ struct InsightTreeView: View {
         }
     }
 
+    private var studyTool: StudyTool {
+        StudyTool(rawValue: studyToolRawValue) ?? .branch
+    }
+
+    private func selectStudyTool(_ tool: StudyTool, direction: Int) {
+        guard tool != studyTool else { return }
+        studyToolDirection = direction
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
+            studyToolRawValue = tool.rawValue
+        }
+    }
+
+    /// The Node Concept being studied, until its exit begins, so the canvas shifts back in
+    /// time for the tree to be whole when Study closes.
+    private var studiedNodeID: UUID? {
+        guard !isExitingStudy, case .node(let node, _) = studySubject else { return nil }
+        return node.id
+    }
+
+    /// The Insight a node Study opens hovered, if Study was pressed on one.
+    private var studyInitialHoverID: UUID? {
+        guard case .node(_, let insightID) = studySubject else { return nil }
+        return insightID
+    }
+
     private func enterStudy() {
-        guard let selectedInsight,
-              selectedCanvasTargets.isEmpty,
-              !isMidpointMode else {
+        // The dock offers Study again as soon as an exit starts; wait for the exit to finish.
+        guard selectedCanvasTargets.isEmpty, !isMidpointMode, !isExitingStudy else { return }
+        let subject: StudySubject
+        if let selectedInsight {
+            // Study on an Insight opens its Node Concept with the Insight hovered. The dot
+            // matrix Study remains for Insights without an ordinary parent (placed midpoints).
+            if let parent = viewModel.nodes.first(where: { node in
+                !viewModel.placedMidpointNodeIDs.contains(node.id)
+                    && node.insights.contains { $0.id == selectedInsight.id }
+            }) {
+                subject = .node(parent, hoveredInsightID: selectedInsight.id)
+            } else {
+                subject = .insight(selectedInsight)
+            }
+        } else if let selectedNode {
+            subject = .node(selectedNode)
+        } else {
             return
         }
-        onStudyBranchCountChange?(2)
         isExitingStudy = false
         UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.72)
+        // The docked card scales away like switching Insights, then the tool card pops up
+        // like tapping one.
         withAnimation(.easeOut(duration: 0.3)) {
             showsDockedCardAfterStudy = false
-            studyInsight = selectedInsight
+            studySubject = subject
+        }
+        Task {
+            try? await Task.sleep(for: .milliseconds(180))
+            guard studySubject != nil, !isExitingStudy else { return }
+            showsStudyToolCard = true
         }
         onStudyModeChange?(true)
     }
 
     private func exitStudy() {
-        guard studyInsight != nil, !isExitingStudy else { return }
+        guard studySubject != nil, !isExitingStudy else { return }
         withAnimation(.spring(response: 0.58, dampingFraction: 0.82)) {
             isExitingStudy = true
         }
+        // Tell the host now, so the dock and Exit change back while the camera moves.
+        onStudyModeChange?(false)
+        // The reverse of entering: the tool card scales away, then the docked card pops back.
+        showsStudyToolCard = false
         Task {
-            try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.16)) {
-                studyInsight = nil
-                isExitingStudy = false
-            }
-            try? await Task.sleep(for: .milliseconds(60))
+            try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
             withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
                 showsDockedCardAfterStudy = true
             }
-            onStudyModeChange?(false)
+            try? await Task.sleep(for: .milliseconds(700))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.16)) {
+                studySubject = nil
+                isExitingStudy = false
+            }
         }
     }
 
@@ -2001,17 +2087,26 @@ struct DockedInsightTreeCard: View {
         }
         // Trim the bottom: the definition's .lineSpacing(12) leaves trailing space below the
         // last line, so a full 32 there reads as noticeably more space than the 32 up top.
-        .padding(.horizontal, 32)
-        .padding(.top, 32)
-        .padding(.bottom, 20)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(insightTreeInsightColor)
-        .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 36, style: .continuous)
-                .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
-        )
-        .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 0)
+        .dockedCardChrome(bottomPadding: 20)
+    }
+}
+
+extension View {
+    /// The docked Insight card's chrome: padding, full width, fill, 36 pt continuous corners,
+    /// hairline border, and soft shadow. Shared so other docked cards match it exactly.
+    func dockedCardChrome(bottomPadding: CGFloat) -> some View {
+        self
+            .padding(.horizontal, 32)
+            .padding(.top, 32)
+            .padding(.bottom, bottomPadding)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(insightTreeInsightColor)
+            .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 36, style: .continuous)
+                    .stroke(AquinasTheme.Colors.brownBorder, lineWidth: 1)
+            )
+            .shadow(color: Color(red: 0.13, green: 0.06, blue: 0).opacity(0.15), radius: 24, x: 0, y: 0)
     }
 }
 

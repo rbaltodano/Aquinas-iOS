@@ -6,6 +6,7 @@
 import SwiftUI
 import UIKit
 import Observation
+import simd
 
 @MainActor
 @Observable
@@ -91,6 +92,14 @@ struct InsightTreeCanvasView: View {
     var onRequestDismissHover: () -> Void = {}
     /// Reports the current blue-dot count whenever Insights or Node Concepts change discovery.
     var onUndiscoveredInsightCountChange: (Int) -> Void = { _ in }
+    /// The Node Concept being studied. The canvas camera shifts from the tree's framing into
+    /// `studySlot` while the rest of the tree fades; nil shifts it back. The studied node is
+    /// the tree's own node, never a copy.
+    var studyNodeID: UUID? = nil
+    /// An Insight of the studied node to open Study already hovered on.
+    var studyInitialHoverInsightID: UUID? = nil
+    /// The Study slot, in this canvas's coordinates.
+    var studySlot: CGRect? = nil
 
     @Environment(\.scenePhase) private var scenePhase
 
@@ -104,6 +113,8 @@ struct InsightTreeCanvasView: View {
     /// reveal. Existing lines are seeded here immediately; new lines are added by the entrance
     /// sequence once the Insight's own animation has completed.
     @State private var revealedInsightConnectorIDs: Set<UUID> = []
+    @State private var revealedGraphEdgeIDs: Set<String> = []
+    @State private var animatedGraphEdgeIDs: Set<String> = []
     @State private var revealedNodeIDs: Set<UUID> = []
     /// Stable topology baselines for live (non-persisted) trees. Reveal state is deliberately
     /// separate: an Insight can already belong to the tree while remaining hidden during its
@@ -159,6 +170,54 @@ struct InsightTreeCanvasView: View {
     /// Per-insight free bond angle around its node; VSEPR repulsion spreads chips to maximize
     /// angular separation. Keyed by insight id.
     @State private var chipAngles: [UUID: ChipAngle] = [:]
+    /// Per-insight elevation angle (radians, within ±45°) above or below the plane. Seeded at
+    /// its cluster's spread target (`InsightClusterSpatialLayout.elevationTargets`) in
+    /// `reconcileBodies`; the sim eases each toward updated targets as the cluster changes.
+    @State private var chipElevationAngles: [UUID: CGFloat] = [:]
+
+    // MARK: Node Concept Study
+    /// The node being studied; kept through the shift back so it lands in place.
+    @State private var studyFocusNodeID: UUID?
+    /// 0 = the tree's framing, 1 = the Study framing.
+    @State private var studyProgress: Double = 0
+    /// Each studied Insight's offset from its Node Concept in the tree, and its Study direction
+    /// (spread over the whole sphere; the ±45° limit only applies in the tree).
+    @State private var studyTreeOffsets: [UUID: SIMD3<Double>] = [:]
+    @State private var studySpread: [UUID: SIMD3<Double>] = [:]
+    @State private var studyRadius: Double = 190
+    @State private var studyYaw: Double = 0
+    @State private var studyPan: CGSize = .zero
+    @State private var studyZoom: CGFloat = 1
+    @State private var studyPinchStartZoom: CGFloat?
+    @State private var studyDragMode: StudyDragMode?
+    @State private var studyLastDragLocation: CGPoint?
+    @State private var studyLastDetentYaw: Double = 0
+    /// 0 → 1 while a finger is on the ring; eased, so the ring brightens and grows smoothly.
+    @State private var studyRingActive: Double = 0
+    /// A tapped Insight in Study: centered, zoomed in on, and the axis of rotation.
+    /// `studyPivotBlend` eases 0 ↔ 1; the id is kept while easing back to the node.
+    @State private var studyPivotID: UUID?
+    @State private var studyPivotBlend: Double = 0
+    @State private var studyPivotLink: DisplayLinkDriver?
+    /// When the focus moves from one Insight to another, the camera glides from the previous
+    /// one's position (`studyPivotSwitch` 0 → 1).
+    @State private var studyPivotFrom: SIMD3<Double>?
+    @State private var studyPivotSwitch: Double = 1
+    @State private var studyPivotSwitchLink: DisplayLinkDriver?
+    /// Set when a focused Insight is released, so the axis returns to the node without the
+    /// view moving (see `releaseStudyPivot`).
+    @State private var studyTargetShift: SIMD3<Double> = .zero
+    @State private var lastCanvasSize: CGSize = .zero
+    /// Ring momentum: yaw keeps turning after release and eases to a stop.
+    @State private var studySpinLink: DisplayLinkDriver?
+    @State private var studyRingHalfWidth: CGFloat = 150
+    /// A plain touch becomes a pan (and lets go of a focused Insight) only past this distance,
+    /// so a tap never releases it.
+    private static let studyTapSlop: CGFloat = 6
+    @State private var studyLink: DisplayLinkDriver?
+    /// Measured label footprints by title. A reference type so filling it never invalidates the
+    /// view; the simulation reads every chip's footprint on every frame.
+    @State private var collisionSizeCache = InsightCollisionSizeCache()
     @State private var alpha: Double = 0
     @State private var displayLink: DisplayLinkDriver? = nil
     @State private var lastTickAt: CFTimeInterval = 0
@@ -226,6 +285,7 @@ struct InsightTreeCanvasView: View {
     private static let bondDomainK: Double = 1.4
     private static let chipAngGain: Double = 0.45        // viscous angular response speed
     private static let chipMaxAngStep: Double = 0.07     // max radians a bond rotates per frame
+    private static let elevationEaseRate: CGFloat = 0.2  // fraction of the way to target per frame
     private static let chipAngleEps: Double = 0.12       // softens the 1/Δθ repulsion
     // The uniform VSEPR spread above maximizes angular separation equally across every bond, but
     // has no notion of how WIDE any one chip's label actually is — a long title next to a short
@@ -242,7 +302,27 @@ struct InsightTreeCanvasView: View {
     private static let depthCuesEnabled = true
     private static let depthMinScale: CGFloat = 0.85     // farthest node's scale
     private static let depthMinOpacity: Double = 0.75    // farthest node's dimming
-    private static let depthParallaxGain: CGFloat = 0.08 // pan-offset fraction applied by depth
+
+    /// One visible Insight's resolved geometry for the current render.
+    fileprivate struct InsightPlacement {
+        let insight: InsightModel
+        let nodeID: UUID
+        let index: Int
+        let count: Int
+        let isPinnedAtNode: Bool
+        /// Footprint on the graph plane (the live drag point while this chip is dragged).
+        let world: CGPoint
+        /// World units above (+) or below (−) the graph plane; 0 for pinned midpoints.
+        let elevation: CGFloat
+        /// Normalized local elevation in [-1, 1]; 0 for pinned midpoints.
+        let localDepth: CGFloat
+    }
+
+    fileprivate struct CanvasInsightLayout {
+        var nodes: [NodeModel]
+        var insightsByNode: [UUID: [InsightModel]] = [:]
+        var placements: [UUID: InsightPlacement] = [:]
+    }
 
     private var activeScale: CGFloat {
         clamp(cameraState.scale, lower: 0.28, upper: 2.6)
@@ -287,15 +367,33 @@ struct InsightTreeCanvasView: View {
     }
 
     private func focusAnchor(in size: CGSize) -> CGPoint {
-        CGPoint(x: size.width / 2, y: size.height * 0.40)
+        CGPoint(x: size.width / 2, y: size.height / 2)
     }
 
     var body: some View {
         GeometryReader { proxy in
             let size = proxy.size
-            let camera = InsightTreeCamera(scale: activeScale, offset: activeOffset)
+            let studyFraming = makeStudyFraming(in: size)
+            let treeCamera = InsightTreeCamera(scale: activeScale, offset: activeOffset)
+            let camera = studyCamera(treeCamera, framing: studyFraming, in: size)
+            // The ring stays put while the user pans or zooms the node in Study; its dashes turn
+            // with the node.
+            let studyRingCamera = studyFraming.map { framing in
+                framing.camera(from: treeCamera.currentOrbitCamera(in: size), progress: studyProgress)
+            }
+            let studyRing = studyFraming.flatMap { framing in
+                studyRingCamera.map { framing.ringPoints(camera: $0) }
+            } ?? []
+            let studyRingDashes = studyFraming.flatMap { framing in
+                studyRingCamera.map { framing.ringDashes(camera: $0, yaw: studyYaw * studyProgress) }
+            } ?? []
+            let restFade = studyFocusNodeID == nil ? 1 : 1 - studyProgress
+            let studyReady = studyNodeID != nil && studyFocusNodeID != nil && studyProgress > 0.99
             let labelOpacity = Self.labelOpacity(for: activeScale)
             let nodeLabelOpacity = Self.nodeLabelOpacity(for: activeScale)
+            let layout = makeInsightLayout()
+            let studyChipTargets = studyReady ? studyTapTargets(layout: layout, camera: camera, size: size) : []
+            let studyNodeTarget = studyReady ? studyNodeTapTarget(camera: camera, size: size) : nil
 
             ZStack {
                 insightTreeCanvasColor.ignoresSafeArea()
@@ -305,56 +403,93 @@ struct InsightTreeCanvasView: View {
                     dragOffset:    dragOffset,
                     ripples:       (rippleTrigger.map { [$0] } ?? []) + selectionRipples
                 )
-                .ignoresSafeArea()
-                .opacity(hasAppeared ? 1 : 0)
+                // Keep the grid's Canvas in the exact same coordinate frame as the graph.
+                // Expanding it independently into the safe area shifts ripple origins away
+                // from the focused chip even though both use the same camera transform.
+                .frame(width: size.width, height: size.height)
+                .opacity(hasAppeared ? restFade : 0)
                 .animation(.easeOut(duration: 0.6), value: hasAppeared)
 
-                ZStack {
-                    graphEdges(camera: camera, size: size)
-                    midpointConnectors(camera: camera, size: size)
-                    insightConnectors(camera: camera, size: size)
-                    connectorPulseOverlay(camera: camera, size: size)
-                    selectionOverlay(camera: camera, size: size)
-                    edgeHitTargets(camera: camera, size: size)
+                // In Study the grid tips up into a floor under the ring, moving with the node.
+                if let studyFraming, let studyOrbit = camera.orbit {
+                    StudyFloorGrid(framing: studyFraming, camera: studyOrbit)
+                        .frame(width: size.width, height: size.height)
+                        .opacity(studyProgress)
+                }
 
-                    ForEach(displayNodes) { node in
-                        let visibleInsights = canvasInsights(for: node)
+                ZStack {
+                    if studyFocusNodeID != nil {
+                        StudyFloorRing(points: studyRing, dashes: studyRingDashes, activeAmount: studyRingActive)
+                            .frame(width: size.width, height: size.height)
+                            .opacity(studyProgress)
+                    }
+                    Group {
+                        graphEdges(camera: camera, size: size)
+                        midpointConnectors(layout: layout, camera: camera, size: size)
+                    }
+                    .opacity(restFade)
+                    insightConnectors(layout: layout, camera: camera, size: size)
+                    // Hover pulses stay in Study: they only ever run along the hovered item's
+                    // connectors, which in Study belong to the studied cluster.
+                    connectorPulseOverlay(layout: layout, camera: camera, size: size)
+                    Group {
+                        selectionOverlay(layout: layout, camera: camera, size: size)
+                        edgeHitTargets(camera: camera, size: size)
+                    }
+                    .opacity(restFade)
+
+                    ForEach(layout.nodes) { node in
+                        let visibleInsights = layout.insightsByNode[node.id] ?? []
                         // Placed-midpoint nodes render as just their insight chip — no concept circle.
                         if !placedMidpointNodeIDs.contains(node.id),
                            revealedNodeIDs.contains(node.id) {
                             nodeGroup(node, camera: camera, size: size, labelOpacity: nodeLabelOpacity)
                                 .opacity(itemFlashOpacity(selected: selectedCanvasTargets.contains(.node(node.id))))
+                                .opacity(studyOpacity(forNodeID: node.id))
                         }
 
-                        ForEach(Array(visibleInsights.enumerated()), id: \.element.id) { index, insight in
-                            insightLabel(
-                                insight,
-                                node: node,
-                                index: index,
-                                count: visibleInsights.count,
-                                camera: camera,
-                                size: size,
-                                labelOpacity: labelOpacity
-                            )
-                            .opacity(itemFlashOpacity(selected: selectedCanvasTargets.contains(.insight(insight.id))))
+                        ForEach(visibleInsights) { insight in
+                            if let placement = layout.placements[insight.id] {
+                                insightLabel(
+                                    placement,
+                                    node: node,
+                                    camera: camera,
+                                    size: size,
+                                    labelOpacity: labelOpacity
+                                )
+                                .opacity(itemFlashOpacity(selected: selectedCanvasTargets.contains(.insight(insight.id))))
+                            }
                         }
                     }
                 }
                 .opacity(isMidpointMode ? 0 : 1)
-                .allowsHitTesting(!isMidpointMode)
+                // In Study only the Study gestures below respond.
+                .allowsHitTesting(!isMidpointMode && studyFocusNodeID == nil)
                 .animation(.easeInOut(duration: 0.3), value: isMidpointMode)
 
                 if isMidpointMode {
-                    midpointOverlay(camera: camera, size: size, labelOpacity: labelOpacity)
+                    midpointOverlay(layout: layout, camera: camera, size: size, labelOpacity: labelOpacity)
                 }
             }
             .contentShape(Rectangle())
             .coordinateSpace(name: Self.canvasSpace)
-            .simultaneousGesture(panGesture(camera: camera, size: size))
-            .simultaneousGesture(zoomGesture(in: size))  // always available for precision zooming
+            .simultaneousGesture(panGesture(camera: camera, size: size), including: studyFocusNodeID == nil ? .all : .none)
+            // Always available for precision zooming, except in Study, which has its own pinch.
+            .simultaneousGesture(zoomGesture(in: size), including: studyFocusNodeID == nil ? .all : .none)
+            .simultaneousGesture(studyDragGesture(ring: studyRing, chips: studyChipTargets, nodeFrame: studyNodeTarget, size: size), including: studyReady ? .all : .none)
+            .onChange(of: size, initial: true) { _, newSize in lastCanvasSize = newSize }
+            .simultaneousGesture(studyPinchGesture, including: studyReady ? .all : .none)
             .onTapGesture {
+                guard studyFocusNodeID == nil else { return }
                 selectedEdgeID = nil
                 cameraState.userMovedSincePlacement = true
+            }
+            .onChange(of: studyNodeID) { _, nodeID in
+                if let nodeID {
+                    beginStudy(of: nodeID)
+                } else {
+                    endStudy()
+                }
             }
             .onChange(of: restoreFocusedCameraRequest) { oldValue, newValue in
                 restorePreFocusCamera()
@@ -363,7 +498,11 @@ struct InsightTreeCanvasView: View {
                 guard let newValue,
                       let focusTarget = insightFocusTarget(for: newValue) else { return }
 
-                focusHoveredTarget(at: focusTarget, in: size)
+                focusHoveredTarget(
+                    at: focusTarget,
+                    elevation: insightElevation(forInsightID: newValue),
+                    in: size
+                )
             }
             .onChange(of: focusedSearchNodeID) { _, newValue in
                 guard let newValue,
@@ -377,6 +516,7 @@ struct InsightTreeCanvasView: View {
                 undiscoveredInsightIDs = loadUndiscoveredInsightIDs()
                 undiscoveredNodeIDs = loadUndiscoveredNodeIDs()
                 revealedNodeIDs = Set(nodes.map(\.id))
+                revealedGraphEdgeIDs = Set(displayGraphEdges().map(\.id))
                 observedLiveInsightIDs = visibleInsightIDs(in: nodes)
                 observedLiveNodeIDs = Set(nodes.map(\.id))
                 if defersEntranceUntilPersistedTree {
@@ -384,6 +524,7 @@ struct InsightTreeCanvasView: View {
                     // persisted baseline. A completed backend load will do both.
                     revealedInsightIDs = visibleInsightIDs(in: nodes)
                     revealedInsightConnectorIDs = visibleInsightIDs(in: nodes)
+                    revealedGraphEdgeIDs = Set(displayGraphEdges().map(\.id))
                     reportUndiscoveredInsightCount()
                 } else {
                     let newInsights = computeNewInsights()
@@ -640,7 +781,7 @@ struct InsightTreeCanvasView: View {
                 // Lock the handle-vs-pan decision to the gesture's start so it can't
                 // flip to panning as the handle moves away from the finger.
                 guard !isHandleDragStart(value.startLocation, camera: camera, size: size) else { return }
-                state = value.translation
+                state = flatTranslation(value, camera: camera, size: size)
             }
             .onChanged { value in
                 guard draggingChipID == nil else {
@@ -676,8 +817,9 @@ struct InsightTreeCanvasView: View {
                     panGestureBlockedByChipDrag = false
                     return
                 }
-                cameraState.offset.width += value.translation.width
-                cameraState.offset.height += value.translation.height
+                let translation = flatTranslation(value, camera: camera, size: size)
+                cameraState.offset.width += translation.width
+                cameraState.offset.height += translation.height
 
                 if hypot(value.translation.width, value.translation.height) > 8 {
                     cameraState.lastDragEndedAt = Date()
@@ -687,6 +829,15 @@ struct InsightTreeCanvasView: View {
                     cameraState.isDragging = false
                 }
             }
+    }
+
+    /// A screen drag converted to the flat pan offset that keeps the grabbed point of the
+    /// perspective plane under the finger. Independent of the current offset.
+    private func flatTranslation(_ value: DragGesture.Value, camera: InsightTreeCamera, size: CGSize) -> CGSize {
+        let projection = camera.projection(in: size)
+        let start = projection.unproject(value.startLocation)
+        let current = projection.unproject(value.location)
+        return CGSize(width: current.x - start.x, height: current.y - start.y)
     }
 
     /// Whether the gesture began on the handle. Uses the handle position captured at the
@@ -718,7 +869,10 @@ struct InsightTreeCanvasView: View {
         DragGesture(minimumDistance: 0, coordinateSpace: .named(Self.canvasSpace))
             .onChanged { value in
                 if draggingChipID == insight.id {
-                    draggingChipWorldPosition = camera.screenToWorld(value.location, in: size)
+                    // Unproject at the chip's own elevation so the chip stays exactly under the finger.
+                    draggingChipWorldPosition = isPinnedAtNode
+                        ? camera.screenToWorld(value.location, in: size)
+                        : draggedChipFootprint(under: value.location, insight: insight, node: node, camera: camera, size: size)
                     // Top up the frame budget every move so a long drag never lets the sim
                     // expire mid-gesture — but WITHOUT re-boosting `alpha` (startSim's own
                     // `max(alpha, intensity)` would do that on every single move event). Alpha
@@ -787,7 +941,11 @@ struct InsightTreeCanvasView: View {
                     UISelectionFeedbackGenerator().selectionChanged()
                     return
                 }
-                let releasePoint = camera.screenToWorld(value.location, in: size)
+                // Unproject at the chip's elevation: the drop point is its footprint on the plane,
+                // so raised or lowered chips keep the angle they were released at.
+                let releasePoint = draggedChipFootprint(
+                    under: value.location, insight: insight, node: node, camera: camera, size: size
+                )
                 let finalAngle = Double(atan2(
                     releasePoint.y - node.position.y,
                     releasePoint.x - node.position.x
@@ -819,10 +977,12 @@ struct InsightTreeCanvasView: View {
                 let initialScale = cameraState.pinchStartScale ?? cameraState.scale
                 let initialOffset = cameraState.pinchStartOffset ?? cameraState.offset
                 let nextScale = clamp(initialScale * pow(value.magnification, 0.72), lower: 0.28, upper: 2.6)
-                let anchor = CGPoint(
-                    x: value.startAnchor.x * size.width,
-                    y: value.startAnchor.y * size.height
-                )
+                let anchor = InsightTreeCamera(scale: initialScale, offset: initialOffset)
+                    .projection(in: size)
+                    .unproject(CGPoint(
+                        x: value.startAnchor.x * size.width,
+                        y: value.startAnchor.y * size.height
+                    ))
 
                 cameraState.scale = nextScale
                 cameraState.offset = offsetKeeping(anchor, fixedFrom: initialOffset, initialScale: initialScale, nextScale: nextScale, in: size)
@@ -831,10 +991,12 @@ struct InsightTreeCanvasView: View {
                 let initialScale = cameraState.pinchStartScale ?? cameraState.scale
                 let initialOffset = cameraState.pinchStartOffset ?? cameraState.offset
                 let nextScale = clamp(initialScale * pow(value.magnification, 0.72), lower: 0.28, upper: 2.6)
-                let anchor = CGPoint(
-                    x: value.startAnchor.x * size.width,
-                    y: value.startAnchor.y * size.height
-                )
+                let anchor = InsightTreeCamera(scale: initialScale, offset: initialOffset)
+                    .projection(in: size)
+                    .unproject(CGPoint(
+                        x: value.startAnchor.x * size.width,
+                        y: value.startAnchor.y * size.height
+                    ))
 
                 cameraState.scale = nextScale
                 cameraState.offset = offsetKeeping(anchor, fixedFrom: initialOffset, initialScale: initialScale, nextScale: nextScale, in: size)
@@ -869,8 +1031,8 @@ struct InsightTreeCanvasView: View {
     /// — a single spring rather than two sequential ones when both need to change together.
     private func focusInsight(at worldPosition: CGPoint, in size: CGSize, targetScale: CGFloat? = nil) {
         rememberCameraBeforeFocusIfNeeded()
-        let target = focusAnchor(in: size)
         let nextScale = targetScale ?? cameraState.scale
+        let target = focusFlatTarget(elevation: 0, scale: nextScale, in: size)
 
         withAnimation(.spring(response: 0.58, dampingFraction: 0.64, blendDuration: 0.08)) {
             cameraState.scale = nextScale
@@ -881,10 +1043,14 @@ struct InsightTreeCanvasView: View {
         }
     }
 
-    private func focusHoveredTarget(at worldPosition: CGPoint, in size: CGSize) {
+    /// Centers a hovered target on screen. An Insight passes its elevation so the chip itself —
+    /// not its footprint on the plane — lands under the selection reticle.
+    /// Returns the zoom scale the camera is animating to.
+    @discardableResult
+    private func focusHoveredTarget(at worldPosition: CGPoint, elevation: CGFloat = 0, in size: CGSize) -> CGFloat {
         rememberCameraBeforeFocusIfNeeded()
         let nextScale = clamp(max(cameraState.scale, 1.15), lower: 0.28, upper: 2.6)
-        let target = focusAnchor(in: size)
+        let target = focusFlatTarget(elevation: elevation, scale: nextScale, in: size)
 
         withAnimation(.spring(response: 0.58, dampingFraction: 0.64, blendDuration: 0.08)) {
             cameraState.scale = nextScale
@@ -893,6 +1059,13 @@ struct InsightTreeCanvasView: View {
                 height: target.y - size.height / 2 + (worldPosition.y * nextScale)
             )
         }
+        return nextScale
+    }
+
+    /// The flat (pre-perspective) point a target must occupy to project onto the focus anchor.
+    private func focusFlatTarget(elevation: CGFloat, scale: CGFloat, in size: CGSize) -> CGPoint {
+        InsightTreeCamera(scale: scale, offset: .zero)
+            .flatPointCentering(elevation: elevation, in: size)
     }
 
     private func rememberCameraBeforeFocusIfNeeded() {
@@ -927,20 +1100,27 @@ struct InsightTreeCanvasView: View {
     private func graphEdges(camera: InsightTreeCamera, size: CGSize) -> some View {
         let hasSelection = !selectedCanvasTargets.isEmpty
         ForEach(displayGraphEdges()) { edge in
-            if let from = simPosition(of: edge.fromNodeID),
+            if revealedGraphEdgeIDs.contains(edge.id),
+               let from = simPosition(of: edge.fromNodeID),
                let to = simPosition(of: edge.toNodeID) {
-                let start = depthScreenPosition(from, nodeID: edge.fromNodeID, camera: camera, size: size)
-                let end = depthScreenPosition(to, nodeID: edge.toNodeID, camera: camera, size: size)
+                let start = camera.worldToScreen(from, in: size)
+                let end = camera.worldToScreen(to, in: size)
 
-                AnimatableLine(start: start, end: end)
-                    .stroke(
-                        AquinasTheme.Colors.divider.opacity(edge.isSuggested ? 0.55 : 0.9),
-                        style: StrokeStyle(
-                            lineWidth: 1,
-                            lineCap: .round,
-                            dash: edge.isSuggested ? [6, 4] : []
+                Group {
+                    if animatedGraphEdgeIDs.contains(edge.id) {
+                        InsightConnectorLine(
+                            start: start,
+                            end: end,
+                            color: AquinasTheme.Colors.divider.opacity(edge.isSuggested ? 0.55 : 0.9)
                         )
-                    )
+                    } else {
+                        AnimatableLine(start: start, end: end)
+                            .stroke(
+                                AquinasTheme.Colors.divider.opacity(edge.isSuggested ? 0.55 : 0.9),
+                                style: StrokeStyle(lineWidth: 1, lineCap: .round, dash: edge.isSuggested ? [6, 4] : [])
+                            )
+                    }
+                }
                     .frame(width: size.width, height: size.height)
                     .allowsHitTesting(false)
                     .opacity(hasSelection ? 0.5 : 1.0)
@@ -961,19 +1141,31 @@ struct InsightTreeCanvasView: View {
         return worldPosition(forInsightID: source.insightID)
     }
 
+    /// Screen endpoint for a midpoint's source. Insight sources end exactly where their chip is
+    /// drawn (including local elevation and perspective); node sources use the node's depth.
+    private func midpointSourceScreenPosition(
+        _ source: MidpointSource,
+        layout: CanvasInsightLayout,
+        camera: InsightTreeCamera,
+        size: CGSize
+    ) -> CGPoint? {
+        if !source.isNode, let placement = layout.placements[source.insightID] {
+            return insightScreenPosition(placement, camera: camera, size: size)
+        }
+        guard let sourceWorld = midpointSourceEndpoint(source) else { return nil }
+        return camera.worldToScreen(sourceWorld, in: size)
+    }
+
     /// Lines from each placed midpoint to the insight chips / node concepts it was spawned from.
     @ViewBuilder
-    private func midpointConnectors(camera: InsightTreeCamera, size: CGSize) -> some View {
+    private func midpointConnectors(layout: CanvasInsightLayout, camera: InsightTreeCamera, size: CGSize) -> some View {
         let hasSelection = !selectedCanvasTargets.isEmpty
         ForEach(Array(placedMidpointNodeIDs), id: \.self) { placedID in
             if let placedWorld = simPosition(of: placedID), let sources = placedMidpointSources[placedID] {
-                let end = depthScreenPosition(placedWorld, nodeID: placedID, camera: camera, size: size)
+                let end = camera.worldToScreen(placedWorld, in: size)
                 ForEach(Array(sources.enumerated()), id: \.offset) { _, source in
-                    if let sourceWorld = midpointSourceEndpoint(source) {
-                        AnimatableLine(
-                            start: depthScreenPosition(sourceWorld, nodeID: owningNodeID(forInsightID: source.insightID), camera: camera, size: size),
-                            end: end
-                        )
+                    if let start = midpointSourceScreenPosition(source, layout: layout, camera: camera, size: size) {
+                        AnimatableLine(start: start, end: end)
                             .stroke(
                                 AquinasTheme.Colors.divider.opacity(0.9),
                                 style: StrokeStyle(lineWidth: 1, lineCap: .round)
@@ -988,22 +1180,17 @@ struct InsightTreeCanvasView: View {
     }
 
     @ViewBuilder
-    private func insightConnectors(camera: InsightTreeCamera, size: CGSize) -> some View {
+    private func insightConnectors(layout: CanvasInsightLayout, camera: InsightTreeCamera, size: CGSize) -> some View {
         let hasSelection = !selectedCanvasTargets.isEmpty
         // Placed-midpoint chips sit on the node itself, so they have no orbit connectors.
-        let connectorNodes = displayNodes.filter { !placedMidpointNodeIDs.contains($0.id) }
+        let connectorNodes = layout.nodes.filter { !placedMidpointNodeIDs.contains($0.id) }
         ForEach(connectorNodes, id: \.id) { node in
-            let visibleInsights = canvasInsights(for: node)
-            ForEach(Array(visibleInsights.enumerated()), id: \.element.id) { index, insight in
-                if revealedInsightConnectorIDs.contains(insight.id) {
-                    let start = depthScreenPosition(node.position, nodeID: node.id, camera: camera, size: size)
-                    let end = insightScreenPosition(
-                        insightWorldPosition(for: node, index: index, count: visibleInsights.count),
-                        insightID: insight.id,
-                        nodeID: node.id,
-                        camera: camera,
-                        size: size
-                    )
+            let visibleInsights = layout.insightsByNode[node.id] ?? []
+            ForEach(visibleInsights) { insight in
+                if revealedInsightConnectorIDs.contains(insight.id),
+                   let placement = layout.placements[insight.id] {
+                    let start = camera.worldToScreen(node.position, in: size)
+                    let end = insightScreenPosition(placement, camera: camera, size: size)
                     // Connector lines stay at a constant opacity regardless of zoom — only the
                     // chip label/background fade with `labelOpacity`, not the lines themselves.
                     let baseOpacity = 0.55
@@ -1011,65 +1198,93 @@ struct InsightTreeCanvasView: View {
                     InsightConnectorLine(
                         start: start,
                         end: end,
-                        color: AquinasTheme.Colors.divider.opacity(baseOpacity * (hasSelection ? 0.5 : 1.0))
+                        color: AquinasTheme.Colors.divider.opacity(
+                            baseOpacity * (hasSelection ? 0.5 : 1.0) * studyOpacity(forNodeID: node.id)
+                        )
                     )
                         .frame(width: size.width, height: size.height)
                         .allowsHitTesting(false)
                         .animation(.easeInOut(duration: 0.22), value: hasSelection)
+
                 }
             }
         }
     }
 
+    private struct ConnectorPulseEndpoints: Identifiable {
+        let id: String
+        let start: CGPoint
+        let end: CGPoint
+        let lineWidth: CGFloat
+    }
+
+    /// Screen endpoints of every connector that should pulse, resolved once per render from the
+    /// same placements the chips and connectors use. Empty when nothing is hovered, so the
+    /// per-frame timeline below draws nothing and scans nothing.
+    private func connectorPulseEndpoints(
+        layout: CanvasInsightLayout,
+        camera: InsightTreeCamera,
+        size: CGSize
+    ) -> [ConnectorPulseEndpoints] {
+        guard pulsingInsightID != nil || pulsingNodeID != nil else { return [] }
+        var lines: [ConnectorPulseEndpoints] = []
+
+        let sourceNodeID = pulsingNodeID ?? pulsingInsightNodeID()
+        if let sourceNodeID, let sourcePos = simPosition(of: sourceNodeID) {
+            let start = camera.worldToScreen(sourcePos, in: size)
+            for edge in displayGraphEdges()
+            where edge.fromNodeID == sourceNodeID || edge.toNodeID == sourceNodeID {
+                let targetNodeID = edge.fromNodeID == sourceNodeID ? edge.toNodeID : edge.fromNodeID
+                guard let targetPos = simPosition(of: targetNodeID) else { continue }
+                lines.append(ConnectorPulseEndpoints(
+                    id: "edge-\(edge.id)",
+                    start: start,
+                    end: camera.worldToScreen(targetPos, in: size),
+                    lineWidth: 2.2
+                ))
+            }
+        }
+
+        for node in layout.nodes {
+            let visibleInsights = layout.insightsByNode[node.id] ?? []
+            let pulsed: [InsightModel]
+            let lineWidth: CGFloat
+            if let pulsingInsightID, let insight = visibleInsights.first(where: { $0.id == pulsingInsightID }) {
+                pulsed = [insight]
+                lineWidth = 2.2
+            } else if pulsingNodeID == node.id {
+                pulsed = visibleInsights
+                lineWidth = 1.8
+            } else {
+                continue
+            }
+            let nodePosition = camera.worldToScreen(node.position, in: size)
+            for insight in pulsed {
+                guard let placement = layout.placements[insight.id] else { continue }
+                lines.append(ConnectorPulseEndpoints(
+                    id: "insight-\(insight.id.uuidString)",
+                    start: insightScreenPosition(placement, camera: camera, size: size),
+                    end: nodePosition,
+                    lineWidth: lineWidth
+                ))
+            }
+        }
+        return lines
+    }
+
     @ViewBuilder
-    private func connectorPulseOverlay(camera: InsightTreeCamera, size: CGSize) -> some View {
-        TimelineView(.animation) { timeline in
+    private func connectorPulseOverlay(layout: CanvasInsightLayout, camera: InsightTreeCamera, size: CGSize) -> some View {
+        let lines = connectorPulseEndpoints(layout: layout, camera: camera, size: size)
+        // Paused while idle: an always-running `.animation` timeline re-evaluated this overlay
+        // every display frame even when no connector was pulsing.
+        TimelineView(.animation(minimumInterval: nil, paused: lines.isEmpty)) { timeline in
             let pulseProgress = connectorPulseProgress(at: timeline.date)
-            let sourceNodeID = pulsingNodeID ?? pulsingInsightNodeID()
 
             ZStack {
-                graphEdgePulseOverlay(sourceNodeID: sourceNodeID, camera: camera, size: size, progress: pulseProgress)
-
-                ForEach(displayNodes) { node in
-                    let visibleInsights = canvasInsights(for: node)
-                    let isPulsingNode = pulsingNodeID == node.id
-                    let selectedInsightIndex = pulsingInsightID.flatMap { pulsingID in
-                        visibleInsights.firstIndex { $0.id == pulsingID }
-                    }
-
-                    ForEach(Array(visibleInsights.enumerated()), id: \.element.id) { index, insight in
-                        let nodePosition = depthScreenPosition(node.position, nodeID: node.id, camera: camera, size: size)
-                        let insightPosition = depthScreenPosition(
-                            insightWorldPosition(for: node, index: index, count: visibleInsights.count),
-                            nodeID: node.id,
-                            camera: camera,
-                            size: size
-                        )
-
-                        if let selectedInsightIndex {
-                            connectorPulseLine(
-                                nodePosition: nodePosition,
-                                insightPosition: insightPosition,
-                                isSelectedInsight: index == selectedInsightIndex,
-                                isSelectedNodeConcept: false,
-                                progress: pulseProgress
-                            )
-                            .frame(width: size.width, height: size.height)
-                            .allowsHitTesting(false)
-                        } else if isPulsingNode {
-                            connectorPulseLine(
-                                nodePosition: nodePosition,
-                                insightPosition: insightPosition,
-                                isSelectedInsight: false,
-                                isSelectedNodeConcept: true,
-                                progress: pulseProgress
-                            )
-                            .frame(width: size.width, height: size.height)
-                            .allowsHitTesting(false)
-                        }
-                    }
+                ForEach(lines) { line in
+                    travelingPulseLine(start: line.start, end: line.end, progress: pulseProgress, lineWidth: line.lineWidth)
+                        .frame(width: size.width, height: size.height)
                 }
-
             }
             .frame(width: size.width, height: size.height)
         }
@@ -1078,21 +1293,22 @@ struct InsightTreeCanvasView: View {
     }
 
     @ViewBuilder
-    private func selectionOverlay(camera: InsightTreeCamera, size: CGSize) -> some View {
+    private func selectionOverlay(layout: CanvasInsightLayout, camera: InsightTreeCamera, size: CGSize) -> some View {
+        // Selection lines end where each target is drawn, including an Insight's elevation and
+        // perspective, rather than at its bare world point.
+        let screenPosition = { (target: CanvasSelectionTarget) in
+            selectionScreenPosition(for: target, layout: layout, camera: camera, size: size)
+        }
         if !isMidpointMode,
            let activeTarget = selectedCanvasTargets.last,
-           let activeWorldPosition = worldPosition(for: activeTarget) {
-            let activePosition = camera.worldToScreen(activeWorldPosition, in: size)
+           let activePosition = screenPosition(activeTarget) {
             let center = focusAnchor(in: size)
 
             ZStack {
                 ForEach(Array(selectedCanvasTargets.indices.dropFirst()), id: \.self) { index in
-                    if let previousWorldPosition = worldPosition(for: selectedCanvasTargets[index - 1]),
-                       let currentWorldPosition = worldPosition(for: selectedCanvasTargets[index]) {
-                        AnimatableLine(
-                            start: camera.worldToScreen(previousWorldPosition, in: size),
-                            end: camera.worldToScreen(currentWorldPosition, in: size)
-                        )
+                    if let previousPosition = screenPosition(selectedCanvasTargets[index - 1]),
+                       let currentPosition = screenPosition(selectedCanvasTargets[index]) {
+                        AnimatableLine(start: previousPosition, end: currentPosition)
                         .stroke(
                             AquinasTheme.Colors.lightGreen.opacity(0.8),
                             style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
@@ -1114,8 +1330,7 @@ struct InsightTreeCanvasView: View {
                 if let selectionPulseStartTime,
                    selectedCanvasTargets.count > 1,
                    let previousTarget = selectedCanvasTargets.dropLast().last,
-                   let previousWorldPosition = worldPosition(for: previousTarget) {
-                    let previousPosition = camera.worldToScreen(previousWorldPosition, in: size)
+                   let previousPosition = screenPosition(previousTarget) {
                     TimelineView(.animation) { timeline in
                         let progress = min(max((timeline.date.timeIntervalSinceReferenceDate - selectionPulseStartTime) / 0.8, 0), 1)
                         if progress < 1 {
@@ -1137,12 +1352,12 @@ struct InsightTreeCanvasView: View {
                     ZStack {
                         // Pulses between each pair of selected targets
                         ForEach(Array(selectedCanvasTargets.indices.dropFirst()), id: \.self) { index in
-                            if let prevWorld = worldPosition(for: selectedCanvasTargets[index - 1]),
-                               let currWorld = worldPosition(for: selectedCanvasTargets[index]),
+                            if let previousPosition = screenPosition(selectedCanvasTargets[index - 1]),
+                               let currentPosition = screenPosition(selectedCanvasTargets[index]),
                                segEnd > segStart {
                                 pulseSegment(
-                                    start: camera.worldToScreen(prevWorld, in: size),
-                                    end: camera.worldToScreen(currWorld, in: size),
+                                    start: previousPosition,
+                                    end: currentPosition,
                                     from: segStart, to: segEnd,
                                     lineWidth: 4,
                                     color: AquinasTheme.Colors.lightGreen,
@@ -1173,45 +1388,18 @@ struct InsightTreeCanvasView: View {
         }
     }
 
-    @ViewBuilder
-    private func graphEdgePulseOverlay(
-        sourceNodeID: UUID?,
+    /// Node targets keep their existing unshifted camera position; Insight targets use the
+    /// position their chip is actually drawn at.
+    private func selectionScreenPosition(
+        for target: CanvasSelectionTarget,
+        layout: CanvasInsightLayout,
         camera: InsightTreeCamera,
-        size: CGSize,
-        progress: Double
-    ) -> some View {
-        if let sourceNodeID {
-            ForEach(displayGraphEdges()) { edge in
-                if edge.fromNodeID == sourceNodeID || edge.toNodeID == sourceNodeID,
-                   let sourcePos = simPosition(of: sourceNodeID) {
-                    let targetNodeID = edge.fromNodeID == sourceNodeID ? edge.toNodeID : edge.fromNodeID
-
-                    if let targetPos = simPosition(of: targetNodeID) {
-                        let start = depthScreenPosition(sourcePos, nodeID: sourceNodeID, camera: camera, size: size)
-                        let end = depthScreenPosition(targetPos, nodeID: targetNodeID, camera: camera, size: size)
-
-                        travelingPulseLine(start: start, end: end, progress: progress, lineWidth: 2.2)
-                            .frame(width: size.width, height: size.height)
-                            .allowsHitTesting(false)
-                    }
-                }
-            }
+        size: CGSize
+    ) -> CGPoint? {
+        if case .insight(let insightID) = target, let placement = layout.placements[insightID] {
+            return insightScreenPosition(placement, camera: camera, size: size)
         }
-    }
-
-    @ViewBuilder
-    private func connectorPulseLine(
-        nodePosition: CGPoint,
-        insightPosition: CGPoint,
-        isSelectedInsight: Bool,
-        isSelectedNodeConcept: Bool,
-        progress: Double
-    ) -> some View {
-        if isSelectedInsight {
-            travelingPulseLine(start: insightPosition, end: nodePosition, progress: progress, lineWidth: 2.2)
-        } else if isSelectedNodeConcept {
-            travelingPulseLine(start: insightPosition, end: nodePosition, progress: progress, lineWidth: 1.8)
-        }
+        return worldPosition(for: target).map { camera.worldToScreen($0, in: size) }
     }
 
     @ViewBuilder
@@ -1707,7 +1895,7 @@ struct InsightTreeCanvasView: View {
     }
 
     @ViewBuilder
-    private func midpointOverlay(camera: InsightTreeCamera, size: CGSize, labelOpacity: Double) -> some View {
+    private func midpointOverlay(layout: CanvasInsightLayout, camera: InsightTreeCamera, size: CGSize, labelOpacity: Double) -> some View {
         let positions = selectedWorldPositions()
         let boundaryPositions = positions.count >= 3 ? convexHull(of: positions) : positions
         let screenPts = boundaryPositions.map { camera.worldToScreen($0, in: size) }
@@ -1732,7 +1920,7 @@ struct InsightTreeCanvasView: View {
 
             // Re-draw the selected items at full opacity so they "pop" above the dimmed canvas.
             ForEach(Array(selectedCanvasTargets.enumerated()), id: \.offset) { _, target in
-                midpointSelectedItem(target, camera: camera, size: size, labelOpacity: labelOpacity)
+                midpointSelectedItem(target, layout: layout, camera: camera, size: size, labelOpacity: labelOpacity)
             }
             .allowsHitTesting(false)
 
@@ -1751,6 +1939,7 @@ struct InsightTreeCanvasView: View {
     @ViewBuilder
     private func midpointSelectedItem(
         _ target: CanvasSelectionTarget,
+        layout: CanvasInsightLayout,
         camera: InsightTreeCamera,
         size: CGSize,
         labelOpacity: Double
@@ -1763,19 +1952,9 @@ struct InsightTreeCanvasView: View {
                 nodeGroup(node, camera: camera, size: size, labelOpacity: 1)
             }
         case .insight(let id):
-            if let node = displayNodes.first(where: { $0.insights.contains { $0.id == id } }) {
-                let visible = canvasInsights(for: node)
-                if let index = visible.firstIndex(where: { $0.id == id }) {
-                    insightLabel(
-                        visible[index],
-                        node: node,
-                        index: index,
-                        count: visible.count,
-                        camera: camera,
-                        size: size,
-                        labelOpacity: 1
-                    )
-                }
+            if let placement = layout.placements[id],
+               let node = layout.nodes.first(where: { $0.id == placement.nodeID }) {
+                insightLabel(placement, node: node, camera: camera, size: size, labelOpacity: 1)
             }
         }
     }
@@ -1787,8 +1966,8 @@ struct InsightTreeCanvasView: View {
                let from = simPosition(of: edge.fromNodeID),
                let to = simPosition(of: edge.toNodeID) {
                 // Midpoint of the depth-parallaxed endpoints, so the button tracks the line.
-                let fromScreen = depthScreenPosition(from, nodeID: edge.fromNodeID, camera: camera, size: size)
-                let toScreen = depthScreenPosition(to, nodeID: edge.toNodeID, camera: camera, size: size)
+                let fromScreen = camera.worldToScreen(from, in: size)
+                let toScreen = camera.worldToScreen(to, in: size)
                 let position = CGPoint(
                     x: (fromScreen.x + toScreen.x) / 2,
                     y: (fromScreen.y + toScreen.y) / 2
@@ -1834,7 +2013,8 @@ struct InsightTreeCanvasView: View {
         size: CGSize,
         labelOpacity: Double
     ) -> some View {
-        let position = depthScreenPosition(node.position, nodeID: node.id, camera: camera, size: size)
+        let projection = camera.project(node.position, in: size)
+        let position = projection.position
 
         ZStack(alignment: .topTrailing) {
             VStack(spacing: 18) {
@@ -1907,7 +2087,7 @@ struct InsightTreeCanvasView: View {
         .animation(.spring(response: 0.6, dampingFraction: 0.75).delay(0.1), value: hasAppeared)
         .transition(.glideFadeUp)
         // 2.5D depth: farther nodes render smaller, dimmer, and behind nearer ones.
-        .scaleEffect(depthScale(node.id))
+        .scaleEffect(depthScale(node.id) * projection.scale)
         // While rotate-dragging a chip, every Node recedes so the dragged chip alone stands out.
         // No `.animation(_, value:)` here — see the matching note in `insightLabel`; a placed
         // Midpoint's `.position()` below needs to ride whatever ambient animation is active
@@ -1934,17 +2114,18 @@ struct InsightTreeCanvasView: View {
     }
 
     private func insightLabel(
-        _ insight: InsightModel,
+        _ placement: InsightPlacement,
         node: NodeModel,
-        index: Int,
-        count: Int,
         camera: InsightTreeCamera,
         size: CGSize,
         labelOpacity: Double
     ) -> some View {
+        let insight = placement.insight
+        let index = placement.index
+        let count = placement.count
         // Placed-midpoint insights are pinned at the node position itself (no orbit).
-        let isPinnedAtNode = placedMidpointNodeIDs.contains(node.id)
-        let worldPosition = isPinnedAtNode ? node.position : insightWorldPosition(for: node, index: index, count: count)
+        let isPinnedAtNode = placement.isPinnedAtNode
+        let worldPosition = placement.world
         let isRevealed    = revealedInsightIDs.contains(insight.id)
         let isLoading     = loadingInsightIDs.contains(insight.id)
         let isSelected    = selectedCanvasTargets.contains(.insight(insight.id))
@@ -1953,14 +2134,10 @@ struct InsightTreeCanvasView: View {
         let isVisible     = isRevealed || isLoading || isPinnedAtNode
         // While unsplayed, render at the node center so the child appears to splay out from it.
         let atCenter      = unsplayedInsightIDs.contains(insight.id)
-        let renderWorld   = atCenter ? node.position : worldPosition
-        let position      = insightScreenPosition(
-            renderWorld,
-            insightID: insight.id,
-            nodeID: node.id,
-            camera: camera,
-            size: size
-        )
+        let projection    = atCenter
+            ? camera.project(node.position, in: size)
+            : insightProjection(placement, camera: camera, size: size)
+        let position      = projection.position
         // Stable per-chip delay (0.05–0.25s) so the title collapse/expand staggers across chips.
 
         return ZStack(alignment: .leading) {
@@ -2015,7 +2192,7 @@ struct InsightTreeCanvasView: View {
                     startTime: Date().timeIntervalSinceReferenceDate
                 )
             }
-            focusHoveredTarget(at: worldPosition, in: size)
+            focusHoveredTarget(at: worldPosition, elevation: placement.elevation, in: size)
             onInsightTapped(insight)
         }
         .simultaneousGesture(
@@ -2035,7 +2212,8 @@ struct InsightTreeCanvasView: View {
         .blur(radius: isVisible ? 0 : 8)
         .animation(.spring(response: 0.6, dampingFraction: 0.75), value: isVisible)
         .transition(.scale(scale: 0.88, anchor: .center).combined(with: .opacity))
-        // 2.5D depth: chips inherit their node's depth so the whole cluster recedes together.
+        // 2.5D depth: each chip combines its Node Concept's semantic depth with its own
+        // bounded local elevation, so a cluster reads as a shallow spatial volume.
         // While rotate-dragging, the dragged chip grows 5% and stays full opacity; every other
         // chip dims along with the Nodes (see `chipDragDimFactor`).
         // No `.animation(_, value:)` here: that resets the animation context for every modifier
@@ -2045,10 +2223,19 @@ struct InsightTreeCanvasView: View {
         // is active — so the line eased back on release while the chip itself snapped instantly.
         // Wrapping the state mutations in `chipRotateDragGesture` in `withAnimation` covers scale,
         // opacity, AND position uniformly, the same way it already covers the connector line.
-        .scaleEffect(depthScale(node.id) * (draggingChipID == insight.id ? 1.05 : 1.0))
-        .opacity(depthOpacity(node.id) * (draggingChipID == insight.id ? 1.0 : chipDragDimFactor))
+        // Node Concept depth times true perspective magnification at the chip's elevation.
+        .scaleEffect(depthScale(node.id) * chipScale(nodeID: node.id, magnification: projection.scale) * (draggingChipID == insight.id ? 1.05 : 1.0))
+        .opacity(insightDepthOpacity(placement) * (draggingChipID == insight.id ? 1.0 : chipDragDimFactor))
+        .opacity(studyOpacity(forNodeID: node.id) * (1 - 0.4 * studyProgress * studyDepthDim(placement, camera: camera)))
+        // A hovered Insight in Study always draws in front; it never dims (see `studyDepthDim`).
         .position(position)
-        .zIndex(30 + Double(depthFactor(node.id)) * 5 + (draggingChipID == insight.id ? 100 : 0))
+        // Nearer the camera draws on top, whether nearer by elevation or by plane position.
+        // In Study, Insights behind the Node Concept draw behind it.
+        .zIndex(
+            studyDepthDim(placement, camera: camera) > 0.5 && insight.id != studyPivotID
+                ? 5 + Double(projection.scale)
+                : 30 + Double(projection.scale) * 5 + (draggingChipID == insight.id ? 100 : 0)
+        )
     }
 
     private func insightFocusTarget(for insightID: UUID) -> CGPoint? {
@@ -2182,15 +2369,18 @@ struct InsightTreeCanvasView: View {
     /// Matches the rendered Insight chip's fixed horizontal layout closely enough for the
     /// cleanup simulation to keep even long titles from overlapping chips in another node.
     private func insightCollisionSize(for insight: InsightModel) -> CGSize {
+        if let cached = collisionSizeCache.sizes[insight.title] { return cached }
         let titleWidth = ceil(
             (insight.title as NSString).size(
                 withAttributes: [.font: Self.insightCollisionFont]
             ).width
         )
-        return CGSize(
+        let size = CGSize(
             width: 20 + 14 + 10 + titleWidth + 20,
             height: 16 + Self.insightCollisionFont.lineHeight + 16
         )
+        collisionSizeCache.sizes[insight.title] = size
+        return size
     }
 
     /// Wraps an angle difference to [-π, π].
@@ -2204,19 +2394,588 @@ struct InsightTreeCanvasView: View {
     private func insightWorldPosition(for node: NodeModel, index: Int, count: Int) -> CGPoint {
         let visibleInsights = canvasInsights(for: node)
         guard index < visibleInsights.count else { return node.position }
-        let insightID = visibleInsights[index].id
-        // While this exact chip is being press-dragged, it follows the finger anywhere — the
-        // connector line stretches to match — rather than the fixed (angle, bond length) orbit.
-        if draggingChipID == insightID, let live = draggingChipWorldPosition {
-            return live
+        return insightSpatialPosition(visibleInsights[index], node: node, index: index, count: count).world
+    }
+
+    /// The single source of an orbiting Insight's projected world position and local depth.
+    /// While this exact chip is being press-dragged, it follows the finger anywhere — the
+    /// connector line stretches to match — rather than the fixed (angle, bond length) orbit.
+    private func insightSpatialPosition(
+        _ insight: InsightModel,
+        node: NodeModel,
+        index: Int,
+        count: Int
+    ) -> (world: CGPoint, elevation: CGFloat, localDepth: CGFloat) {
+        let radius = bondLength(forInsightID: insight.id)
+        let elevationAngle = Self.depthCuesEnabled ? insightElevationAngle(insight.id) : 0
+        let localDepth = InsightClusterSpatialLayout.normalizedDepth(angle: elevationAngle)
+        if draggingChipID == insight.id, let live = draggingChipWorldPosition {
+            // Same angle at the live distance: a chip dragged inward sinks toward the plane
+            // rather than climbing past 45° over its Node Concept.
+            let liveZ = InsightClusterSpatialLayout.elevation(
+                angle: elevationAngle,
+                horizontalDistance: hypot(live.x - node.position.x, live.y - node.position.y)
+            )
+            return (live, liveZ, localDepth)
         }
+        let z = InsightClusterSpatialLayout.elevation(angle: elevationAngle, horizontalDistance: radius)
         // Free VSEPR bond angle (falls back to the even base angle until the sim seeds it).
-        let angle = chipAngles[insightID]?.angle ?? baseChipAngle(index: index, count: count)
-        let radius = bondLength(forInsightID: insightID)
-        return CGPoint(
+        let angle = chipAngles[insight.id]?.angle ?? baseChipAngle(index: index, count: count)
+        let world = CGPoint(
             x: node.position.x + cos(angle) * radius,
             y: node.position.y + sin(angle) * radius
         )
+        return (world, z, localDepth)
+    }
+
+    private func insightElevationAngle(_ id: UUID) -> CGFloat {
+        chipElevationAngles[id] ?? 0
+    }
+
+    /// Orbit height of an Insight: its elevation angle at its bond length.
+    private func insightElevation(_ insight: InsightModel) -> CGFloat {
+        InsightClusterSpatialLayout.elevation(
+            angle: insightElevationAngle(insight.id),
+            horizontalDistance: bondLength(forInsightID: insight.id)
+        )
+    }
+
+    /// The plane point under the finger for a dragged chip. Its height depends on its distance
+    /// from the Node Concept, which depends on the point, so refine from the orbit height.
+    private func draggedChipFootprint(
+        under location: CGPoint,
+        insight: InsightModel,
+        node: NodeModel,
+        camera: InsightTreeCamera,
+        size: CGSize
+    ) -> CGPoint {
+        let angle = Self.depthCuesEnabled ? insightElevationAngle(insight.id) : 0
+        var world = camera.screenToWorld(location, elevation: insightElevation(insight), in: size)
+        for _ in 0..<3 {
+            let z = InsightClusterSpatialLayout.elevation(
+                angle: angle,
+                horizontalDistance: hypot(world.x - node.position.x, world.y - node.position.y)
+            )
+            world = camera.screenToWorld(location, elevation: z, in: size)
+        }
+        return world
+    }
+
+    /// Resolves every visible Insight once per render. Chips, connectors, pulses, midpoint
+    /// connectors, and selection lines all read these placements, so they cannot disagree about
+    /// where a chip is, and no render path rescans nodes or re-filters members per chip.
+    private func makeInsightLayout() -> CanvasInsightLayout {
+        var layout = CanvasInsightLayout(nodes: displayNodes)
+        for node in layout.nodes {
+            let visibleInsights = canvasInsights(for: node)
+            layout.insightsByNode[node.id] = visibleInsights
+            let isPinnedAtNode = placedMidpointNodeIDs.contains(node.id)
+            for (index, insight) in visibleInsights.enumerated() {
+                var spatial: (world: CGPoint, elevation: CGFloat, localDepth: CGFloat) = isPinnedAtNode
+                    ? (node.position, 0, 0)
+                    : insightSpatialPosition(insight, node: node, index: index, count: visibleInsights.count)
+                if !isPinnedAtNode, let offset = studyOffset(forInsightID: insight.id, nodeID: node.id) {
+                    spatial = (
+                        CGPoint(x: node.position.x + CGFloat(offset.x), y: node.position.y + CGFloat(offset.y)),
+                        CGFloat(offset.z),
+                        spatial.localDepth * CGFloat(1 - studyProgress)
+                    )
+                }
+                layout.placements[insight.id] = InsightPlacement(
+                    insight: insight,
+                    nodeID: node.id,
+                    index: index,
+                    count: visibleInsights.count,
+                    isPinnedAtNode: isPinnedAtNode,
+                    world: spatial.world,
+                    elevation: spatial.elevation,
+                    localDepth: spatial.localDepth
+                )
+            }
+        }
+        return layout
+    }
+
+    // MARK: - Node Concept Study
+
+    /// The ring's bottom edge sits this far above the canvas's bottom, which is the top of the
+    /// docked Study tool card.
+    private static let studyRingBottomMargin: CGFloat = 24
+
+    private func makeStudyFraming(in size: CGSize) -> StudyFraming? {
+        guard let nodeID = studyFocusNodeID, let slot = studySlot,
+              let position = bodies[nodeID]?.pos ?? nodes.first(where: { $0.id == nodeID })?.position
+        else { return nil }
+        return StudyFraming(
+            nodeCenter: SIMD3(Double(position.x), Double(position.y), 0),
+            radius: studyRadius,
+            slot: slot,
+            // The ring is 42 pt tall, so its center is 21 pt above its bottom edge.
+            ringCenterY: size.height - Self.studyRingBottomMargin - 21
+        )
+    }
+
+    /// The Study camera starts from the tree's live camera, not a snapshot: the canvas can
+    /// resize while docked cards swap, and at progress 0 the two must match exactly so handing
+    /// back to the tree never jumps.
+    private func studyCamera(_ tree: InsightTreeCamera, framing: StudyFraming?, in size: CGSize) -> InsightTreeCamera {
+        guard let framing else { return tree }
+        var camera = tree
+        camera.orbit = framing.camera(
+            from: tree.currentOrbitCamera(in: size),
+            progress: studyProgress,
+            yaw: studyYaw,
+            pan: studyPan,
+            zoom: studyZoom,
+            pivot: studyPivotPoint(framing: framing),
+            pivotBlend: studyPivotBlend,
+            targetShift: studyTargetShift
+        )
+        camera.studyNodeCenter = framing.nodeCenter
+        return camera
+    }
+
+    /// Everything but the studied Node Concept and its Insights fades as the camera moves in.
+    private func studyOpacity(forNodeID nodeID: UUID) -> Double {
+        guard let focus = studyFocusNodeID, nodeID != focus else { return 1 }
+        return 1 - studyProgress
+    }
+
+    /// Chip scale: the tree's, blending in Study to the same size with gentle depth scaling.
+    private func chipScale(nodeID: UUID, magnification: CGFloat) -> CGFloat {
+        // In the tree, perspective moves chips but doesn't resize them.
+        let tree: CGFloat = 1
+        guard nodeID == studyFocusNodeID else { return tree }
+        let study = pow(max(magnification, 0.01), 0.6)
+        return tree + (study - tree) * CGFloat(studyProgress)
+    }
+
+    /// How far a studied Insight has swung behind its Node Concept: 0 in front, 1 behind, easing
+    /// smoothly (smoothstep) across the node's depth so dimming never snaps while rotating.
+    private func studyDepthDim(_ placement: InsightPlacement, camera: InsightTreeCamera) -> Double {
+        guard placement.nodeID == studyFocusNodeID, placement.insight.id != studyPivotID,
+              let orbit = camera.orbit, let center = camera.studyNodeCenter,
+              let chip = orbit.project(SIMD3(Double(placement.world.x), Double(placement.world.y), Double(placement.elevation))),
+              let node = orbit.project(center)
+        else { return 0 }
+        let band = 0.7 * studyRadius
+        let t = min(max((chip.depth - node.depth + band / 2) / band, 0), 1)
+        return t * t * (3 - 2 * t)
+    }
+
+    /// A studied Insight's offset from its Node Concept, moving from its tree position to its
+    /// place on the Study sphere.
+    private func studyOffset(forInsightID insightID: UUID, nodeID: UUID) -> SIMD3<Double>? {
+        guard nodeID == studyFocusNodeID, studyProgress > 0,
+              let start = studyTreeOffsets[insightID], let spread = studySpread[insightID]
+        else { return nil }
+        let length = simd_length(start)
+        let from = length > 1e-9 ? start / length : spread
+        let direction = StudyNodeLayout.slerp(from, spread, studyProgress)
+        return direction * (length + (studyRadius - length) * studyProgress)
+    }
+
+    private func beginStudy(of nodeID: UUID) {
+        let layout = makeInsightLayout()
+        guard let node = layout.nodes.first(where: { $0.id == nodeID }) else { return }
+        let center = SIMD3(Double(node.position.x), Double(node.position.y), 0)
+        var ids: [UUID] = []
+        var offsets: [SIMD3<Double>] = []
+        for insight in layout.insightsByNode[nodeID] ?? [] {
+            guard let placement = layout.placements[insight.id], !placement.isPinnedAtNode else { continue }
+            ids.append(insight.id)
+            offsets.append(SIMD3(
+                Double(placement.world.x), Double(placement.world.y), Double(placement.elevation)
+            ) - center)
+        }
+        studyTreeOffsets = Dictionary(uniqueKeysWithValues: zip(ids, offsets))
+        studySpread = Dictionary(uniqueKeysWithValues: zip(ids, StudyNodeLayout.sphereSpread(from: offsets)))
+        let lengths = offsets.map(simd_length).filter { $0 > 1 }
+        studyRadius = lengths.isEmpty ? 190 : lengths.reduce(0, +) / Double(lengths.count)
+        studyYaw = 0
+        studyPan = .zero
+        studyZoom = StudyFraming.entryZoom
+        studyLastDetentYaw = 0
+        studyPivotLink?.stop()
+        studyPivotSwitchLink?.stop()
+        studyPivotID = nil
+        studyPivotFrom = nil
+        studyPivotBlend = 0
+        studyTargetShift = .zero
+        studyFocusNodeID = nodeID
+        // Opened from an Insight's Study: fly straight to that Insight, hovered. It is already
+        // the hover, so only the Study camera needs it.
+        if let insightID = studyInitialHoverInsightID, studyTreeOffsets[insightID] != nil {
+            studyPivotID = insightID
+            studyPivotBlend = 1
+            studyZoom = max(studyZoom, StudyFraming.hoverZoom)
+        }
+        animateStudyProgress(to: 1, duration: 0.8)
+    }
+
+    private func endStudy() {
+        guard studyFocusNodeID != nil else { return }
+        studyDragMode = nil
+        studyRingActive = 0
+        studySpinLink?.stop()
+        studySpinLink = nil
+        // Whole turns look identical, so drop them before flying back: the exit unwinds at most
+        // half a turn, the short way, rather than every turn the user made.
+        let wrappedYaw = remainder(studyYaw, 2 * .pi)
+        studyLastDetentYaw += wrappedYaw - studyYaw
+        studyYaw = wrappedYaw
+        // Leaving Study keeps a hovered Insight hovered; only the Study camera lets go of it.
+        if studyPivotID != nil { releaseStudyPivot(in: lastCanvasSize) }
+        animateStudyProgress(to: 0, duration: 0.6) {
+            studyFocusNodeID = nil
+            studyTreeOffsets = [:]
+            studySpread = [:]
+        }
+    }
+
+    /// Drives the camera move frame by frame (ease in-out), since every position on the canvas
+    /// is computed from `studyProgress` rather than interpolated by SwiftUI.
+    private func animateStudyProgress(to target: Double, duration: Double, completion: (() -> Void)? = nil) {
+        studyLink?.stop()
+        let from = studyProgress
+        let start = CACurrentMediaTime()
+        let driver = DisplayLinkDriver()
+        driver.onTick = { now in
+            let t = min(max((now - start) / duration, 0), 1)
+            let eased = t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2
+            studyProgress = from + (target - from) * eased
+            if t >= 1 {
+                studyLink?.stop()
+                studyLink = nil
+                completion?()
+            }
+        }
+        driver.start()
+        studyLink = driver
+    }
+
+    /// In Study a drag on the ring spins the node like a turntable; any other drag moves it. It
+    /// starts on touch-down so the ring responds the moment a finger lands on it.
+    private func studyDragGesture(
+        ring: [CGPoint],
+        chips: [(id: UUID, frame: CGRect)],
+        nodeFrame: CGRect?,
+        size: CGSize
+    ) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                if studyDragMode == nil {
+                    // Any touch catches a coasting ring.
+                    studySpinLink?.stop()
+                    studySpinLink = nil
+                    let onRing = StudyFraming.distance(from: value.startLocation, toPolyline: ring) < 28
+                    studyDragMode = onRing ? .rotate : .pending
+                    studyLastDragLocation = value.startLocation
+                    if studyDragMode == .rotate {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.6)
+                        withAnimation(.easeInOut(duration: 0.25)) { studyRingActive = 1 }
+                    }
+                }
+                if studyDragMode == .pending {
+                    // Still possibly a tap; becomes a pan once it moves.
+                    guard hypot(value.translation.width, value.translation.height) > Self.studyTapSlop else { return }
+                    studyDragMode = .pan
+                    // Like panning away in the tree, dragging off a hovered Insight unhovers it.
+                    if studyPivotID != nil { unhoverStudyInsight(in: size) }
+                }
+                let previous = studyLastDragLocation ?? value.startLocation
+                let delta = CGSize(width: value.location.x - previous.x, height: value.location.y - previous.y)
+                studyLastDragLocation = value.location
+                switch studyDragMode {
+                case .rotate:
+                    // Dragging right carries the front of the ring to the right.
+                    let xs = ring.map(\.x)
+                    let halfWidth = max(((xs.max() ?? 0) - (xs.min() ?? 0)) / 2, 40)
+                    studyRingHalfWidth = halfWidth
+                    spinStudy(by: -Double(delta.width / halfWidth))
+                case .pan:
+                    studyPan.width += delta.width
+                    studyPan.height += delta.height
+                case .pending, nil:
+                    break
+                }
+            }
+            .onEnded { value in
+                if studyDragMode == .pending {
+                    if let hit = chips.first(where: { $0.frame.contains(value.location) }) {
+                        hoverStudyInsight(hit.id, in: size)
+                    } else if let nodeFrame, nodeFrame.contains(value.location) {
+                        hoverStudyNode(in: size)
+                    }
+                } else if studyDragMode == .rotate {
+                    coastStudySpin(velocity: -Double(value.velocity.width / studyRingHalfWidth))
+                }
+                studyDragMode = nil
+                studyLastDragLocation = nil
+                withAnimation(.easeInOut(duration: 0.3)) { studyRingActive = 0 }
+            }
+    }
+
+    private var studyPinchGesture: some Gesture {
+        MagnifyGesture()
+            .onChanged { value in
+                let start = studyPinchStartZoom ?? studyZoom
+                studyPinchStartZoom = start
+                studyZoom = min(max(start * value.magnification, 0.5), 5)
+            }
+            .onEnded { _ in studyPinchStartZoom = nil }
+    }
+
+    /// Where the camera centers for the focused Insight, gliding from the previous one.
+    private func studyPivotPoint(framing: StudyFraming) -> SIMD3<Double>? {
+        guard let id = studyPivotID, let target = studyInsightPosition(id, framing: framing) else { return nil }
+        guard let from = studyPivotFrom else { return target }
+        return from + (target - from) * studyPivotSwitch
+    }
+
+    /// A studied Insight's position on its Study sphere.
+    private func studyInsightPosition(_ insightID: UUID, framing: StudyFraming) -> SIMD3<Double>? {
+        guard let focus = studyFocusNodeID,
+              let offset = studyOffset(forInsightID: insightID, nodeID: focus) else { return nil }
+        return framing.nodeCenter + offset
+    }
+
+    /// Where each studied Insight's chip is on screen, padded for an easy tap.
+    private func studyTapTargets(
+        layout: CanvasInsightLayout,
+        camera: InsightTreeCamera,
+        size: CGSize
+    ) -> [(id: UUID, frame: CGRect)] {
+        guard let focus = studyFocusNodeID else { return [] }
+        return (layout.insightsByNode[focus] ?? []).compactMap { insight in
+            guard let placement = layout.placements[insight.id], !placement.isPinnedAtNode else { return nil }
+            let projection = insightProjection(placement, camera: camera, size: size)
+            let chip = insightCollisionSize(for: insight)
+            let scale = chipScale(nodeID: focus, magnification: projection.scale)
+            let frame = CGRect(
+                x: projection.position.x - chip.width * scale / 2,
+                y: projection.position.y - chip.height * scale / 2,
+                width: chip.width * scale,
+                height: chip.height * scale
+            )
+            return (insight.id, frame.insetBy(dx: -8, dy: -8))
+        }
+        // Nearer chips first, so the one drawn on top wins an overlapping tap.
+        .sorted { first, second in
+            (studyDepth(of: first.id, camera: camera) ?? 0) < (studyDepth(of: second.id, camera: camera) ?? 0)
+        }
+    }
+
+    private func studyDepth(of insightID: UUID, camera: InsightTreeCamera) -> Double? {
+        guard let orbit = camera.orbit, let center = camera.studyNodeCenter,
+              let focus = studyFocusNodeID,
+              let offset = studyOffset(forInsightID: insightID, nodeID: focus) else { return nil }
+        return orbit.project(center + offset)?.depth
+    }
+
+    /// Hovering an Insight in Study is the tree's hover (same haptic, card state, and pulses via
+    /// `onInsightTapped`), and the Study camera centers it, zooms in, and turns around it. The
+    /// tree's own camera focuses it too, unseen, so leaving Study lands on it still hovered.
+    private func hoverStudyInsight(_ insightID: UUID, in size: CGSize) {
+        guard let focus = studyFocusNodeID,
+              let node = nodes.first(where: { $0.id == focus }),
+              let insight = node.insights.first(where: { $0.id == insightID }) else { return }
+        markDiscovered(insightID)
+        if let treeOffset = studyTreeOffsets[insightID] {
+            let bodyPosition = bodies[focus]?.pos ?? node.position
+            focusHoveredTarget(
+                at: CGPoint(x: bodyPosition.x + CGFloat(treeOffset.x), y: bodyPosition.y + CGFloat(treeOffset.y)),
+                elevation: CGFloat(treeOffset.z),
+                in: size
+            )
+        }
+        onInsightTapped(insight)
+        focusStudyInsight(insightID)
+    }
+
+    /// The studied node's label on screen, padded for an easy tap.
+    private func studyNodeTapTarget(camera: InsightTreeCamera, size: CGSize) -> CGRect? {
+        guard let focus = studyFocusNodeID,
+              let node = displayNodes.first(where: { $0.id == focus }) else { return nil }
+        let position = camera.project(node.position, in: size).position
+        let width: CGFloat = node.isSuggested ? 220 : 260
+        return CGRect(x: position.x - width / 2, y: position.y - 44, width: width, height: 88)
+    }
+
+    /// Tapping the studied node hovers it (the tree's node hover), and the camera glides back to
+    /// center the node with the axis on it (from a hovered Insight, or from a pan).
+    private func hoverStudyNode(in size: CGSize) {
+        guard let focus = studyFocusNodeID,
+              let node = displayNodes.first(where: { $0.id == focus }) else { return }
+        if studyPivotID != nil { releaseStudyPivot(in: size) }
+        recenterStudyNode()
+        focusHoveredTarget(at: node.position, in: size)
+        onNodeTapped(node)
+    }
+
+    /// Eases any pan and look-at shift back to zero, centering the node, and zooms in like a
+    /// hover in the tree (to at least `StudyFraming.hoverZoom`).
+    private func recenterStudyNode() {
+        let fromPan = studyPan
+        let fromShift = studyTargetShift
+        let fromZoom = studyZoom
+        let toZoom = max(studyZoom, StudyFraming.hoverZoom)
+        studyPivotLink?.stop()
+        let start = CACurrentMediaTime()
+        let driver = DisplayLinkDriver()
+        driver.onTick = { now in
+            let (eased, done) = Self.studyHoverCurve(elapsed: now - start)
+            studyPan = CGSize(width: fromPan.width * (1 - eased), height: fromPan.height * (1 - eased))
+            studyTargetShift = fromShift * (1 - eased)
+            studyZoom = fromZoom + (toZoom - fromZoom) * CGFloat(eased)
+            if done {
+                studyPivotLink?.stop()
+                studyPivotLink = nil
+            }
+        }
+        driver.start()
+        studyPivotLink = driver
+    }
+
+    /// Turns the node, with a detent haptic every 15°.
+    private func spinStudy(by delta: Double) {
+        studyYaw += delta
+        if abs(studyYaw - studyLastDetentYaw) >= .pi / 12 {
+            studyLastDetentYaw = studyYaw
+            UISelectionFeedbackGenerator().selectionChanged()
+        }
+    }
+
+    /// After a ring swipe the node keeps turning at the release velocity (radians per second)
+    /// and eases to a stop.
+    private func coastStudySpin(velocity: Double) {
+        studySpinLink?.stop()
+        guard abs(velocity) > 0.3 else { return }
+        var speed = min(max(velocity, -12), 12)
+        var last = CACurrentMediaTime()
+        let driver = DisplayLinkDriver()
+        driver.onTick = { now in
+            let dt = min(now - last, 1.0 / 30)
+            last = now
+            spinStudy(by: speed * dt)
+            speed *= exp(-3.2 * dt)
+            if abs(speed) < 0.05 {
+                studySpinLink?.stop()
+                studySpinLink = nil
+            }
+        }
+        driver.start()
+        studySpinLink = driver
+    }
+
+    /// Unhovering returns the hover to the studied node (as tapping it would) and the axis of
+    /// rotation to the node's center, without moving the view.
+    private func unhoverStudyInsight(in size: CGSize) {
+        releaseStudyPivot(in: size)
+        guard let focus = studyFocusNodeID,
+              let node = displayNodes.first(where: { $0.id == focus }) else { return }
+        focusHoveredTarget(at: node.position, in: size)
+        onNodeTapped(node)
+    }
+
+    private func focusStudyInsight(_ insightID: UUID) {
+        guard insightID != studyPivotID || studyPivotBlend < 1 else { return }
+        let settledPan = studyPan
+        if studyPivotID != nil, studyPivotID != insightID, studyPivotBlend > 0,
+           // Only the node's position matters here, not the canvas size.
+           let framing = makeStudyFraming(in: .zero),
+           let from = studyPivotPoint(framing: framing) {
+            // Moving between focused Insights: glide from one to the other.
+            studyPivotFrom = from
+            studyPivotID = insightID
+            animateStudyPivotSwitch()
+            return animateStudyPivot(to: 1)
+        }
+        studyPivotID = insightID
+        animateStudyPivot(to: 1) {
+            // Fully centered: the pan and any shift have eased out, so drop them for good.
+            if studyPan == settledPan {
+                studyPan = .zero
+                studyTargetShift = .zero
+            }
+        }
+    }
+
+    /// The tree's hover spring as a 0 → 1 curve (it overshoots slightly), and whether it has
+    /// settled.
+    private static func studyHoverCurve(elapsed: TimeInterval) -> (value: Double, done: Bool) {
+        let spring = StudyFraming.hoverSpring
+        guard elapsed < spring.settlingDuration else { return (1, true) }
+        return (spring.value(target: 1.0, time: elapsed), false)
+    }
+
+    /// Returns the axis of rotation to the node's center without moving anything on screen: the
+    /// rotation center moves to the node while the look-at point, zoom, and pan are re-expressed
+    /// so every point projects exactly where it did.
+    private func releaseStudyPivot(in size: CGSize) {
+        studyPivotLink?.stop()
+        studyPivotSwitchLink?.stop()
+        defer {
+            studyPivotID = nil
+            studyPivotFrom = nil
+            studyPivotBlend = 0
+        }
+        guard let framing = makeStudyFraming(in: size),
+              let current = studyCamera(
+                  InsightTreeCamera(scale: activeScale, offset: activeOffset),
+                  framing: framing,
+                  in: size
+              ).orbit,
+              studyProgress > 0.99
+        else { return }
+        let blend = studyPivotBlend
+        let newTarget = current.target(
+            keepingViewWhenCenterMovesFrom: current.rotationCenter ?? current.target,
+            to: framing.nodeCenter
+        )
+        studyTargetShift = newTarget - framing.nodeCenter
+        // Fold the focus's zoom and eased-out pan into the plain Study values.
+        studyZoom *= 1 + (StudyFraming.hoverZoomFactor(zoom: studyZoom) - 1) * CGFloat(blend)
+        studyPan = CGSize(
+            width: studyPan.width * (1 - blend),
+            height: studyPan.height * (1 - blend) + StudyFraming.pivotDrop * blend
+        )
+    }
+
+    private func animateStudyPivotSwitch() {
+        studyPivotSwitchLink?.stop()
+        studyPivotSwitch = 0
+        let start = CACurrentMediaTime()
+        let driver = DisplayLinkDriver()
+        driver.onTick = { now in
+            let (eased, done) = Self.studyHoverCurve(elapsed: now - start)
+            studyPivotSwitch = eased
+            if done {
+                studyPivotSwitchLink?.stop()
+                studyPivotSwitchLink = nil
+                studyPivotFrom = nil
+            }
+        }
+        driver.start()
+        studyPivotSwitchLink = driver
+    }
+
+    private func animateStudyPivot(to target: Double, completion: (() -> Void)? = nil) {
+        studyPivotLink?.stop()
+        let from = studyPivotBlend
+        let start = CACurrentMediaTime()
+        let driver = DisplayLinkDriver()
+        driver.onTick = { now in
+            let (eased, done) = Self.studyHoverCurve(elapsed: now - start)
+            studyPivotBlend = from + (target - from) * eased
+            if done {
+                studyPivotLink?.stop()
+                studyPivotLink = nil
+                completion?()
+            }
+        }
+        driver.start()
+        studyPivotLink = driver
     }
 
     /// The Node currently hosting `insightID` as one of its own (non-pinned) chips.
@@ -2268,32 +3027,43 @@ struct InsightTreeCanvasView: View {
         Self.depthMinOpacity + (1 - Self.depthMinOpacity) * Double(depthFactor(nodeID))
     }
 
-    /// World → screen with the node's depth parallax applied: farther nodes lag the pan
-    /// slightly, giving the map depth. Degenerates to `worldToScreen` when depth is off.
-    /// Deliberately not reflected in `screenToWorld` (taps), so the gain stays small.
-    private func depthScreenPosition(_ world: CGPoint, nodeID: UUID?, camera: InsightTreeCamera, size: CGSize) -> CGPoint {
-        var p = camera.worldToScreen(world, in: size)
-        guard Self.depthCuesEnabled, let nodeID else { return p }
-        let lag = (depthFactor(nodeID) - 1) * Self.depthParallaxGain
-        p.x += activeOffset.width * lag
-        p.y += activeOffset.height * lag
-        return p
+    /// Every chip goes through the same perspective camera as the plane beneath it, so a raised
+    /// chip sits higher and nearer than its footprint and moves faster than the plane while
+    /// panning. The hovered chip needs no special case: focus solves for its elevation.
+    private func insightProjection(
+        _ placement: InsightPlacement,
+        camera: InsightTreeCamera,
+        size: CGSize
+    ) -> PerspectivePlaneProjection.Point {
+        camera.project(placement.world, elevation: placement.elevation, in: size)
     }
 
-    /// The active hover shares its unshifted camera position with the selection reticle and
-    /// dot-grid ripple. Depth parallax remains on every other chip, but must not displace the
-    /// focal chip away from the feedback that describes its selection.
     private func insightScreenPosition(
-        _ world: CGPoint,
-        insightID: UUID,
-        nodeID: UUID,
+        _ placement: InsightPlacement,
         camera: InsightTreeCamera,
         size: CGSize
     ) -> CGPoint {
-        if focusedInsightID == insightID {
-            return camera.worldToScreen(world, in: size)
-        }
-        return depthScreenPosition(world, nodeID: nodeID, camera: camera, size: size)
+        insightProjection(placement, camera: camera, size: size).position
+    }
+
+    /// Combines the global semantic MDS depth of a Node Concept with an Insight's local
+    /// elevation for opacity. Pinned midpoint Insights stay at their Node depth.
+    private func insightDepthFactor(_ placement: InsightPlacement) -> CGFloat {
+        clamp(depthFactor(placement.nodeID) + placement.localDepth * 0.12, lower: 0, upper: 1)
+    }
+
+    private func insightDepthOpacity(_ placement: InsightPlacement) -> Double {
+        Self.depthMinOpacity + (1 - Self.depthMinOpacity) * Double(insightDepthFactor(placement))
+    }
+
+    /// World elevation of a visible Insight by id (0 for pinned midpoints and hidden members).
+    private func insightElevation(forInsightID id: UUID) -> CGFloat {
+        guard Self.depthCuesEnabled,
+              let node = nodes.first(where: { node in
+                  !placedMidpointNodeIDs.contains(node.id) && node.insights.contains { $0.id == id }
+              }),
+              let insight = canvasInsights(for: node).first(where: { $0.id == id }) else { return 0 }
+        return insightElevation(insight)
     }
 
     /// The node whose orbit an insight chip belongs to (for depth lookups by insight id).
@@ -2427,6 +3197,23 @@ struct InsightTreeCanvasView: View {
         }
         chipAngles = nextAngles
 
+        // Seed elevation angles here too, not only in the sim: opening a tree freezes the sim, so
+        // it never runs to assign them and every Insight would sit flat on the plane. Insights
+        // already placed keep their angle; the sim (when it runs) eases them to new targets.
+        var nextElevations = chipElevationAngles.filter { chipIDs.contains($0.key) }
+        for node in nodes where !placedMidpointNodeIDs.contains(node.id) {
+            let members = canvasInsights(for: node).compactMap { insight in
+                nextAngles[insight.id].map {
+                    InsightClusterSpatialLayout.Member(id: insight.id, azimuth: $0.angle)
+                }
+            }
+            for (id, target) in InsightClusterSpatialLayout.elevationTargets(members)
+            where nextElevations[id] == nil {
+                nextElevations[id] = target
+            }
+        }
+        chipElevationAngles = nextElevations
+
         if isInitialLayout {
             // Restored positions are already authoritative. Opening the Canvas should be
             // perfectly still rather than replaying a global settling pass.
@@ -2546,9 +3333,11 @@ struct InsightTreeCanvasView: View {
             bondsByNode[edge.toNodeID, default: []].append(Bond(angle: Double(atan2(aPos.y - bPos.y, aPos.x - bPos.x)), kind: .fixedEdge))
         }
 
-        // Cross-node Insight collision. A collision rotates both free bonds away from contact
-        // and gently separates their parent nodes, allowing Insights in unrelated concepts to
-        // affect one another without discarding the semantic layout.
+        // Insight collision. A collision rotates both free bonds away from contact; across nodes
+        // it also gently separates their parent nodes, allowing Insights in unrelated concepts to
+        // affect one another without discarding the semantic layout. Same-node chips only rotate:
+        // the angular spread below is planar, and opposite elevations can still bring two sibling
+        // labels together on screen.
         var crossNodeForces: [UUID: CGVector] = [:]
         var chipTorque: [UUID: Double] = [:]
         func addCrossNodeForce(_ force: CGVector, to nodeID: UUID) {
@@ -2562,7 +3351,7 @@ struct InsightTreeCanvasView: View {
             for secondIndex in chipInfos.indices where secondIndex > firstIndex {
                 let first = chipInfos[firstIndex]
                 let second = chipInfos[secondIndex]
-                guard first.nodeID != second.nodeID else { continue }
+                let isSameNode = first.nodeID == second.nodeID
 
                 let dx = first.pos.x - second.pos.x
                 let dy = first.pos.y - second.pos.y
@@ -2589,8 +3378,10 @@ struct InsightTreeCanvasView: View {
                     dx: separation.dx * Self.bubblePushK,
                     dy: separation.dy * Self.bubblePushK
                 )
-                addCrossNodeForce(force, to: first.nodeID)
-                addCrossNodeForce(CGVector(dx: -force.dx, dy: -force.dy), to: second.nodeID)
+                if !isSameNode {
+                    addCrossNodeForce(force, to: first.nodeID)
+                    addCrossNodeForce(CGVector(dx: -force.dx, dy: -force.dy), to: second.nodeID)
+                }
 
                 let normalizedDepth = Double(min(min(overlapX, overlapY) / 48, 2))
                 if first.radius > 1 {
@@ -2712,6 +3503,32 @@ struct InsightTreeCanvasView: View {
                 nextAngles[id] = ch
             }
             chipAngles = nextAngles
+        }
+
+        // Elevation spread: each cluster's Insights alternate up and down the ±45° band around
+        // their Node Concept. Angles ease toward those targets (cooled like the bond angles) so a
+        // reordering glides instead of snapping. A drag only moves a chip around its node; its
+        // height, like every sibling's, follows from the new order.
+        if Self.depthCuesEnabled {
+            var nextElevations = chipElevationAngles
+            var membersByNode: [UUID: [InsightClusterSpatialLayout.Member]] = [:]
+            for ci in chipInfos where ci.radius > 1 {
+                membersByNode[ci.nodeID, default: []].append(
+                    InsightClusterSpatialLayout.Member(id: ci.id, azimuth: ci.angle)
+                )
+            }
+            for members in membersByNode.values {
+                for (id, target) in InsightClusterSpatialLayout.elevationTargets(members) {
+                    guard let current = nextElevations[id] else {
+                        nextElevations[id] = target
+                        continue
+                    }
+                    let step = (target - current) * Self.elevationEaseRate * CGFloat(dtScale) * coolCG
+                    maxChipAngMotion = max(maxChipAngMotion, Double(abs(step)))
+                    nextElevations[id] = current + step
+                }
+            }
+            if nextElevations != chipElevationAngles { chipElevationAngles = nextElevations }
         }
 
         // Integrate (semi-implicit Euler; force scaled into velocity so spacing is effective).
@@ -2858,6 +3675,11 @@ struct InsightTreeCanvasView: View {
         // Clear these before the asynchronous camera/reveal sequence begins. This prevents a
         // connector from the previous topology from remaining visible during the camera scroll.
         revealedInsightConnectorIDs.subtract(newInsightIDs)
+        let newGraphEdgeIDs = Set(displayGraphEdges().filter {
+            newNodeIDs.contains($0.fromNodeID) || newNodeIDs.contains($0.toNodeID)
+        }.map(\.id))
+        revealedGraphEdgeIDs.subtract(newGraphEdgeIDs)
+        animatedGraphEdgeIDs.formUnion(newGraphEdgeIDs)
         confirmedPersistedInsightIDs = currentInsightIDs
         confirmedPersistedNodeIDs = currentNodeIDs
         undiscoveredInsightIDs.formUnion(loadUndiscoveredInsightIDs())
@@ -2866,6 +3688,7 @@ struct InsightTreeCanvasView: View {
         guard !newInsights.isEmpty || !newNodeIDs.isEmpty else {
             revealedInsightIDs = currentInsightIDs
             revealedInsightConnectorIDs = currentInsightIDs
+            revealedGraphEdgeIDs = Set(displayGraphEdges().map(\.id))
             revealedNodeIDs = currentNodeIDs
             saveAllInsightIDsAsSeen()
             reportUndiscoveredInsightCount()
@@ -2911,6 +3734,10 @@ struct InsightTreeCanvasView: View {
         let allNodeIDs = Set(nodes.map(\.id))
         revealedInsightIDs = allInsightIDs.subtracting(insightIDs)
         revealedInsightConnectorIDs = allInsightIDs.subtracting(insightIDs)
+        let newGraphEdgeIDs = Set(displayGraphEdges().filter {
+            newNodeIDs.contains($0.fromNodeID) || newNodeIDs.contains($0.toNodeID)
+        }.map(\.id))
+        revealedGraphEdgeIDs = Set(displayGraphEdges().map(\.id)).subtracting(newGraphEdgeIDs)
         revealedNodeIDs = allNodeIDs.subtracting(newNodeIDs)
 
         // The topology callback can arrive before the simulation has reconciled the new nodes.
@@ -2966,6 +3793,13 @@ struct InsightTreeCanvasView: View {
                     _ = withAnimation(.easeOut(duration: 0.22)) {
                         revealedNodeIDs.insert(nodeID)
                     }
+                    try? await Task.sleep(for: .milliseconds(620))
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.easeInOut(duration: 0.62)) {
+                        revealedGraphEdgeIDs.formUnion(displayGraphEdges().filter {
+                            $0.fromNodeID == nodeID || $0.toNodeID == nodeID
+                        }.map(\.id))
+                    }
                 }
                 rippleTrigger = RippleTrigger(
                     worldOrigin: position,
@@ -2985,8 +3819,16 @@ struct InsightTreeCanvasView: View {
                 revealedNodeIDs.formUnion(newNodeIDs)
                 revealedInsightIDs.formUnion(insightIDs)
             } completion: {
-                guard !Task.isCancelled else { return }
-                revealedInsightConnectorIDs.formUnion(insightIDs)
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(620))
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.easeInOut(duration: 0.62)) {
+                        revealedInsightConnectorIDs.formUnion(insightIDs)
+                        revealedGraphEdgeIDs.formUnion(displayGraphEdges().filter {
+                            newNodeIDs.contains($0.fromNodeID) || newNodeIDs.contains($0.toNodeID)
+                        }.map(\.id))
+                    }
+                }
             }
             let center = CGPoint(
                 x: positions.map(\.x).reduce(0, +) / CGFloat(positions.count),
@@ -3244,6 +4086,9 @@ struct ChipAngle {
     var angle: Double
 }
 
+/// `pending` is a touch that could still be a tap; it becomes `pan` once it moves.
+private enum StudyDragMode { case rotate, pending, pan }
+
 /// Drives a per-frame tick from a `CADisplayLink`. The callback fires as a run-loop event
 /// OUTSIDE SwiftUI body evaluation, so the sim can safely assign `@State` each frame (doing
 /// that inside a `TimelineView` closure would be "modifying state during view update").
@@ -3414,7 +4259,7 @@ private struct RevealedInsightLabel: View {
                 )
                 .frame(width: titleWidth == 0 ? nil : (showTitle ? titleWidth : 0), alignment: .leading)
                 .clipped()
-                .opacity(labelOpacity)
+                .opacity(showTitle ? labelOpacity : 0)
         }
         .onAppear { showTitle = !collapsed }
         .onChange(of: collapsed) { _, isCollapsed in
@@ -3563,24 +4408,88 @@ private struct SelectedCanvasInsightBorder: View {
     }
 }
 
+@MainActor
+private final class InsightCollisionSizeCache {
+    var sizes: [String: CGSize] = [:]
+}
+
 // MARK: - Camera Projection
 
 private struct InsightTreeCamera {
     var scale: CGFloat
     var offset: CGSize
+    /// In Study, every projection goes through this camera instead of the tree's, so the whole
+    /// canvas moves with it.
+    var orbit: OrbitCamera? = nil
+    /// The studied Node Concept, for ordering its Insights in front of or behind it.
+    var studyNodeCenter: SIMD3<Double>? = nil
 
-    func worldToScreen(_ point: CGPoint, in size: CGSize) -> CGPoint {
+    /// The camera looks straight down, so the plane (grid, edges, Node Concepts) stays flat on
+    /// screen while Insights above or below it get a faint perspective parallax.
+    /// Camera height in world units: an Insight at the full 45° on a typical 190-unit bond sits
+    /// 5% farther from screen center and pans 5% faster than the plane (190 · 1.05 / 0.05). It
+    /// scales with zoom, so the parallax depends only on elevation. The Study view is where
+    /// Insights are seen in full 3D.
+    static let focalLength: CGFloat = 3990
+
+    func projection(in size: CGSize) -> PerspectivePlaneProjection {
+        PerspectivePlaneProjection(
+            pitch: 0,
+            focalLength: Self.focalLength * scale,
+            principalPoint: CGPoint(x: size.width / 2, y: size.height / 2)
+        )
+    }
+
+    /// The top-down pan/zoom position, before perspective.
+    func flatPoint(_ point: CGPoint, in size: CGSize) -> CGPoint {
         CGPoint(
             x: size.width / 2 + point.x * scale + offset.width,
             y: size.height / 2 - point.y * scale + offset.height
         )
     }
 
-    func screenToWorld(_ point: CGPoint, in size: CGSize) -> CGPoint {
+    func world(fromFlat flat: CGPoint, in size: CGSize) -> CGPoint {
         CGPoint(
-            x: (point.x - size.width / 2 - offset.width) / scale,
-            y: -(point.y - size.height / 2 - offset.height) / scale
+            x: (flat.x - size.width / 2 - offset.width) / scale,
+            y: -(flat.y - size.height / 2 - offset.height) / scale
         )
+    }
+
+    /// Projects a world point at `elevation` world units above the graph plane.
+    func project(_ point: CGPoint, elevation: CGFloat = 0, in size: CGSize) -> PerspectivePlaneProjection.Point {
+        if let orbit {
+            guard let projected = orbit.project(SIMD3(Double(point.x), Double(point.y), Double(elevation))) else {
+                return PerspectivePlaneProjection.Point(position: CGPoint(x: -10_000, y: -10_000), scale: 0.01)
+            }
+            return PerspectivePlaneProjection.Point(position: projected.position, scale: CGFloat(projected.scale))
+        }
+        return projection(in: size).project(flat: flatPoint(point, in: size), elevation: elevation * scale)
+    }
+
+    /// The flat point that puts something at `elevation` exactly on screen center.
+    func flatPointCentering(elevation: CGFloat, in size: CGSize) -> CGPoint {
+        projection(in: size).flatPointCentering(elevation: elevation * scale)
+    }
+
+    func worldToScreen(_ point: CGPoint, in size: CGSize) -> CGPoint {
+        project(point, in: size).position
+    }
+
+    /// This camera's current framing as an `OrbitCamera` (yaw and pitch zero), exactly.
+    func currentOrbitCamera(in size: CGSize) -> OrbitCamera {
+        let center = CGPoint(x: size.width / 2, y: size.height / 2)
+        let target = world(fromFlat: center, in: size)
+        return OrbitCamera(
+            target: SIMD3(Double(target.x), Double(target.y), 0),
+            distance: Double(Self.focalLength),
+            zoom: Double(scale),
+            principalPoint: center
+        )
+    }
+
+    /// The world point under `point`, assuming it lies `elevation` world units above the plane.
+    func screenToWorld(_ point: CGPoint, elevation: CGFloat = 0, in size: CGSize) -> CGPoint {
+        world(fromFlat: projection(in: size).unproject(point, elevation: elevation * scale), in: size)
     }
 }
 

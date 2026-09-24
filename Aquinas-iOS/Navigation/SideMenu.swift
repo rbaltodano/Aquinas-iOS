@@ -30,6 +30,45 @@ struct SideMenuTriggerButton: View {
     }
 }
 
+/// Grows beside the side-menu button while Study is open and returns to the Insight Tree.
+/// Figma: source-of-truth 944:1098 (48 pt tall capsule, × icon, "Exit").
+struct StudyExitButton: View {
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(AquinasTheme.Colors.darkGreen)
+                    .frame(width: 14, height: 14)
+                Text("Exit")
+                    .font(AquinasTheme.Typography.uiSubheading)
+                    .foregroundColor(AquinasTheme.Colors.paragraphText)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .padding(.horizontal, 19)
+            .frame(height: 48)
+            .background(AquinasTheme.Colors.canvasSecondary)
+            .clipShape(Capsule())
+            .overlay(
+                Capsule()
+                    .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Exit Study")
+    }
+}
+
+extension AnyTransition {
+    /// The Exit capsule grows out of the side-menu button beside it.
+    static var studyExitGrow: AnyTransition {
+        .scale(scale: 0.4, anchor: .leading).combined(with: .blurFade)
+    }
+}
+
 /// Top-right control for quickly moving between focused Branch mode and the wider Canvas view.
 struct CanvasModeToggleButton: View {
     let isActive: Bool
@@ -240,7 +279,7 @@ private struct CanvasModeUpdatedWidthKey: PreferenceKey {
 }
 
 /// Slide-out navigation panel mirrored from Figma's "03 - User Screen Flow" side-panel frames.
-struct AquinasSideMenu: View {
+struct AquinasSideMenu: View, Equatable {
     @Environment(\.colorScheme) private var colorScheme
 
     let currentTitle: String
@@ -250,6 +289,9 @@ struct AquinasSideMenu: View {
     let modelTasks: ModelTaskQueue
     let selectedPersonality: String
     let isPresented: Bool
+    /// An inexpensive identity for the conversation collection. It lets the
+    /// shell update the panel's position while preserving this whole view tree.
+    let renderVersion: Int
     var onNewChat: () -> Void
     var onSelectConversation: (InquiryConversation) -> Void
     var onRenameConversation: (InquiryConversation, String) -> Void
@@ -275,6 +317,16 @@ struct AquinasSideMenu: View {
     @State private var sideMenuStudyTopics: [StudyTopic] = []
     @State private var topicBeingRenamed: StudyTopic? = nil
     @State private var topicRenameDraft = ""
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.currentTitle == rhs.currentTitle
+            && lhs.activeConversationID == rhs.activeConversationID
+            && lhs.activePage == rhs.activePage
+            && lhs.selectedPersonality == rhs.selectedPersonality
+            && lhs.isPresented == rhs.isPresented
+            && lhs.newInsightsCount == rhs.newInsightsCount
+            && lhs.renderVersion == rhs.renderVersion
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -361,7 +413,7 @@ struct AquinasSideMenu: View {
                             .opacity(showsOpenConversationsTitle ? 1 : 0)
                             .offset(x: showsOpenConversationsTitle ? 0 : -24)
 
-                        VStack(alignment: .leading, spacing: 2) {
+                        LazyVStack(alignment: .leading, spacing: 2) {
                             ForEach(Array(sideMenuStudyTopics.enumerated()), id: \.element.id) { index, topic in
                                 StudyTopicMenuRow(
                                     topic: topic,
@@ -396,7 +448,7 @@ struct AquinasSideMenu: View {
                         .opacity(showsOpenConversationsTitle ? 1 : 0)
                         .offset(x: showsOpenConversationsTitle ? 0 : -24)
 
-                    VStack(alignment: .leading, spacing: 8) {
+                    LazyVStack(alignment: .leading, spacing: 8) {
                         let sortedConversations = conversations.sorted { $0.isPinned && !$1.isPinned }
                         ForEach(Array(sortedConversations.enumerated()), id: \.element.id) { index, conversation in
                             ConversationMenuRow(
@@ -526,8 +578,15 @@ struct AquinasSideMenu: View {
             runTitleEntrance()
         }
         .onChange(of: isPresented) { _, newValue in
-            if newValue { sideMenuStudyTopics = StudyTopicStore.load() }
             runTitleEntrance()
+        }
+        // Give the slide transition its first frame before refreshing persisted
+        // topics. This keeps an occasional larger UserDefaults decode off the
+        // tap and gesture critical path while preserving fresh topic contents.
+        .task(id: isPresented) {
+            guard isPresented else { return }
+            await Task.yield()
+            sideMenuStudyTopics = StudyTopicStore.load()
         }
         .simultaneousGesture(
             DragGesture(minimumDistance: 18)
