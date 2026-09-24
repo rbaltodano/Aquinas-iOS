@@ -135,6 +135,8 @@ struct InsightTreeView: View {
     /// hover state the user entered from.
     @State private var studyInsight: InsightModel?
     @State private var isExitingStudy: Bool = false
+    /// The canvas chip contracts to its bubble icon before the Study overlay takes over.
+    @State private var studyCollapsedInsightID: UUID?
     /// Kept separate from `studyInsight` so the hovered card is reinserted with its normal
     /// dock transition after Study clears, rather than merely becoming visible underneath it.
     @State private var showsDockedCardAfterStudy: Bool = true
@@ -325,6 +327,7 @@ struct InsightTreeView: View {
                 restoreFocusedCameraRequest: restoreFocusedCameraRequest,
                 focusedInsightID: focusedInsightID,
                 focusedSearchNodeID: focusedNodeID,
+                collapsedInsightID: studyCollapsedInsightID,
                 pulsingInsightID: questionBarContextInsight?.id,
                 pulsingNodeID: selectedNode?.id,
                 selectedCanvasTargets: selectedCanvasTargets,
@@ -429,6 +432,7 @@ struct InsightTreeView: View {
                     insight: studyInsight,
                     branchCount: studyBranchCount,
                     isExiting: isExitingStudy,
+                    animatesCenterIconEntrance: false,
                     onBranchCountChange: onStudyBranchCountChange ?? { _ in }
                 )
                     .transition(.opacity)
@@ -825,9 +829,11 @@ struct InsightTreeView: View {
               !isMidpointMode else {
             return
         }
-        onStudyBranchCountChange?(2)
         isExitingStudy = false
         UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.72)
+        withAnimation(.easeInOut(duration: 0.28)) {
+            studyCollapsedInsightID = selectedInsight.id
+        }
         withAnimation(.easeOut(duration: 0.3)) {
             showsDockedCardAfterStudy = false
             studyInsight = selectedInsight
@@ -840,8 +846,11 @@ struct InsightTreeView: View {
         withAnimation(.spring(response: 0.58, dampingFraction: 0.82)) {
             isExitingStudy = true
         }
+        withAnimation(.easeInOut(duration: 0.28)) {
+            studyCollapsedInsightID = nil
+        }
         Task {
-            try? await Task.sleep(for: .seconds(1))
+            try? await Task.sleep(for: .milliseconds(500))
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.16)) {
                 studyInsight = nil

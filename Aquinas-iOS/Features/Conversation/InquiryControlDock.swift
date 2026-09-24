@@ -790,11 +790,14 @@ struct ModelStatusButton: View {
     let modelTasks: ModelTaskQueue
     let action: () -> Void
     var controlIsPressed: Binding<Bool> = .constant(false)
+    /// Allows non-model background work (such as Global Insight Tree reconciliation) to use the
+    /// same activity affordance without acquiring a model-runtime lease.
+    var statusOverride: String? = nil
     @AppStorage(SettingsStorageKey.modelActivityDisplay)
     private var activityDisplay: ModelActivityDisplayOption = .detailed
 
     private var isActive: Bool {
-        modelTasks.isBusy
+        modelTasks.isBusy || statusOverride != nil
     }
 
     private var totalTaskCount: Int {
@@ -806,6 +809,7 @@ struct ModelStatusButton: View {
     }
 
     private var activeStatusText: String {
+        if let statusOverride { return statusOverride }
         if modelTasks.isRuntimeLoading {
             return modelTasks.currentTask?.funLoadingStatusText
                 ?? String(localized: "Loading...")
@@ -816,6 +820,7 @@ struct ModelStatusButton: View {
     }
 
     private var accessibleActiveStatusText: String {
+        if let statusOverride { return statusOverride }
         if modelTasks.isRuntimeLoading {
             return String(localized: "Loading...")
         }
@@ -1299,6 +1304,8 @@ struct InquiryControlDock: View {
     var onStudyBranchCountChange: (Int) -> Void = { _ in }
     /// While a placed midpoint insight is generating, the dock hides its canvas actions.
     var isCanvasInsightLoading: Bool = false
+    /// Status for background canvas work that does not run through `ModelTaskQueue`.
+    var modelStatusOverride: String? = nil
     /// Shared serialized model work. Drives both the status control and its task popup.
     var modelTasks: ModelTaskQueue? = nil
     var modelTasksPopupState: ModelTasksPopupState? = nil
@@ -1318,6 +1325,8 @@ struct InquiryControlDock: View {
     var onClearCanvasSelection: () -> Void = {}
     var contextWordCount: Int = 0
     var contextWordLimit: Int = aquinasContextWindowLimit
+    /// The context gauge belongs to an active conversation, not standalone tree canvases.
+    var showsContextWheel: Bool = true
     var canCompactContext: Bool = false
     var onCompactContext: () async -> Bool = { false }
     var onClearConversation: () -> Void = {}
@@ -1390,7 +1399,9 @@ struct InquiryControlDock: View {
     }
 
     private var showsContextControl: Bool {
-        !isStudyMode && (!isCanvasMode || (!hasSelectedCanvasItems && !isCanvasAskMode))
+        showsContextWheel
+            && !isStudyMode
+            && (!isCanvasMode || (!hasSelectedCanvasItems && !isCanvasAskMode))
     }
 
     private var controlCount: Int {
@@ -1438,7 +1449,8 @@ struct InquiryControlDock: View {
     /// keep the same control count but change content width (e.g. the "Add" button ↔ the
     /// "Tap another Insight" hint) — so the capsule resizes with the same spring + scale bump.
     private var controlLayoutKey: String {
-        "\(controlCount)|\(modelTaskCounterKey)|\(isStudyMode ? 1 : 0)|\(studyBranchCount)|\(isMidpointMode ? 1 : 0)|\(isCanvasInsightLoading ? 1 : 0)|\(hasCanvasHover ? 1 : 0)|\(hasCanvasInsightHover ? 1 : 0)|\(selectedCanvasItemCount)|\(showsSendButton ? 1 : 0)|\(canvasSearchIsActive ? 1 : 0)|\(isCanvasAskMode ? 1 : 0)"
+        let statusKey = modelStatusOverride ?? "idle"
+        return "\(controlCount)|\(modelTaskCounterKey)|\(statusKey)|\(isStudyMode ? 1 : 0)|\(studyBranchCount)|\(isMidpointMode ? 1 : 0)|\(isCanvasInsightLoading ? 1 : 0)|\(hasCanvasHover ? 1 : 0)|\(hasCanvasInsightHover ? 1 : 0)|\(selectedCanvasItemCount)|\(showsSendButton ? 1 : 0)|\(canvasSearchIsActive ? 1 : 0)|\(isCanvasAskMode ? 1 : 0)"
     }
 
     /// Explicitly keys the pill's resize and 5% pulse to the fraction shown by Model Status.
@@ -1477,12 +1489,22 @@ struct InquiryControlDock: View {
                 }
 
                 if showsModelStatusControl, let modelTasks {
-                    ModelStatusButton(
-                        modelTasks: modelTasks,
-                        action: handleModelStatusTap,
-                        controlIsPressed: $isControlButtonPressed
-                    )
-                    .transition(.scale(scale: 0.4).combined(with: .opacity))
+                    if let modelStatusOverride {
+                        ModelStatusButton(
+                            modelTasks: modelTasks,
+                            action: {},
+                            controlIsPressed: $isControlButtonPressed,
+                            statusOverride: modelStatusOverride
+                        )
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                    } else {
+                        ModelStatusButton(
+                            modelTasks: modelTasks,
+                            action: handleModelStatusTap,
+                            controlIsPressed: $isControlButtonPressed
+                        )
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                    }
                 }
 
                 if isCanvasMode && isStudyMode {
@@ -1577,7 +1599,7 @@ struct InquiryControlDock: View {
                 .padding(.horizontal, isStudyMode ? 0 : (isCanvasAskMode ? 16 : 32))
                 .padding(.vertical, isStudyMode ? 0 : 24)
                 .fixedSize(horizontal: true, vertical: true)
-                .background(isStudyMode ? Color.clear : AquinasTheme.Colors.canvasSecondary)
+                .background(AquinasTheme.Colors.canvasSecondary.opacity(isStudyMode ? 0 : 1))
                 .clipShape(Capsule())
                 .overlay(Capsule().stroke(AquinasTheme.Colors.controlBorder.opacity(isStudyMode ? 0 : 1), lineWidth: 1))
                 .modifier(FloatingControlPressFeedback(isButtonPressed: isControlButtonPressed))

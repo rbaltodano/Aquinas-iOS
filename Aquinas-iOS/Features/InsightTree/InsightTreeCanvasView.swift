@@ -30,6 +30,8 @@ struct InsightTreeCanvasView: View {
     let restoreFocusedCameraRequest: Int
     let focusedInsightID: UUID?
     let focusedSearchNodeID: UUID?
+    /// The focused chip that is contracting into its icon before Study opens.
+    var collapsedInsightID: UUID? = nil
     let pulsingInsightID: UUID?
     let pulsingNodeID: UUID?
     let selectedCanvasTargets: [CanvasSelectionTarget]
@@ -104,6 +106,8 @@ struct InsightTreeCanvasView: View {
     /// reveal. Existing lines are seeded here immediately; new lines are added by the entrance
     /// sequence once the Insight's own animation has completed.
     @State private var revealedInsightConnectorIDs: Set<UUID> = []
+    @State private var revealedGraphEdgeIDs: Set<String> = []
+    @State private var animatedGraphEdgeIDs: Set<String> = []
     @State private var revealedNodeIDs: Set<UUID> = []
     /// Stable topology baselines for live (non-persisted) trees. Reveal state is deliberately
     /// separate: an Insight can already belong to the tree while remaining hidden during its
@@ -287,7 +291,7 @@ struct InsightTreeCanvasView: View {
     }
 
     private func focusAnchor(in size: CGSize) -> CGPoint {
-        CGPoint(x: size.width / 2, y: size.height * 0.40)
+        CGPoint(x: size.width / 2, y: size.height / 2)
     }
 
     var body: some View {
@@ -305,7 +309,10 @@ struct InsightTreeCanvasView: View {
                     dragOffset:    dragOffset,
                     ripples:       (rippleTrigger.map { [$0] } ?? []) + selectionRipples
                 )
-                .ignoresSafeArea()
+                // Keep the grid's Canvas in the exact same coordinate frame as the graph.
+                // Expanding it independently into the safe area shifts ripple origins away
+                // from the focused chip even though both use the same camera transform.
+                .frame(width: size.width, height: size.height)
                 .opacity(hasAppeared ? 1 : 0)
                 .animation(.easeOut(duration: 0.6), value: hasAppeared)
 
@@ -377,6 +384,7 @@ struct InsightTreeCanvasView: View {
                 undiscoveredInsightIDs = loadUndiscoveredInsightIDs()
                 undiscoveredNodeIDs = loadUndiscoveredNodeIDs()
                 revealedNodeIDs = Set(nodes.map(\.id))
+                revealedGraphEdgeIDs = Set(displayGraphEdges().map(\.id))
                 observedLiveInsightIDs = visibleInsightIDs(in: nodes)
                 observedLiveNodeIDs = Set(nodes.map(\.id))
                 if defersEntranceUntilPersistedTree {
@@ -384,6 +392,7 @@ struct InsightTreeCanvasView: View {
                     // persisted baseline. A completed backend load will do both.
                     revealedInsightIDs = visibleInsightIDs(in: nodes)
                     revealedInsightConnectorIDs = visibleInsightIDs(in: nodes)
+                    revealedGraphEdgeIDs = Set(displayGraphEdges().map(\.id))
                     reportUndiscoveredInsightCount()
                 } else {
                     let newInsights = computeNewInsights()
@@ -927,20 +936,27 @@ struct InsightTreeCanvasView: View {
     private func graphEdges(camera: InsightTreeCamera, size: CGSize) -> some View {
         let hasSelection = !selectedCanvasTargets.isEmpty
         ForEach(displayGraphEdges()) { edge in
-            if let from = simPosition(of: edge.fromNodeID),
+            if revealedGraphEdgeIDs.contains(edge.id),
+               let from = simPosition(of: edge.fromNodeID),
                let to = simPosition(of: edge.toNodeID) {
                 let start = depthScreenPosition(from, nodeID: edge.fromNodeID, camera: camera, size: size)
                 let end = depthScreenPosition(to, nodeID: edge.toNodeID, camera: camera, size: size)
 
-                AnimatableLine(start: start, end: end)
-                    .stroke(
-                        AquinasTheme.Colors.divider.opacity(edge.isSuggested ? 0.55 : 0.9),
-                        style: StrokeStyle(
-                            lineWidth: 1,
-                            lineCap: .round,
-                            dash: edge.isSuggested ? [6, 4] : []
+                Group {
+                    if animatedGraphEdgeIDs.contains(edge.id) {
+                        InsightConnectorLine(
+                            start: start,
+                            end: end,
+                            color: AquinasTheme.Colors.divider.opacity(edge.isSuggested ? 0.55 : 0.9)
                         )
-                    )
+                    } else {
+                        AnimatableLine(start: start, end: end)
+                            .stroke(
+                                AquinasTheme.Colors.divider.opacity(edge.isSuggested ? 0.55 : 0.9),
+                                style: StrokeStyle(lineWidth: 1, lineCap: .round, dash: edge.isSuggested ? [6, 4] : [])
+                            )
+                    }
+                }
                     .frame(width: size.width, height: size.height)
                     .allowsHitTesting(false)
                     .opacity(hasSelection ? 0.5 : 1.0)
@@ -1976,11 +1992,15 @@ struct InsightTreeCanvasView: View {
             // Icon + title appear together as one unit (fade + transform + blur), like a
             // streamed model response. The icon stays full opacity; only the title fades with zoom.
             if isRevealed {
-                RevealedInsightLabel(title: insight.title, labelOpacity: labelOpacity)
+                RevealedInsightLabel(
+                    title: insight.title,
+                    labelOpacity: labelOpacity,
+                    hidesTitleForStudy: collapsedInsightID == insight.id
+                )
                     .transition(.glideFadeUp)
             }
         }
-        .padding(.horizontal, 20)
+        .padding(.horizontal, collapsedInsightID == insight.id ? 14 : 20)
         .padding(.vertical, 16)
         // Background + title fade with zoom, leaving just the floating icon.
         .background(insightTreeCanvasColor.opacity(labelOpacity))
@@ -2858,6 +2878,11 @@ struct InsightTreeCanvasView: View {
         // Clear these before the asynchronous camera/reveal sequence begins. This prevents a
         // connector from the previous topology from remaining visible during the camera scroll.
         revealedInsightConnectorIDs.subtract(newInsightIDs)
+        let newGraphEdgeIDs = Set(displayGraphEdges().filter {
+            newNodeIDs.contains($0.fromNodeID) || newNodeIDs.contains($0.toNodeID)
+        }.map(\.id))
+        revealedGraphEdgeIDs.subtract(newGraphEdgeIDs)
+        animatedGraphEdgeIDs.formUnion(newGraphEdgeIDs)
         confirmedPersistedInsightIDs = currentInsightIDs
         confirmedPersistedNodeIDs = currentNodeIDs
         undiscoveredInsightIDs.formUnion(loadUndiscoveredInsightIDs())
@@ -2866,6 +2891,7 @@ struct InsightTreeCanvasView: View {
         guard !newInsights.isEmpty || !newNodeIDs.isEmpty else {
             revealedInsightIDs = currentInsightIDs
             revealedInsightConnectorIDs = currentInsightIDs
+            revealedGraphEdgeIDs = Set(displayGraphEdges().map(\.id))
             revealedNodeIDs = currentNodeIDs
             saveAllInsightIDsAsSeen()
             reportUndiscoveredInsightCount()
@@ -2911,6 +2937,10 @@ struct InsightTreeCanvasView: View {
         let allNodeIDs = Set(nodes.map(\.id))
         revealedInsightIDs = allInsightIDs.subtracting(insightIDs)
         revealedInsightConnectorIDs = allInsightIDs.subtracting(insightIDs)
+        let newGraphEdgeIDs = Set(displayGraphEdges().filter {
+            newNodeIDs.contains($0.fromNodeID) || newNodeIDs.contains($0.toNodeID)
+        }.map(\.id))
+        revealedGraphEdgeIDs = Set(displayGraphEdges().map(\.id)).subtracting(newGraphEdgeIDs)
         revealedNodeIDs = allNodeIDs.subtracting(newNodeIDs)
 
         // The topology callback can arrive before the simulation has reconciled the new nodes.
@@ -2966,6 +2996,13 @@ struct InsightTreeCanvasView: View {
                     _ = withAnimation(.easeOut(duration: 0.22)) {
                         revealedNodeIDs.insert(nodeID)
                     }
+                    try? await Task.sleep(for: .milliseconds(620))
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.easeInOut(duration: 0.62)) {
+                        revealedGraphEdgeIDs.formUnion(displayGraphEdges().filter {
+                            $0.fromNodeID == nodeID || $0.toNodeID == nodeID
+                        }.map(\.id))
+                    }
                 }
                 rippleTrigger = RippleTrigger(
                     worldOrigin: position,
@@ -2985,8 +3022,16 @@ struct InsightTreeCanvasView: View {
                 revealedNodeIDs.formUnion(newNodeIDs)
                 revealedInsightIDs.formUnion(insightIDs)
             } completion: {
-                guard !Task.isCancelled else { return }
-                revealedInsightConnectorIDs.formUnion(insightIDs)
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(620))
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.easeInOut(duration: 0.62)) {
+                        revealedInsightConnectorIDs.formUnion(insightIDs)
+                        revealedGraphEdgeIDs.formUnion(displayGraphEdges().filter {
+                            newNodeIDs.contains($0.fromNodeID) || newNodeIDs.contains($0.toNodeID)
+                        }.map(\.id))
+                    }
+                }
             }
             let center = CGPoint(
                 x: positions.map(\.x).reduce(0, +) / CGFloat(positions.count),
@@ -3385,6 +3430,7 @@ private struct MidpointHandle: View {
 private struct RevealedInsightLabel: View {
     let title: String
     let labelOpacity: Double
+    var hidesTitleForStudy: Bool = false
 
     @State private var titleWidth: CGFloat = 0
     /// Animated width state — toggled (with an explicit ease) when the fade crosses 0, so the
@@ -3392,7 +3438,7 @@ private struct RevealedInsightLabel: View {
     @State private var showTitle: Bool = true
 
     /// Title keeps full width through the whole fade; it only collapses once opacity hits 0.
-    private var collapsed: Bool { labelOpacity <= 0.01 }
+    private var collapsed: Bool { labelOpacity <= 0.01 || hidesTitleForStudy }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -3414,7 +3460,7 @@ private struct RevealedInsightLabel: View {
                 )
                 .frame(width: titleWidth == 0 ? nil : (showTitle ? titleWidth : 0), alignment: .leading)
                 .clipped()
-                .opacity(labelOpacity)
+                .opacity(showTitle ? labelOpacity : 0)
         }
         .onAppear { showTitle = !collapsed }
         .onChange(of: collapsed) { _, isCollapsed in

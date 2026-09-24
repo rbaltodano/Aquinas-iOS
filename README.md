@@ -26,6 +26,9 @@ working through questions of faith, meaning, truth, or human flourishing.
   source-dependent answers are tied to available evidence.
 - **Builds an Insight Tree.** Save contextual definitions and important concepts, then explore the
   relationships between them in a spatial, evolving map.
+- **Explores ideas in semantic space.** Aquinas uses local embedding and relatedness tools to
+  compare concepts, find meaningful neighborhoods, and turn relationships between ideas into a
+  visual map rather than leaving them buried in a linear transcript.
 - **Stays local by design.** The intended product keeps conversations, retrieval, and model work
   under the user's control rather than requiring an account or a cloud conversation history.
 
@@ -35,6 +38,7 @@ working through questions of faith, meaning, truth, or human flourishing.
 | --- | --- |
 | Conversation | Branch a line of inquiry, return to it later, compact older context, and keep the visible transcript intact. |
 | Study | Open contextual definitions, save durable Insights, and explore relationships in the Insight Tree. |
+| Semantic map | Compare concept vectors, surface related ideas, and render their relationships as a spatial graph. |
 | Sources | Retrieve relevant passages from a bundled local library for source-dependent questions. |
 | Reflection | Return to a Question of the Day, loose threads, historical prompts, and other optional study cues. |
 | Privacy | Keep the intended production experience local-first, with no account or cloud conversation history requirement. |
@@ -100,3 +104,20 @@ xcodebuild -project Aquinas-iOS.xcodeproj -scheme Aquinas-iOS \
 
 The README is intentionally public-facing. Detailed architecture, runtime constraints, and agent
 guidance are routed from [`AGENTS.md`](AGENTS.md).
+
+## Project status
+
+Aquinas is in active development and is not yet a public consumer release. The
+most useful parts of the project to explore today are the conversation flow,
+source-grounded study experience, semantic Insight Tree, and on-device model
+integration. The semantic layer is central to the product: it helps the app
+show how ideas relate, cluster, and develop over time.
+
+The repository does not include the full local model bundle. To run the complete
+on-device experience, you will need the corresponding development model assets
+and a recent Xcode installation.
+
+## Related repositories
+
+- [Aquinas Foundations](https://github.com/rbaltodano/Aquinas-Foundations) — product, design, and architecture contracts.
+- [Aquinas Backend](https://github.com/rbaltodano/Aquinas_Backend) — development-time generation, retrieval, and persistence service.

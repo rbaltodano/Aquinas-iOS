@@ -12,8 +12,12 @@ struct StudyModeView: View {
     let insight: InsightModel
     let branchCount: Int
     let isExiting: Bool
+    /// The Insight Tree already supplies its own focus transition. A standalone Insights page
+    /// can opt in to a distinct center-icon entrance when it adopts this shared Study surface.
+    var animatesCenterIconEntrance: Bool = true
     let onBranchCountChange: (Int) -> Void
 
+    @AppStorage("study.lastSelectedTool") private var lastSelectedToolRawValue = StudyTool.branch.rawValue
     @State private var selectedTool: StudyTool = .branch
     @State private var hasEntered: Bool = false
     @State private var showsCenterIcon: Bool = false
@@ -21,14 +25,21 @@ struct StudyModeView: View {
 
     var body: some View {
         GeometryReader { proxy in
+            let matrixDiameter: CGFloat = 300
+            let titleHeight: CGFloat = 24
+            let titleMatrixSpacing: CGFloat = 20
+            let matrixCenter = CGPoint(x: proxy.size.width / 2, y: proxy.size.height / 2)
+            // The title sits above the matrix without changing its fixed focal point.
+            let titleMatrixClusterCenterY = matrixCenter.y - (titleHeight + titleMatrixSpacing) / 2
+
             ZStack {
                 AquinasTheme.Colors.canvas
                     .ignoresSafeArea()
                     .opacity(hasEntered ? 1 : 0)
 
-                VStack(spacing: 48) {
+                VStack(spacing: titleMatrixSpacing) {
                     StudyInsightTitle(title: insight.title)
-                        .padding(.top, max(proxy.safeAreaInsets.top, 20) + 28)
+                        .frame(height: titleHeight)
                         .opacity(hasEntered ? 1 : 0)
                         .blur(radius: hasEntered ? 0 : 8)
 
@@ -41,38 +52,39 @@ struct StudyModeView: View {
                         showsCenterIcon: showsCenterIcon,
                         onBranchCountChange: onBranchCountChange
                     )
-                    .frame(width: 300, height: 300)
+                    .frame(width: matrixDiameter, height: matrixDiameter)
                     // Keep the matrix present after the surrounding Study chrome fades so
                     // its dots can retrace their entrance during the one-second exit.
                     .opacity(hasEntered || isExiting ? 1 : 0)
                     .transition(.opacity)
-
-                    StudyToolCarousel(
-                        tool: selectedTool,
-                        transitionDirection: toolTransitionDirection,
-                        onPrevious: { select(selectedTool.previous, direction: -1) },
-                        onNext: { select(selectedTool.next, direction: 1) }
-                    )
-                    .padding(.horizontal, 24)
-                    .opacity(hasEntered ? 1 : 0)
-                    .offset(y: hasEntered ? 0 : 18)
-
-                    Spacer(minLength: 0)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .frame(width: matrixDiameter)
+                .position(x: matrixCenter.x, y: titleMatrixClusterCenterY)
+
+                StudyToolCarousel(
+                    tool: selectedTool,
+                    transitionDirection: toolTransitionDirection,
+                    onPrevious: { select(selectedTool.previous, direction: -1) },
+                    onNext: { select(selectedTool.next, direction: 1) }
+                )
+                .padding(.horizontal, 24)
+                .frame(width: proxy.size.width)
+                .opacity(hasEntered ? 1 : 0)
+                .offset(y: hasEntered ? 0 : 18)
+                .position(x: matrixCenter.x, y: matrixCenter.y + matrixDiameter / 2 + 48 + 36)
             }
         }
         .task(id: insight.id) {
+            selectedTool = StudyTool(rawValue: lastSelectedToolRawValue) ?? .branch
             hasEntered = false
-            showsCenterIcon = false
-            try? await Task.sleep(for: .milliseconds(280))
-            guard !Task.isCancelled else { return }
+            showsCenterIcon = !animatesCenterIconEntrance
             withAnimation(.easeOut(duration: 0.2)) {
                 hasEntered = true
             }
+            guard animatesCenterIconEntrance else { return }
             try? await Task.sleep(for: .milliseconds(150))
             guard !Task.isCancelled else { return }
-            withAnimation(.linear(duration: 0.01)) {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.72)) {
                 showsCenterIcon = true
             }
         }
@@ -93,11 +105,12 @@ struct StudyModeView: View {
         withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
             selectedTool = tool
         }
+        lastSelectedToolRawValue = tool.rawValue
     }
 
 }
 
-private enum StudyTool: CaseIterable, Hashable {
+private enum StudyTool: String, CaseIterable, Hashable {
     case branch
     case deconstruct
     case traverse
@@ -152,11 +165,22 @@ private struct StudyDotMatrix: View {
     let onBranchCountChange: (Int) -> Void
 
     private let dots = StudyMatrixDot.points
+    /// Kept behind a feature flag while the Branch visual language is being evaluated.
+    private let showsBranchConnectionLines = false
     @State private var hapticPattern = StudyToolHapticPattern()
     @State private var previousDragAngle: CGFloat?
     @State private var accumulatedRotation: CGFloat = 0
     @State private var deconstructPhase: DeconstructPhase = .inactive
     @State private var firstPresentedToolID: UUID?
+    @State private var previousTool: StudyTool?
+    @State private var branchEntryGeneration: Int = 0
+    @State private var isBranchEntryAnimating: Bool = false
+    @State private var branchLineProgress: CGFloat = 0
+    @State private var displayedBranchCount: Int?
+    @State private var previousBranchCount: Int?
+    @State private var isBranchCountTransitioning: Bool = false
+    @State private var isBranchCountDragging: Bool = false
+    @State private var branchLinesNeedRedraw: Bool = false
 
     var body: some View {
         GeometryReader { proxy in
@@ -164,15 +188,32 @@ private struct StudyDotMatrix: View {
             let center = CGPoint(x: proxy.size.width / 2, y: proxy.size.height / 2)
 
             ZStack {
+                if showsBranchConnectionLines, tool == .branch, let displayedBranchCount {
+                    ForEach(dots.filter { $0.isBranchTarget(for: displayedBranchCount) }) { dot in
+                        BranchConnectionLine(
+                            center: center,
+                            destination: CGPoint(
+                                x: center.x + dot.x * diameter / 2,
+                                y: center.y + dot.y * diameter / 2
+                            ),
+                            progress: branchLineProgress
+                        )
+                    }
+                }
+
                 ForEach(dots) { dot in
+                    let highlightBehavior = dot.highlightBehavior(
+                        for: tool,
+                        branchCount: branchCount,
+                        deconstructPhase: deconstructPhase
+                    )
+
                     StudyMatrixDotView(
                         dot: dot,
                         insightID: insightID,
-                        highlightBehavior: dot.highlightBehavior(
-                            for: tool,
-                            branchCount: branchCount,
-                            deconstructPhase: deconstructPhase
-                        ),
+                        highlightBehavior: highlightBehavior,
+                        usesInstantHighlightTransition: !isBranchEntryAnimating && tool == .branch,
+                        branchEntryGeneration: branchEntryGeneration,
                         isExiting: isExiting
                     )
                     .position(
@@ -181,10 +222,27 @@ private struct StudyDotMatrix: View {
                     )
                 }
 
-                if showsCenterIcon {
-                    StudyInsightCenterIcon()
-                        .position(center)
-                }
+                StudyInsightCenterIcon()
+                    .scaleEffect(
+                        showsCenterIcon
+                            ? (showsBranchConnectionLines && isBranchCountTransitioning ? 1.1 : 1)
+                            : 1.05
+                    )
+                    .opacity(showsCenterIcon ? 1 : 0)
+                    .blur(radius: showsCenterIcon ? 0 : 5)
+                    .shadow(
+                        color: AquinasTheme.Colors.lightGreen.opacity(
+                            showsBranchConnectionLines && isBranchCountTransitioning ? 0.75 : 0
+                        ),
+                        radius: 4,
+                        x: 0,
+                        y: 0
+                    )
+                    .animation(
+                        .spring(response: 0.28, dampingFraction: 0.72),
+                        value: showsCenterIcon
+                    )
+                    .position(center)
 
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -199,6 +257,55 @@ private struct StudyDotMatrix: View {
             guard isExiting else { return }
             await hapticPattern.playExit()
         }
+        .task(id: BranchConnectionAnimationID(
+            insightID: insightID,
+            tool: tool,
+            branchCount: branchCount,
+            isVisible: isVisible,
+            isExiting: isExiting,
+            isDragging: isBranchCountDragging
+        )) {
+            guard showsBranchConnectionLines, tool == .branch, isVisible, !isExiting else {
+                branchLineProgress = 0
+                displayedBranchCount = nil
+                previousBranchCount = nil
+                isBranchCountTransitioning = false
+                branchLinesNeedRedraw = false
+                return
+            }
+
+            let isCountChange = previousBranchCount.map { $0 != branchCount } ?? false
+            previousBranchCount = branchCount
+
+            if isCountChange {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    branchLineProgress = 0
+                    isBranchCountTransitioning = true
+                }
+                branchLinesNeedRedraw = true
+            }
+
+            if displayedBranchCount == nil {
+                displayedBranchCount = branchCount
+                branchLineProgress = 0
+                branchLinesNeedRedraw = true
+            }
+
+            // During a radial drag, preserve the retracted state. Releasing the gesture
+            // restarts this task and is the single point at which the new lines draw outward.
+            guard !isBranchCountDragging, branchLinesNeedRedraw else { return }
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled, tool == .branch, isVisible, !isExiting else { return }
+
+            displayedBranchCount = branchCount
+            branchLinesNeedRedraw = false
+            withAnimation(.easeOut(duration: 0.15)) {
+                isBranchCountTransitioning = false
+            }
+            withAnimation(.timingCurve(0.55, 0, 0.17, 1, duration: 1)) {
+                branchLineProgress = 1
+            }
+        }
         .task(id: ToolHapticID(insightID: insightID, tool: tool, isVisible: isVisible)) {
             guard isVisible else {
                 firstPresentedToolID = nil
@@ -211,20 +318,36 @@ private struct StudyDotMatrix: View {
             await hapticPattern.playIntro(for: tool)
         }
         .task(id: tool) {
+            let isReturningToBranch = tool == .branch && previousTool != nil
+            previousTool = tool
+
+            if isReturningToBranch {
+                branchEntryGeneration += 1
+                isBranchEntryAnimating = true
+                // Branch's per-dot delay tops out at 320 ms; retain the transition
+                // state long enough for the final 200 ms spring to finish as well.
+                try? await Task.sleep(for: .milliseconds(560))
+                guard !Task.isCancelled, tool == .branch else { return }
+                isBranchEntryAnimating = false
+            }
+
             guard tool == .deconstruct else {
                 deconstructPhase = .inactive
                 return
             }
 
             deconstructPhase = .forming
-            // Base dots may take up to one second to arrive, and the ring itself
-            // has a final randomized highlight delay. Wait until that formation is
-            // complete before moving the dot outward.
-            try? await Task.sleep(for: .milliseconds(1_350))
+            let sourceEntranceDelay = dots.first {
+                $0.ring == 2 && $0.slot == 5
+            }?.highlightDelayMilliseconds(
+                for: insightID,
+                behavior: .deconstructRing
+            ) ?? 0
+            // Transfer the emphasis as soon as the clock-two source dot has finished its own
+            // stagger and growth animation, rather than waiting for the whole ring.
+            try? await Task.sleep(for: .milliseconds(sourceEntranceDelay + 200))
             guard !Task.isCancelled, tool == .deconstruct else { return }
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.76)) {
-                deconstructPhase = .transferred
-            }
+            deconstructPhase = .transferred
             hapticPattern.playDeconstructBreakout()
         }
         .accessibilityHidden(true)
@@ -243,6 +366,7 @@ private struct StudyDotMatrix: View {
 
                 guard let previousDragAngle else {
                     self.previousDragAngle = currentAngle
+                    isBranchCountDragging = true
                     return
                 }
 
@@ -260,6 +384,7 @@ private struct StudyDotMatrix: View {
             .onEnded { _ in
                 previousDragAngle = nil
                 accumulatedRotation = 0
+                isBranchCountDragging = false
             }
     }
 
@@ -289,10 +414,46 @@ private struct StudyInsightCenterIcon: View {
     }
 }
 
+private struct BranchConnectionLine: View {
+    let center: CGPoint
+    let destination: CGPoint
+    let progress: CGFloat
+
+    var body: some View {
+        GeometryReader { proxy in
+            Path { path in
+                path.move(to: center)
+                path.addLine(to: destination)
+            }
+            .trim(from: 0, to: progress)
+            .stroke(
+                LinearGradient(
+                    stops: [
+                        .init(color: AquinasTheme.Colors.headingText.opacity(0), location: 0),
+                        .init(color: AquinasTheme.Colors.headingText.opacity(0), location: 0.12),
+                        .init(color: AquinasTheme.Colors.headingText.opacity(0.35), location: 1)
+                    ],
+                    startPoint: UnitPoint(
+                        x: center.x / max(proxy.size.width, 1),
+                        y: center.y / max(proxy.size.height, 1)
+                    ),
+                    endPoint: UnitPoint(
+                        x: destination.x / max(proxy.size.width, 1),
+                        y: destination.y / max(proxy.size.height, 1)
+                    )
+                ),
+                style: StrokeStyle(lineWidth: 1, lineCap: .round)
+            )
+        }
+    }
+}
+
 private struct StudyMatrixDotView: View {
     let dot: StudyMatrixDot
     let insightID: UUID
     let highlightBehavior: StudyDotHighlightBehavior
+    let usesInstantHighlightTransition: Bool
+    let branchEntryGeneration: Int
     let isExiting: Bool
 
     @State private var isVisible: Bool = false
@@ -312,7 +473,12 @@ private struct StudyMatrixDotView: View {
             )
             .scaleEffect(isHighlightVisible ? 1 : (hasSettled ? 0.5 : 1))
             .opacity(isVisible ? (isHighlightVisible ? 0.86 : 0.75) : 0)
-            .animation(.spring(response: 0.28, dampingFraction: 0.76), value: isHighlightVisible)
+            .animation(
+                usesInstantHighlightTransition
+                    ? nil
+                    : .spring(response: 0.28, dampingFraction: 0.76),
+                value: isHighlightVisible
+            )
             .task(id: BaseDotAnimationID(insightID: insightID, isExiting: isExiting)) {
                 guard !isExiting else { return }
                 isVisible = false
@@ -345,24 +511,46 @@ private struct StudyMatrixDotView: View {
                 insightID: insightID,
                 behavior: highlightBehavior,
                 isBaseVisible: isVisible,
+                branchEntryGeneration: branchEntryGeneration,
                 isExiting: isExiting
             )) {
+                // The Deconstruct breakout skips its own delay, but still grows into place
+                // immediately after the source dot completes its ring entrance.
+                if highlightBehavior == .deconstructTransfer, !isExiting {
+                    isVisible = true
+                    hasSettled = true
+                    withAnimation(.spring(response: 0.2, dampingFraction: 0.7)) {
+                        isHighlightVisible = true
+                    }
+                    return
+                }
+
                 guard isVisible, isHighlighted, !isExiting else {
-                    withAnimation(.easeOut(duration: 0.12)) {
+                    if usesInstantHighlightTransition {
                         isHighlightVisible = false
+                    } else {
+                        withAnimation(.easeOut(duration: 0.12)) {
+                            isHighlightVisible = false
+                        }
                     }
                     return
                 }
 
                 isHighlightVisible = false
-                try? await Task.sleep(for: .milliseconds(dot.highlightDelayMilliseconds(
-                    for: insightID,
-                    behavior: highlightBehavior
-                )))
+                if !usesInstantHighlightTransition {
+                    try? await Task.sleep(for: .milliseconds(dot.highlightDelayMilliseconds(
+                        for: insightID,
+                        behavior: highlightBehavior
+                    )))
+                }
                 guard !Task.isCancelled, isHighlighted, !isExiting else { return }
 
-                withAnimation(.spring(response: 0.2, dampingFraction: 0.7)) {
+                if usesInstantHighlightTransition {
                     isHighlightVisible = true
+                } else {
+                    withAnimation(.spring(response: 0.2, dampingFraction: 0.7)) {
+                        isHighlightVisible = true
+                    }
                 }
             }
     }
@@ -372,6 +560,7 @@ private struct HighlightAnimationID: Hashable {
     let insightID: UUID
     let behavior: StudyDotHighlightBehavior
     let isBaseVisible: Bool
+    let branchEntryGeneration: Int
     let isExiting: Bool
 }
 
@@ -396,6 +585,15 @@ private struct ToolHapticID: Hashable {
     let isVisible: Bool
 }
 
+private struct BranchConnectionAnimationID: Hashable {
+    let insightID: UUID
+    let tool: StudyTool
+    let branchCount: Int
+    let isVisible: Bool
+    let isExiting: Bool
+    let isDragging: Bool
+}
+
 private enum DeconstructPhase: Hashable {
     case inactive
     case forming
@@ -407,26 +605,29 @@ private enum StudyDotHighlightBehavior: Hashable {
     case branch(count: Int)
     case deconstructRing
     case deconstructTransfer
+    case traverseRing
 }
 
 /// Supplies a stable, recognizable feedback signature per Study tool. Visual dots
 /// remain independently timed, but their count never changes the haptic rhythm.
 @MainActor
 private final class StudyToolHapticPattern {
-    /// A simple 1.5-second physical bed for the matrix appearing: 20 evenly-spaced
-    /// taps, with a one-in-four chance that an individual tap is emphasized.
+    private let rigidGenerator = UIImpactFeedbackGenerator(style: .rigid)
+
+    /// A concise one-second physical bed for the matrix appearing: 10 evenly-spaced
+    /// taps, each with a forty-percent chance of being emphasized.
     func playMatrixEntrance() async {
         guard SettingsHaptics.isEnabled else { return }
 
-        for index in 0..<20 {
+        for index in 0..<10 {
             guard !Task.isCancelled else { return }
-            emit(Int.random(in: 0..<4) == 0 ? .emphasized : .light)
-            guard index < 19 else { continue }
-            try? await Task.sleep(for: .nanoseconds(78_947_368))
+            emit(Int.random(in: 0..<10) < 4 ? .emphasized : .light)
+            guard index < 9 else { continue }
+            try? await Task.sleep(for: .nanoseconds(111_111_111))
         }
     }
 
-    /// Seven evenly spaced taps across one second: heavy, light, light,
+    /// Seven evenly spaced taps across half a second: heavy, light, light,
     /// heavy, light, light, light.
     func playExit() async {
         guard SettingsHaptics.isEnabled else { return }
@@ -438,7 +639,7 @@ private final class StudyToolHapticPattern {
             guard !Task.isCancelled else { return }
             emit(taps[index])
             guard index < taps.count - 1 else { continue }
-            try? await Task.sleep(for: .nanoseconds(166_666_667))
+            try? await Task.sleep(for: .nanoseconds(83_333_333))
         }
     }
 
@@ -449,10 +650,8 @@ private final class StudyToolHapticPattern {
         switch tool {
         case .branch:
             taps = [.light, .light, .emphasized]
-        case .deconstruct:
+        case .deconstruct, .traverse:
             taps = [.emphasized, .light, .light]
-        case .traverse:
-            return
         }
 
         for index in taps.indices {
@@ -469,9 +668,8 @@ private final class StudyToolHapticPattern {
     }
 
     private func emit(_ tap: StudyHapticTap) {
-        let generator = UIImpactFeedbackGenerator(style: tap == .emphasized ? .medium : .light)
-        generator.prepare()
-        generator.impactOccurred(intensity: tap == .emphasized ? 0.74 : 0.48)
+        rigidGenerator.prepare()
+        rigidGenerator.impactOccurred(intensity: tap == .emphasized ? 1.0 : 0.74)
     }
 }
 
@@ -580,7 +778,7 @@ private struct StudyMatrixDot: Identifiable {
             let count = counts[ring]
             return (0..<count).map { slot in
                 let angle = (2 * .pi * CGFloat(slot) / CGFloat(count))
-                    + ((ring == 3 || ring == radii.indices.last) ? -.pi / 2 : CGFloat(ring) * 0.23)
+                    + ((ring == 2 || ring == 3 || ring == radii.indices.last) ? -.pi / 2 : CGFloat(ring) * 0.23)
                 return StudyMatrixDot(
                     id: ring * 100 + slot,
                     x: cos(angle) * radii[ring],
@@ -602,7 +800,9 @@ private struct StudyMatrixDot: Identifiable {
     }
 
     func exitDelayMilliseconds(for insightID: UUID) -> Int {
-        1_000 - delayMilliseconds(for: insightID)
+        // The final shrink-to-dismiss occupies 200 ms, leaving a 300 ms reverse
+        // stagger so the full dot exit completes in half a second.
+        (1_000 - delayMilliseconds(for: insightID)) * 3 / 8
     }
 
     func highlightDelayMilliseconds(
@@ -617,6 +817,8 @@ private struct StudyMatrixDot: Identifiable {
             behaviorSeed = count * 1_003
         case .deconstructRing:
             behaviorSeed = 7_919
+        case .traverseRing:
+            behaviorSeed = 4_873
         case .none, .deconstructTransfer:
             behaviorSeed = 0
         }
@@ -658,14 +860,21 @@ private struct StudyMatrixDot: Identifiable {
             }
 
         case .traverse:
-            return .none
+            // Traverse currently uses the closest available ring as a simple placeholder
+            // for the starting point of a semantic journey outward.
+            return ring == Self.traverseRingIndex ? .traverseRing : .none
         }
     }
 
-    private static let deconstructRingIndex = 3
-    private static let deconstructTransferRingIndex = 5
-    private static let deconstructClockTwoSlot = 6
-    private static let deconstructClockTwoTransferSlot = 38
+    func isBranchTarget(for count: Int) -> Bool {
+        ring == 6 && Self.branchHighlightedSlots(for: count).contains(slot)
+    }
+
+    private static let deconstructRingIndex = 2
+    private static let deconstructTransferRingIndex = 4
+    private static let deconstructClockTwoSlot = 5
+    private static let deconstructClockTwoTransferSlot = 34
+    private static let traverseRingIndex = 0
 
     private static func branchHighlightedSlots(for count: Int) -> Set<Int> {
         switch count {
