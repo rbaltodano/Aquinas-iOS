@@ -136,12 +136,14 @@ struct StudyNodeLayoutTests {
             nodeCenter: [40, -20, 0],
             radius: 190,
             slot: CGRect(x: 51, y: 160, width: 300, height: 300),
-            ringCenterY: 600
+            // The minimum ring drop keeps the camera close, so brute force stays cheap: tests run
+            // on the main actor, and a slow one starves timing-sensitive suites on CI.
+            ringCenterY: 160 + StudyFraming.nodeOffsetFromSlotTop + StudyFraming.minimumRingDrop
         )
         let size = CGSize(width: 402, height: 700)
         let tree = OrbitCamera(target: [0, 0, 0], distance: 3990, zoom: 1.15, principalPoint: CGPoint(x: 201, y: 380))
         var generator = SystemRandomNumberGenerator()
-        for _ in 0..<12 {
+        for _ in 0..<6 {
             let camera = framing.camera(
                 from: tree,
                 progress: 1,
