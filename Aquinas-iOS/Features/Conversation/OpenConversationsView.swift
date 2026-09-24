@@ -724,19 +724,15 @@ struct OpenConversationCard: View {
     }
 }
 
-/// Renders the short answer preview without exposing persisted `aq://` Markdown or the local
-/// model's `{{term}}` generation markers. Conversation cards are intentionally non-interactive;
-/// highlighted terms communicate the same Insight affordance while the card tap opens the full
-/// conversation.
+/// Renders the short answer preview as ordinary text, without exposing persisted `aq://` Markdown
+/// or the local model's `{{term}}` generation markers. Conversation cards are intentionally
+/// non-interactive; opening the card shows the full conversation.
 private struct ConversationCardAnswerText: View {
     let answer: String
 
     var body: some View {
         Text(
-            ConversationCardAnswerFormatting.attributedText(
-                from: answer,
-                highlightColor: AquinasTheme.Colors.lightGreen
-            )
+            ConversationCardAnswerFormatting.attributedText(from: answer)
         )
         .font(.custom("Figtree-Regular", size: 14))
         .foregroundColor(AquinasTheme.Colors.paragraphText)
@@ -749,7 +745,6 @@ private struct ConversationCardAnswerText: View {
 enum ConversationCardAnswerFormatting {
     enum Segment: Equatable {
         case plain(String)
-        case insight(String)
     }
 
     private static let insightMarkup = try! NSRegularExpression(
@@ -773,7 +768,7 @@ enum ConversationCardAnswerFormatting {
                 ? match.range(at: 1)
                 : match.range(at: 2)
             if let titleRange = Range(titleRange, in: visibleAnswer) {
-                segments.append(.insight(String(visibleAnswer[titleRange])))
+                appendPlain(String(visibleAnswer[titleRange]), to: &segments)
             }
             cursor = matchRange.upperBound
         }
@@ -782,18 +777,11 @@ enum ConversationCardAnswerFormatting {
         return segments
     }
 
-    static func attributedText(from answer: String, highlightColor: Color) -> AttributedString {
+    static func attributedText(from answer: String) -> AttributedString {
         var result = AttributedString()
         for segment in segments(from: answer) {
-            switch segment {
-            case .plain(let text):
-                result.append(AttributedString(text))
-            case .insight(let text):
-                var highlighted = AttributedString(text)
-                highlighted.foregroundColor = highlightColor
-                highlighted.underlineStyle = .single
-                result.append(highlighted)
-            }
+            guard case .plain(let text) = segment else { continue }
+            result.append(AttributedString(text))
         }
         return result
     }

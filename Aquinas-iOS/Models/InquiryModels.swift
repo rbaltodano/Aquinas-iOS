@@ -135,6 +135,52 @@ struct InquiryConversation: Identifiable, Codable, Equatable {
     }
 }
 
+/// Decides whether an otherwise new conversation contains user work worth retaining.
+/// Empty drafts are intentionally ephemeral, but text, uploads, Insight context, and explicit
+/// organization choices all make a conversation meaningful.
+enum ConversationDraftRetention {
+    static func shouldKeep(
+        _ conversation: InquiryConversation,
+        transientAttachedConcept: ConceptDefinition? = nil,
+        hasSavedInsights: Bool = false
+    ) -> Bool {
+        guard transientAttachedConcept == nil else { return true }
+        guard !conversation.isStudyTopic,
+              conversation.studyTopicID == nil,
+              !conversation.isPinned,
+              conversation.title == "New Conversation",
+              conversation.promotedInsightIDs.isEmpty,
+              !hasSavedInsights else {
+            return true
+        }
+
+        return conversation.branches.contains { branch in
+            branch.startingConcept != nil ||
+            branch.duplicatedResponse?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ||
+            branch.topQuestionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ||
+            !branch.topQuestionUploads.isEmpty ||
+            branch.bottomQuestionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ||
+            branch.attachedConcept != nil ||
+            branch.branchContextConcept != nil ||
+            branch.compactedContext?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ||
+            branch.hiddenPromptContext?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ||
+            branch.pinnedHeaderQuestion?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ||
+            branch.activeChatBlocks.contains(where: hasMeaningfulContent)
+        }
+    }
+
+    private static func hasMeaningfulContent(_ block: ChatBlock) -> Bool {
+        switch block {
+        case .text(let text):
+            !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .user(let text, let concept, let uploads):
+            !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+            concept != nil ||
+            !uploads.isEmpty
+        }
+    }
+}
+
 /// Atomic handoff from an Insight Tree into an existing conversation. A Study Topic origin is
 /// retained when present so canceling the quote can reopen that tree and restore its selection.
 struct InsightConversationQuoteRequest: Identifiable, Equatable {

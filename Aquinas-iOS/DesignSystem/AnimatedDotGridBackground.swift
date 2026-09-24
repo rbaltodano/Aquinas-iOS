@@ -61,13 +61,18 @@ struct AnimatedDotGridBackground: View, Animatable {
         )
     }
 
-    private var baseColor: Color {
+    private var baseColor: Color { Self.dotColor(for: colorScheme) }
+
+    private var opacityScale: Double { Self.dotOpacityScale(for: colorScheme) }
+
+    /// Shared with other dot fields (the Study floor) so they match this grid exactly.
+    static func dotColor(for colorScheme: ColorScheme) -> Color {
         colorScheme == .dark
             ? Color(hex: 0xB7AE78)
             : Color(hex: 0x4A321C)
     }
 
-    private var opacityScale: Double {
+    static func dotOpacityScale(for colorScheme: ColorScheme) -> Double {
         colorScheme == .dark ? 1.0 : 1.6
     }
 
@@ -147,7 +152,7 @@ struct AnimatedDotGridBackground: View, Animatable {
                         }
 
                         let opacity = min(
-                            (blobOpacity(
+                            (Self.blobOpacity(
                                 worldX: Double(wx),
                                 worldY: Double(wy),
                                 time: t
@@ -169,7 +174,8 @@ struct AnimatedDotGridBackground: View, Animatable {
         .allowsHitTesting(false)
     }
 
-    private func blobOpacity(worldX: Double, worldY: Double, time: Double) -> Double {
+    /// The drifting brightness field, in grid world units (16 per dot).
+    static func blobOpacity(worldX: Double, worldY: Double, time: Double) -> Double {
         let x = worldX * 0.022
         let y = worldY * 0.022
 

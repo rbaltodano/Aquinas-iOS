@@ -379,19 +379,15 @@ struct LiteRTProductionRuntimeTests {
     }
 
     @MainActor
-    @Test("Conversation card previews hide markers and retain highlighted terms")
-    func conversationCardPreviewFormatsInsightMarkup() {
+    @Test("Conversation card previews hide annotation markers and retain plain text")
+    func conversationCardPreviewFlattensInsightMarkup() {
         let segments = ConversationCardAnswerFormatting.segments(
             from: "Aquinas joins {{prudence}} to *[right reason](aq://right-reason)*."
         )
 
         #expect(
             segments == [
-                .plain("Aquinas joins "),
-                .insight("prudence"),
-                .plain(" to "),
-                .insight("right reason"),
-                .plain(".")
+                .plain("Aquinas joins prudence to right reason.")
             ]
         )
     }
@@ -405,11 +401,30 @@ struct LiteRTProductionRuntimeTests {
 
         #expect(
             segments == [
-                .plain("Aquinas distinguishes "),
-                .insight("essence"),
-                .plain(" from existence")
+                .plain("Aquinas distinguishes essence from existence")
             ]
         )
+    }
+
+    @Test("Untouched conversation drafts are discarded while insight context is retained")
+    func conversationDraftRetention() {
+        let emptyDraft = InquiryConversation()
+        #expect(!ConversationDraftRetention.shouldKeep(emptyDraft))
+
+        var insightDraft = InquiryConversation()
+        insightDraft.branches[0].attachedConcept = ConceptDefinition(
+            word: "Prudence",
+            partOfSpeech: "noun",
+            pronunciation: "",
+            meaning: "Practical wisdom.",
+            example: "",
+            definitions: []
+        )
+        #expect(ConversationDraftRetention.shouldKeep(insightDraft))
+
+        var textDraft = InquiryConversation()
+        textDraft.branches[0].topQuestionText = "How does prudence guide action?"
+        #expect(ConversationDraftRetention.shouldKeep(textDraft))
     }
 
     @Test("Generation guard rejects exact repetitive loops")

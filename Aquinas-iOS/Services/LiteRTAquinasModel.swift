@@ -1334,7 +1334,7 @@ private extension LiteRTAquinasModel {
         separate key-term list, or a thinking summary. Never echo input control markup. The
         requested double-curly Insight markers are the sole output-markup exception.
 
-        \(groundingReferences.isEmpty ? "Do not add Insight markers to this response." : insightAnnotationInstruction)
+        \(insightAnnotationInstruction)
 
         Finish the complete answer before stopping.
         """
