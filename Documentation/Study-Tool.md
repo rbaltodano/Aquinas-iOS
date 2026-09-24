@@ -7,6 +7,9 @@ the user's place in the Insight Tree. It is not a separate screen with a copy of
 tree canvas moves its own camera into a 3D view of the node the user was looking at, fades the
 rest of the tree, and moves back on exit.
 
+A short [demo video](Screenshots/study-3d-demo.mp4) shows entering Study, rotating, hovering,
+and exiting.
+
 ## Entry and exit
 
 1. The user hovers a Node Concept or an Insight in the tree and selects **Study**

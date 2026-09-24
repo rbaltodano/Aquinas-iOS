@@ -49,11 +49,12 @@ working through questions of faith, meaning, truth, or human flourishing.
   <img src="Documentation/Screenshots/home-dashboard.jpg" alt="Aquinas Home dashboard" width="23%">
   <img src="Documentation/Screenshots/conversation-ecumenical-councils.jpg" alt="Aquinas conversation with annotated Insights" width="23%">
   <img src="Documentation/Screenshots/insight-tree-church-doctrine-authority.jpg" alt="Aquinas Insight Tree" width="23%">
-  <img src="Documentation/Screenshots/study-branch.jpg" alt="Aquinas Study mode Branch tool" width="23%">
+  <a href="Documentation/Screenshots/study-3d-demo.mp4"><img src="Documentation/Screenshots/study-3d.jpg" alt="Aquinas Study mode showing a Node Concept and its Insights in 3D" width="23%"></a>
 </p>
 
 From left to right: the Home dashboard, a source-oriented conversation with contextual Insights,
-the Insight Tree, and focused Study mode.
+the Insight Tree, and Study mode, which shows a Node Concept and its Insights in 3D (select it for
+a short [demo video](Documentation/Screenshots/study-3d-demo.mp4)).
 
 ## A note on privacy and current development
 
