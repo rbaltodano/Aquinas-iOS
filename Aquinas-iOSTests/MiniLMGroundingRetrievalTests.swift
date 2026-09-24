@@ -2,10 +2,23 @@ import Foundation
 import Testing
 @testable import Aquinas_iOS
 
+/// The MiniLM model and grounding export live in the gitignored `LocalGrounding/` folder, so a
+/// clean checkout (such as CI) builds without them. Suites that need the real assets use this to
+/// skip instead of failing on `resourceMissing`.
+enum BundledGroundingAssets {
+    static var areAvailable: Bool {
+        (Bundle.main.url(forResource: "MiniLM", withExtension: "mlmodelc", subdirectory: "LocalGrounding")
+            ?? Bundle.main.url(forResource: "MiniLM", withExtension: "mlmodelc")) != nil
+    }
+}
+
 /// End-to-end checks against the real bundled 48k-passage export, covering the three failure modes
 /// a measured audit of that corpus turned up. These assert retrieval *correctness*, not merely that
 /// retrieval returns rows — the weaker bar that originally let all three ship.
-@Suite("MiniLM grounding retrieval")
+@Suite(
+    "MiniLM grounding retrieval",
+    .enabled(if: BundledGroundingAssets.areAvailable, "LocalGrounding assets are not bundled")
+)
 struct MiniLMGroundingRetrievalTests {
     @Test("Council questions ground in curated facts, not Roman history")
     func councilQuestionAvoidsClassicalHistory() throws {

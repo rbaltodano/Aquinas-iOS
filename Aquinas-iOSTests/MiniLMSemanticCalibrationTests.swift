@@ -2,7 +2,10 @@ import Foundation
 import Testing
 @testable import Aquinas_iOS
 
-@Suite("MiniLM semantic calibration")
+@Suite(
+    "MiniLM semantic calibration",
+    .enabled(if: BundledGroundingAssets.areAvailable, "LocalGrounding assets are not bundled")
+)
 struct MiniLMSemanticCalibrationTests {
     private enum Judgment: String, CaseIterable {
         case sameNode

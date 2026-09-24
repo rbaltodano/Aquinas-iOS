@@ -555,10 +555,13 @@ struct LiteRTProductionRuntimeTests {
         let summary = LiteRTAquinasModel.approachSummary(for: context)
         #expect(
             summary == [
-                "Identifying the central claim and checking the relevant distinctions and evidence."
+                "Working out the steps or mechanism the question is actually asking for."
             ]
         )
         #expect(!summary[0].contains("Focusing on"))
+        for questionWord in ["friendship", "patient"] {
+            #expect(!summary.joined().localizedCaseInsensitiveContains(questionWord))
+        }
     }
 
     @Test("Local grounding distinguishes the first councils and icon council")

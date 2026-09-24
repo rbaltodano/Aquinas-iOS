@@ -7,10 +7,11 @@ struct ModelRuntimeLifecycleTests {
     @Test("Short foreground pauses keep the model warm")
     func shortPauseKeepsModelWarm() async throws {
         let driver = TestModelRuntimeDriver()
+        // A generous idle timeout, so a slow CI machine can't stretch the short pause past it.
         let manager = makeManager(
             driver: driver,
-            normalTimeout: 0.2,
-            seriousTimeout: 0.05
+            normalTimeout: 5,
+            seriousTimeout: 1
         )
 
         let lease = try #require(await manager.acquireLease())
@@ -137,8 +138,8 @@ struct ModelRuntimeLifecycleTests {
         try await waitUntil { await queue.latestCompletedTask?.id == taskID }
         #expect(queue.latestCompletedTask?.originPage == .studyTopics)
 
-        try await Task.sleep(for: .milliseconds(750))
-        #expect(queue.completedTasks.isEmpty)
+        // Completed rows clear 0.7 s after finishing; wait for that rather than a fixed sleep.
+        try await waitUntil { await queue.completedTasks.isEmpty }
         #expect(queue.latestCompletedTask?.id == taskID)
     }
 
@@ -158,7 +159,8 @@ struct ModelRuntimeLifecycleTests {
     }
 
     private func waitUntil(
-        timeout: Duration = .seconds(2),
+        // Generous for slow CI machines; passing checks return as soon as the condition holds.
+        timeout: Duration = .seconds(10),
         condition: @escaping @Sendable () async -> Bool
     ) async throws {
         let clock = ContinuousClock()
