@@ -652,6 +652,12 @@ struct InsightTreeView: View {
     }
 
     private func treeRequestObservers<Content: View>(_ content: Content) -> some View {
+        treeNavigationObservers(treeContentObservers(content))
+    }
+
+    /// Insight, bookmark, and selection-request observers (half of `treeRequestObservers`,
+    /// split again for Xcode 26.6's type checker).
+    private func treeContentObservers<Content: View>(_ content: Content) -> some View {
         content
         .onChange(of: insights) { oldValue, newValue in
             viewModel.updateInsights(newValue, promotedInsightIDs: promotedInsightIDs)
@@ -717,6 +723,11 @@ struct InsightTreeView: View {
         .onChange(of: nodeSelectionRequest) { _, _ in
             restoreRequestedNodeSelection()
         }
+    }
+
+    /// Search, persistence, and lifecycle observers (the other half).
+    private func treeNavigationObservers<Content: View>(_ content: Content) -> some View {
+        content
         .onChange(of: inquireConnectionRequest) { _, _ in
             performInquireConnection()
         }
