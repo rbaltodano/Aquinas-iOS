@@ -108,8 +108,12 @@ struct ModelRuntimeLifecycleTests {
         let attempts = TestAttemptCounter()
 
         queue.enqueue(kind: .refreshQuestionOfTheDay, priority: .background) {
-            await attempts.started()
-            try? await Task.sleep(for: .milliseconds(120))
+            // The first attempt stays busy until backgrounding preempts it; the retry finishes
+            // at once. A fixed short sleep let slow CI machines finish the first attempt
+            // before the test could background the app.
+            if await attempts.started() == 1 {
+                try? await Task.sleep(for: .seconds(30))
+            }
             guard !Task.isCancelled else { return }
             await attempts.completed()
         }
@@ -191,8 +195,11 @@ private actor TestAttemptCounter {
     private(set) var startCount = 0
     private(set) var completionCount = 0
 
-    func started() {
+    /// Records a start and returns which attempt this is (1 for the first).
+    @discardableResult
+    func started() -> Int {
         startCount += 1
+        return startCount
     }
 
     func completed() {
