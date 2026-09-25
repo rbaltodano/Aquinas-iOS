@@ -306,24 +306,19 @@ struct StudyTopicsView: View {
             // Single morphing nav button that floats above both layers.
             VStack {
                 HStack(spacing: 8) {
-                    AquinasNavButton(
-                        // In Study the Back becomes the menu, with an Exit beside it.
-                        isDetailVisible: selectedTopicID != nil && !topicCanvasMode.isCanvasStudyMode,
-                        onMenuTap: onOpenMenu,
-                        onBackTap: {
+                    AquinasNavButton(onMenuTap: onOpenMenu)
+                    if selectedTopicID != nil && !topicCanvasMode.isCanvasStudyMode {
+                        NavBackCapsuleButton(title: "Study Topics") {
                             withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
                                 if topicCanvasMode.isTopicCanvasVisible {
-                                    if topicCanvasMode.isCanvasStudyMode {
-                                        topicCanvasMode.canvasStudyExitRequest += 1
-                                    } else {
-                                        topicCanvasMode.isTopicCanvasVisible = false
-                                    }
+                                    topicCanvasMode.isTopicCanvasVisible = false
                                 } else {
                                     selectedTopicID = nil
                                 }
                             }
                         }
-                    )
+                        .transition(.studyExitGrow)
+                    }
                     if topicCanvasMode.isCanvasStudyMode {
                         StudyExitButton {
                             withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
@@ -335,6 +330,7 @@ struct StudyTopicsView: View {
                     Spacer()
                 }
                 .animation(.spring(response: 0.42, dampingFraction: 0.84), value: topicCanvasMode.isCanvasStudyMode)
+                .animation(.spring(response: 0.42, dampingFraction: 0.84), value: selectedTopicID)
                 .padding(.horizontal, 24)
                 .padding(.top, 24)
                 Spacer()
@@ -1511,12 +1507,13 @@ struct StudyTopicDetailView: View {
             createConceptRequest: canvasMode.canvasCreateConceptRequest,
             studyRequest: canvasMode.canvasStudyRequest,
             studyExitRequest: canvasMode.canvasStudyExitRequest,
+            studyToolsToggleRequest: canvasMode.canvasStudyToolsToggleRequest,
             studyBranchCount: canvasMode.canvasStudyBranchCount,
             onStudyModeChange: { canvasMode.isCanvasStudyMode = $0 },
+            onStudyToolsActiveChange: { canvasMode.isCanvasStudyToolsActive = $0 },
             onStudyBranchCountChange: { canvasMode.canvasStudyBranchCount = $0 },
             restoreSelectedInsightID: restoredTreeInsightID,
             promotedInsightIDs: canvasMode.promotedCanvasInsightIDs,
-            onClose: closeInsightTree,
             onRemoveInsight: removeTopicTreeInsight,
             onRestoreInsight: restoreTopicTreeInsight,
             onForkInsight: forkTopicInsight,
@@ -1604,6 +1601,8 @@ struct StudyTopicDetailView: View {
             onMidpointConcepts: { canvasMode.canvasMidpointEnterRequest += 1 },
             isMidpointMode: canvasMode.isCanvasMidpointMode,
             isStudyMode: canvasMode.isCanvasStudyMode,
+            isStudyToolsActive: canvasMode.isCanvasStudyToolsActive,
+            onToggleStudyTools: { canvasMode.canvasStudyToolsToggleRequest += 1 },
             studyBranchCount: canvasMode.canvasStudyBranchCount,
             onStudyBranchCountChange: { canvasMode.canvasStudyBranchCount = $0 },
             isCanvasInsightLoading: canvasMode.isCanvasInsightGenerating,

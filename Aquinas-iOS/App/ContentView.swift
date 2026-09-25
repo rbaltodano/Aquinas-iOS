@@ -220,6 +220,7 @@ struct ContentView: View {
     // Set while a Study Topic's detail view is open, so the global edge-swipe
     // gesture below yields to that screen's own swipe-to-go-back gesture.
     @State private var isStudyTopicDetailVisible: Bool = false
+    @State private var isInsightLibraryVisible: Bool = false
     @State private var isSettingsDetailVisible: Bool = false
     @State private var isConversationCanvasMode: Bool = false
     @State private var globalInsightsContextCardState = ContextCardState()
@@ -271,6 +272,8 @@ struct ContentView: View {
     @State private var globalInsightStudyRequest: Int = 0
     @State private var globalInsightStudyExitRequest: Int = 0
     @State private var globalInsightIsStudyMode: Bool = false
+    @State private var globalInsightStudyToolsToggleRequest: Int = 0
+    @State private var globalInsightStudyToolsActive: Bool = false
     @State private var globalInsightStudyBranchCount: Int = 2
     @State private var globalInsightPromotedIDs: [UUID] =
         GlobalInsightPromotedIDsStore.load()
@@ -521,6 +524,8 @@ struct ContentView: View {
                 selectedCanvasItemCount: globalInsightSelectedItemCount,
                 isMidpointMode: globalInsightIsMidpointMode,
                 isStudyMode: globalInsightIsStudyMode,
+                isStudyToolsActive: globalInsightStudyToolsActive,
+                onToggleStudyTools: { globalInsightStudyToolsToggleRequest += 1 },
                 studyBranchCount: globalInsightStudyBranchCount,
                 onStudyBranchCountChange: { globalInsightStudyBranchCount = $0 },
                 isCanvasInsightLoading: globalInsightIsGenerating,
@@ -631,8 +636,10 @@ struct ContentView: View {
             createConceptRequest: globalInsightCreateConceptRequest,
             studyRequest: globalInsightStudyRequest,
             studyExitRequest: globalInsightStudyExitRequest,
+            studyToolsToggleRequest: globalInsightStudyToolsToggleRequest,
             studyBranchCount: globalInsightStudyBranchCount,
             onStudyModeChange: { globalInsightIsStudyMode = $0 },
+            onStudyToolsActiveChange: { globalInsightStudyToolsActive = $0 },
             onStudyBranchCountChange: { globalInsightStudyBranchCount = $0 },
             restoreSelectedInsightID: globalInsightRestoreSelectionID,
             restoreSelectedNodeID: globalInsightHighlightedNodeID,
@@ -766,6 +773,7 @@ struct ContentView: View {
         CurrentConversationView(
             onOpenMenu: presentGlobalSideMenu,
             onCanvasModeChange: { isConversationCanvasMode = $0 },
+            onInsightLibraryVisibilityChange: { isInsightLibraryVisible = $0 },
             onRequestConversationPage: {
                 activePage = .conversation
             },
@@ -1008,7 +1016,8 @@ struct ContentView: View {
                                     responseFont: $responseFont,
                                     conversationPersonality: $conversationPersonality,
                                     onOpenMenu: presentGlobalSideMenu,
-                                    onDetailVisibilityChange: { isSettingsDetailVisible = $0 }
+                                    onDetailVisibilityChange: { isSettingsDetailVisible = $0 },
+                                    onClearInsightTree: clearInsightTree
                                 )
                             case .insights:
                                 insightTreePage
@@ -1088,7 +1097,9 @@ struct ContentView: View {
                         .opacity(isPageContentVisible ? 1 : 0)
                         .offset(y: pageContentOffsetY)
                     }
-                    .background(AquinasTheme.Colors.activeInquiryChrome)
+                    // Matches the pages' canvas so the slide offset during page transitions
+                    // doesn't reveal a differently tinted strip behind the page.
+                    .background(canvasColor)
                     // Rendered here — outside the fade/offset applied to the two branches above —
                     // so the Model Controls bar stays put and simply swaps its own content while
                     // page transitions play, instead of animating (and briefly disappearing) with
@@ -1105,6 +1116,7 @@ struct ContentView: View {
                     activePage: activePage,
                     isStudyTopicDetailVisible: isStudyTopicDetailVisible,
                     isSettingsDetailVisible: isSettingsDetailVisible,
+                    isBlocked: isInsightLibraryVisible,
                     onBeginDrag: dismissKeyboard,
                     onDismiss: { dismissGlobalSideMenu() },
                     menu: globalSideMenu
@@ -1507,6 +1519,16 @@ struct ContentView: View {
         scheduleDailyQuestionRefreshIfNeeded()
     }
 
+    /// Clears in-memory state first so the change observers persist empty values, then wipes
+    /// every stored Insight Tree artifact.
+    private func clearInsightTree() {
+        isGlobalTreeUpdatePromptVisible = false
+        globalInsightPromotedIDs = []
+        globalTreeInsights = []
+        collectedDefinitions = []
+        InsightTreeReset.clearPersistedData()
+    }
+
     private func handleCollectedDefinitionsChange(_ definitions: [ConceptDefinition]) {
         InsightLibraryStore.save(definitions)
         guard activePage == .insights,
@@ -1857,6 +1879,8 @@ private struct GlobalInsightsModelControls: View {
     let selectedCanvasItemCount: Int
     let isMidpointMode: Bool
     var isStudyMode: Bool = false
+    var isStudyToolsActive: Bool = false
+    var onToggleStudyTools: () -> Void = {}
     var studyBranchCount: Int = 2
     var onStudyBranchCountChange: (Int) -> Void = { _ in }
     let isCanvasInsightLoading: Bool
@@ -1920,6 +1944,8 @@ private struct GlobalInsightsModelControls: View {
             onMidpointConcepts: onMidpointConcepts,
             isMidpointMode: isMidpointMode,
             isStudyMode: isStudyMode,
+            isStudyToolsActive: isStudyToolsActive,
+            onToggleStudyTools: onToggleStudyTools,
             studyBranchCount: studyBranchCount,
             onStudyBranchCountChange: onStudyBranchCountChange,
             isCanvasInsightLoading: isCanvasInsightLoading,
@@ -1994,6 +2020,7 @@ private struct SideMenuDragPresentation: ViewModifier {
     let activePage: AppPage
     let isStudyTopicDetailVisible: Bool
     let isSettingsDetailVisible: Bool
+    let isBlocked: Bool
     let onBeginDrag: () -> Void
     let onDismiss: () -> Void
     let menu: AnyView
@@ -2028,7 +2055,7 @@ private struct SideMenuDragPresentation: ViewModifier {
     private var dragGesture: some Gesture {
         DragGesture(minimumDistance: 10, coordinateSpace: .local)
             .onChanged { value in
-                guard !isPresented,
+                guard !isPresented, !isBlocked,
                       !(activePage == .studyTopics && isStudyTopicDetailVisible),
                       !(activePage == .settings && isSettingsDetailVisible),
                       abs(value.translation.width) > abs(value.translation.height) else { return }
@@ -2087,6 +2114,7 @@ private extension View {
         activePage: AppPage,
         isStudyTopicDetailVisible: Bool,
         isSettingsDetailVisible: Bool,
+        isBlocked: Bool,
         onBeginDrag: @escaping () -> Void,
         onDismiss: @escaping () -> Void,
         menu: AnyView
@@ -2096,6 +2124,7 @@ private extension View {
             activePage: activePage,
             isStudyTopicDetailVisible: isStudyTopicDetailVisible,
             isSettingsDetailVisible: isSettingsDetailVisible,
+            isBlocked: isBlocked,
             onBeginDrag: onBeginDrag,
             onDismiss: onDismiss,
             menu: menu

@@ -17,6 +17,7 @@ duplicate architecture specifications.
 | LiteRT runtime or backend recovery | [`Documentation/Model-Runtime.md`](Documentation/Model-Runtime.md) |
 | Builds, tests, device work, or Figma | [`Documentation/Development-Workflow.md`](Documentation/Development-Workflow.md) |
 | Study mode | [`Documentation/Study-Tool.md`](Documentation/Study-Tool.md) |
+| Gemma 4 E4B QAT migration | [`Documentation/Gemma4-E4B-QAT-Plan.md`](Documentation/Gemma4-E4B-QAT-Plan.md), then its [progress ledger](Documentation/Gemma4-E4B-QAT-Progress.md) |
 
 ## Non-negotiable rules
 

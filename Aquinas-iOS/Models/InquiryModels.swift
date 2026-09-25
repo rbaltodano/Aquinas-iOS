@@ -139,12 +139,41 @@ struct InquiryConversation: Identifiable, Codable, Equatable {
 /// Empty drafts are intentionally ephemeral, but text, uploads, Insight context, and explicit
 /// organization choices all make a conversation meaningful.
 enum ConversationDraftRetention {
+    /// A conversation started from a pinned prompt (Question of the Day, Today in History) that
+    /// the user left before typing anything. The card that started it stays on Home, so the draft
+    /// is recreated on demand rather than restored as a special empty-prompt conversation.
+    static func isUntouchedPromptDraft(_ conversation: InquiryConversation) -> Bool {
+        guard !conversation.isStudyTopic,
+              conversation.studyTopicID == nil,
+              !conversation.isPinned,
+              conversation.promotedInsightIDs.isEmpty,
+              conversation.branches.count == 1,
+              let branch = conversation.branches.first,
+              let pinned = branch.pinnedHeaderQuestion?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !pinned.isEmpty,
+              conversation.title == pinned || conversation.title == "New Conversation" else {
+            return false
+        }
+        return branch.parentBranchID == nil
+            && branch.startingConcept == nil
+            && branch.duplicatedResponse == nil
+            && !branch.topQuestionSubmitted
+            && branch.activeChatBlocks.isEmpty
+            && branch.topQuestionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && branch.topQuestionUploads.isEmpty
+            && branch.bottomQuestionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && branch.attachedConcept == nil
+            && branch.branchContextConcept == nil
+            && branch.compactedContext == nil
+    }
+
     static func shouldKeep(
         _ conversation: InquiryConversation,
         transientAttachedConcept: ConceptDefinition? = nil,
         hasSavedInsights: Bool = false
     ) -> Bool {
         guard transientAttachedConcept == nil else { return true }
+        if !hasSavedInsights, isUntouchedPromptDraft(conversation) { return false }
         guard !conversation.isStudyTopic,
               conversation.studyTopicID == nil,
               !conversation.isPinned,

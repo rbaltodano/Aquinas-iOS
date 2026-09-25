@@ -20,6 +20,7 @@ struct SettingsView: View {
     @Binding var conversationPersonality: ConversationPersonality
     var onOpenMenu: () -> Void
     var onDetailVisibilityChange: (Bool) -> Void = { _ in }
+    var onClearInsightTree: () -> Void = {}
 
     @State private var path: [SettingsRoute] = []
 
@@ -40,7 +41,8 @@ struct SettingsView: View {
                         inputFont: $inputFont,
                         responseFont: $responseFont,
                         conversationPersonality: $conversationPersonality,
-                        onReset: resetSettings
+                        onReset: resetSettings,
+                        onClearInsightTree: onClearInsightTree
                     )
                     .navigationBarBackButtonHidden(true)
                     .toolbar(.hidden, for: .navigationBar)
@@ -49,15 +51,17 @@ struct SettingsView: View {
             }
             .background(AquinasTheme.Colors.canvas)
 
-            AquinasNavButton(
-                isDetailVisible: !path.isEmpty,
-                backLabel: "Settings",
-                onMenuTap: onOpenMenu,
-                onBackTap: {
-                    guard !path.isEmpty else { return }
-                    path.removeLast()
+            HStack(spacing: 8) {
+                AquinasNavButton(onMenuTap: onOpenMenu)
+                if !path.isEmpty {
+                    NavBackCapsuleButton(title: "Settings") {
+                        guard !path.isEmpty else { return }
+                        path.removeLast()
+                    }
+                    .transition(.studyExitGrow)
                 }
-            )
+            }
+            .animation(.spring(response: 0.42, dampingFraction: 0.84), value: path.isEmpty)
             .padding(.top, 24)
             .padding(.leading, 24)
             .zIndex(2)
@@ -232,6 +236,7 @@ private struct SettingsDestinationView: View {
     @Binding var responseFont: ConversationFontOption
     @Binding var conversationPersonality: ConversationPersonality
     let onReset: () -> Void
+    var onClearInsightTree: () -> Void = {}
 
     var body: some View {
         switch route {
@@ -242,7 +247,7 @@ private struct SettingsDestinationView: View {
         case .notifications:
             NotificationSettingsView()
         case .privacyAndData:
-            PrivacyAndDataSettingsView()
+            PrivacyAndDataSettingsView(onClearInsightTree: onClearInsightTree)
         case .modelBehavior:
             ModelBehaviorSettingsView(
                 userName: $userName,
@@ -459,6 +464,8 @@ private struct PrivacyAndDataSettingsView: View {
     @State private var isExportingConversations = false
     @State private var isImportingConversations = false
     @State private var dataTransferError: String?
+    @State private var showsClearInsightTreeConfirmation = false
+    var onClearInsightTree: () -> Void = {}
 
     var body: some View {
         SettingsDetailScaffold(title: "Privacy & Data") {
@@ -488,11 +495,31 @@ private struct PrivacyAndDataSettingsView: View {
                     }
                     .buttonStyle(.plain)
 
+                    Button(role: .destructive) {
+                        showsClearInsightTreeConfirmation = true
+                    } label: {
+                        Text("Clear Insight Tree")
+                            .font(.custom("Figtree-Bold", size: 12))
+                            .foregroundStyle(AquinasTheme.Colors.accentRed)
+                            .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+
                     SettingsUnavailableActionRow(title: "Delete All Conversations", isDestructive: true)
                     SettingsUnavailableActionRow(title: "Delete Memories", isDestructive: true)
                     SettingsUnavailableActionRow(title: "Delete All App Data", isDestructive: true)
                 }
             }
+        }
+        .confirmationDialog(
+            "Clear the Insight Tree?",
+            isPresented: $showsClearInsightTreeConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Clear Insight Tree", role: .destructive, action: onClearInsightTree)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes every saved Insight and the whole tree on this device. Conversations are kept. This can’t be undone. Fully quit and reopen Aquinas afterward.")
         }
         .fileExporter(
             isPresented: $isExportingConversations,

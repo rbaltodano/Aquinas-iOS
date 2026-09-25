@@ -71,6 +71,8 @@ final class ConversationDefinitionState {
 struct CurrentConversationView: View {
     var onOpenMenu: () -> Void = {}
     var onCanvasModeChange: (Bool) -> Void = { _ in }
+    /// Reports whether the Insight drawer is up so the shell can ignore swipes that land on it.
+    var onInsightLibraryVisibilityChange: (Bool) -> Void = { _ in }
     var onRequestConversationPage: () -> Void = {}
     var onReturnToStudyTopicTree: (StudyTopicTreeSelectionRequest) -> Void = { _ in }
     /// Mirrors `onReturnToStudyTopicTree` for an Insight quoted from the global Insight Tree
@@ -791,8 +793,10 @@ struct CurrentConversationView: View {
 
     @ViewBuilder
     private var topicCanvasLayer: some View {
-        InsightTreeView(
-            insights: conversationInsights,
+        // Only bookmarked Insights belong in the tree; un-bookmarking removes the node.
+        let savedIDs = Set(collectedDefinitions.map(\.id))
+        return InsightTreeView(
+            insights: conversationInsights.filter { savedIDs.contains($0.id) },
             conversationID: activeConversationID,
             selectionRequest: canvasMode.canvasSelectionRequest,
             persistedTreeRefreshRequest: persistedTreeRefreshRequest,
@@ -801,11 +805,12 @@ struct CurrentConversationView: View {
             createConceptRequest: canvasMode.canvasCreateConceptRequest,
             studyRequest: canvasMode.canvasStudyRequest,
             studyExitRequest: canvasMode.canvasStudyExitRequest,
+            studyToolsToggleRequest: canvasMode.canvasStudyToolsToggleRequest,
             studyBranchCount: canvasMode.canvasStudyBranchCount,
             onStudyModeChange: { canvasMode.isCanvasStudyMode = $0 },
+            onStudyToolsActiveChange: { canvasMode.isCanvasStudyToolsActive = $0 },
             onStudyBranchCountChange: { canvasMode.canvasStudyBranchCount = $0 },
             promotedInsightIDs: canvasMode.promotedCanvasInsightIDs,
-            onClose: closeTopicCanvas,
             onRemoveInsight: removeConversationInsight,
             onRestoreInsight: restoreConversationInsight,
             onForkInsight: forkCanvasInsight,
@@ -980,6 +985,8 @@ struct CurrentConversationView: View {
             onMidpointConcepts: { canvasMode.canvasMidpointEnterRequest += 1 },
             isMidpointMode: canvasMode.isCanvasMidpointMode,
             isStudyMode: canvasMode.isCanvasStudyMode,
+            isStudyToolsActive: canvasMode.isCanvasStudyToolsActive,
+            onToggleStudyTools: { canvasMode.canvasStudyToolsToggleRequest += 1 },
             studyBranchCount: canvasMode.canvasStudyBranchCount,
             onStudyBranchCountChange: { canvasMode.canvasStudyBranchCount = $0 },
             isCanvasInsightLoading: canvasMode.isCanvasInsightGenerating,
@@ -1100,6 +1107,10 @@ struct CurrentConversationView: View {
             .presentationDragIndicator(.visible)
             .presentationBackground(AquinasTheme.Colors.canvas)
         }
+        .onChange(of: isInsightLibraryOpen) { _, isOpen in
+            onInsightLibraryVisibilityChange(isOpen)
+        }
+        .onDisappear { onInsightLibraryVisibilityChange(false) }
     }
 
     /// Split out of `body` so each piece stays small enough to type-check quickly; the
@@ -1155,7 +1166,14 @@ struct CurrentConversationView: View {
         // MARK: - Persistence / conversation management
         .onAppear {
             let loadedSnapshot = CurrentConversationsStore.load()
-            if let snapshot = loadedSnapshot, !snapshot.conversations.isEmpty {
+            // Untouched Question of the Day drafts saved by earlier builds are dropped rather
+            // than restored; restoring one froze the app on open.
+            let cleanedSnapshot = loadedSnapshot.map { snapshot in
+                var cleaned = snapshot
+                cleaned.conversations.removeAll { ConversationDraftRetention.isUntouchedPromptDraft($0) }
+                return cleaned
+            }
+            if let snapshot = cleanedSnapshot, !snapshot.conversations.isEmpty {
                 conversations = snapshot.conversations
                 // `openModelTaskPage` (tapping a task in the Model Tasks popup from a different
                 // page) sets `requestedConversationID` *before* this view is even created, so
@@ -1196,7 +1214,7 @@ struct CurrentConversationView: View {
             }
             studyTopics = StudyTopicStore.load()
             publishShellMenuState()
-            scrollToBottomAfterLayout()
+            scrollToEndOfConversationAfterLayout()
 
             // A new-conversation request may have been fired while this view was
             // unmounted (e.g. from the Study Topics page). Handle it now so the
@@ -1324,7 +1342,7 @@ struct CurrentConversationView: View {
                 }
 
                 // Left-swipe trigger (UIKit-backed, passthrough)
-                if isPageVisible && !canvasMode.isTopicCanvasVisible {
+                if isPageVisible && !canvasMode.isTopicCanvasVisible && !isInsightLibraryOpen {
                     RightEdgeCanvasSwipeTrigger {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         enterCanvasMode()
@@ -2066,7 +2084,7 @@ struct CurrentConversationView: View {
         modelTasksPopupState.reset()
         publishShellMenuState()
         persistConversations()
-        scrollToBottomAfterLayout()
+        scrollToEndOfConversationAfterLayout()
         scheduleInsightTreeUpdateAfterIdle()
     }
 
@@ -2141,7 +2159,12 @@ struct CurrentConversationView: View {
 
     /// Save current work, then create a fresh conversation and make it active.
     private func startNewConversation() {
-        resetModelTaskPipeline(conversationID: activeConversationID)
+        // Starting a new conversation is navigation, not cancellation: jobs already queued for
+        // the conversation being left keep running and route their results back to it. Only the
+        // per-conversation UI state is reset for the fresh conversation.
+        pendingResponseCount = 0
+        definitionState.reset()
+        modelTasksPopupState.reset()
         removeActiveConversationIfEmpty()
         // Consume any pending topic tag set by a "New Conversation inside topic" action.
         let topicID = newConversationTopicID
@@ -2216,6 +2239,16 @@ struct CurrentConversationView: View {
         publishShellMenuState()
         persistConversations()
         scrollToTopAfterLayout()
+    }
+
+    /// An untouched draft (e.g. an unanswered Question of the Day) is one viewport-tall prompt
+    /// with a long scroll runway beneath it. Restoring it must land on the prompt, not the runway.
+    private func scrollToEndOfConversationAfterLayout() {
+        if isNewConversationPromptMode {
+            scrollToTopAfterLayout()
+        } else {
+            scrollToBottomAfterLayout()
+        }
     }
 
     private func scrollToBottomAfterLayout() {

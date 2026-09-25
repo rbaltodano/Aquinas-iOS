@@ -427,6 +427,18 @@ struct LiteRTProductionRuntimeTests {
         #expect(ConversationDraftRetention.shouldKeep(textDraft))
     }
 
+    @Test("An unanswered Question of the Day draft is discarded, but typed text is kept")
+    func unansweredQuestionOfTheDayDraftIsDiscarded() {
+        var draft = InquiryConversation(title: "What is prudence?")
+        draft.branches[0].pinnedHeaderQuestion = "What is prudence?"
+        draft.branches[0].hiddenPromptContext = "<question of the day>"
+        #expect(ConversationDraftRetention.isUntouchedPromptDraft(draft))
+        #expect(!ConversationDraftRetention.shouldKeep(draft))
+
+        draft.branches[0].topQuestionText = "Practical wisdom."
+        #expect(ConversationDraftRetention.shouldKeep(draft))
+    }
+
     @Test("Generation guard rejects exact repetitive loops")
     func generationGuardRejectsRepetitiveLoops() {
         let sentence = "Prudence directs practical reason toward the right action in a concrete circumstance"

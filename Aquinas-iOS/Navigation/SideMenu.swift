@@ -62,6 +62,39 @@ struct StudyExitButton: View {
     }
 }
 
+/// Back capsule shown beside the side-menu button on detail screens (chevron + parent title),
+/// styled like `StudyExitButton`.
+struct NavBackCapsuleButton: View {
+    let title: String
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(AquinasTheme.Colors.darkGreen)
+                    .frame(width: 14, height: 14)
+                Text(title)
+                    .font(AquinasTheme.Typography.uiSubheading)
+                    .foregroundColor(AquinasTheme.Colors.paragraphText)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .padding(.horizontal, 19)
+            .frame(height: 48)
+            .background(AquinasTheme.Colors.canvasSecondary)
+            .clipShape(Capsule())
+            .overlay(
+                Capsule()
+                    .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Back to \(title)")
+    }
+}
+
 extension AnyTransition {
     /// The Exit capsule grows out of the side-menu button beside it.
     static var studyExitGrow: AnyTransition {
@@ -578,6 +611,7 @@ struct AquinasSideMenu: View, Equatable {
             runTitleEntrance()
         }
         .onChange(of: isPresented) { _, newValue in
+            if newValue { SideMenuEntrance.openedAt = Date() }
             runTitleEntrance()
         }
         // Give the slide transition its first frame before refreshing persisted
@@ -738,6 +772,16 @@ struct AquinasSideMenu: View, Equatable {
     }
 }
 
+/// Tracks when the panel last opened so rows the lazy stacks create while scrolling
+/// skip the entrance animation and only rows present at open time animate in.
+private enum SideMenuEntrance {
+    static var openedAt = Date.distantPast
+
+    static var isScrollRecycle: Bool {
+        Date().timeIntervalSince(openedAt) > 1.2
+    }
+}
+
 private struct SideMenuRow: View {
     let icon: String
     let title: String
@@ -793,8 +837,18 @@ private struct SideMenuRow: View {
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
-        .onAppear(perform: runEntrance)
+        .onAppear(perform: appearedInList)
         .onChange(of: isPresented) { oldValue, newValue in
+            runEntrance()
+        }
+    }
+
+    private func appearedInList() {
+        if isPresented, SideMenuEntrance.isScrollRecycle {
+            entranceRunID = UUID()
+            showsIcon = true
+            showsText = true
+        } else {
             runEntrance()
         }
     }
@@ -990,7 +1044,12 @@ private struct ConversationMenuRow: View {
         .offset(x: isVisible ? 0 : -10)
         .onAppear {
             isPinRevealed = conversation.isPinned
-            runEntrance()
+            if isPresented, SideMenuEntrance.isScrollRecycle {
+                entranceRunID = UUID()
+                isVisible = true
+            } else {
+                runEntrance()
+            }
         }
         .onChange(of: conversation.isPinned) { _, newValue in
             withAnimation(.spring(response: 0.40, dampingFraction: 0.78)) {
@@ -1130,7 +1189,14 @@ private struct StudyTopicMenuRow: View {
         }
         .opacity(isVisible ? 1 : 0)
         .offset(x: isVisible ? 0 : -10)
-        .onAppear(perform: runEntrance)
+        .onAppear {
+            if isPresented, SideMenuEntrance.isScrollRecycle {
+                entranceRunID = UUID()
+                isVisible = true
+            } else {
+                runEntrance()
+            }
+        }
         .onChange(of: isPresented) { _, newValue in
             isShowingLongPressFeedback = false
             runEntrance()
