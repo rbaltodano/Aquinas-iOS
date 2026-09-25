@@ -198,7 +198,7 @@ enum ConversationDraftRetention {
         }
     }
 
-    private static func hasMeaningfulContent(_ block: ChatBlock) -> Bool {
+    nonisolated private static func hasMeaningfulContent(_ block: ChatBlock) -> Bool {
         switch block {
         case .text(let text):
             !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty

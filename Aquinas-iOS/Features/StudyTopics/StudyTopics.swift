@@ -399,7 +399,7 @@ struct StudyTopicsView: View {
                 var added: [UploadedFile] = []
                 for item in newItems {
                     if let data = try? await item.loadTransferable(type: Data.self),
-                       UIImage(data: data) != nil {
+                       UploadedFile.isImageData(data) {
                         added.append(UploadedFile(
                             name: "Photo",
                             imageData: data,
@@ -429,7 +429,7 @@ struct StudyTopicsView: View {
                     let hasAccess = url.startAccessingSecurityScopedResource()
                     defer { if hasAccess { url.stopAccessingSecurityScopedResource() } }
                     let data = try? Data(contentsOf: url)
-                    let imageData = data.flatMap { UIImage(data: $0) == nil ? nil : $0 }
+                    let imageData = data.flatMap { UploadedFile.isImageData($0) ? $0 : nil }
                     added.append(UploadedFile(
                         name: url.lastPathComponent,
                         imageData: imageData,

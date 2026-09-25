@@ -11,29 +11,6 @@ import PhotosUI
 
 // MARK: - Shared Models
 
-/// File/image selected before submitting a question.
-nonisolated struct UploadedFile: Identifiable, Equatable, Hashable, Codable {
-    let id: UUID
-    let name: String
-    let imageData: Data?
-    let rotationDegrees: Double
-
-    init(id: UUID = UUID(), name: String, imageData: Data?, rotationDegrees: Double) {
-        self.id = id
-        self.name = name
-        self.imageData = imageData
-        self.rotationDegrees = rotationDegrees
-    }
-
-    static func == (lhs: UploadedFile, rhs: UploadedFile) -> Bool {
-        lhs.id == rhs.id
-    }
-
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-}
-
 nonisolated struct InsightDefinition: Identifiable, Equatable, Hashable, Codable, Sendable {
     let id: UUID
     let context: String
@@ -1140,7 +1117,7 @@ struct ContentView: View {
                                 }
 
                                 let data = try? Data(contentsOf: url)
-                                let imageData = data.flatMap { UIImage(data: $0) == nil ? nil : $0 }
+                                let imageData = data.flatMap { UploadedFile.isImageData($0) ? $0 : nil }
 
                                 uploadedFiles.append(
                                     UploadedFile(
@@ -1168,7 +1145,7 @@ struct ContentView: View {
                     Task {
                         for item in newValue {
                             if let data = try? await item.loadTransferable(type: Data.self),
-                               UIImage(data: data) != nil {
+                               UploadedFile.isImageData(data) {
                                 await MainActor.run {
                                     withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
                                         uploadedFiles.append(

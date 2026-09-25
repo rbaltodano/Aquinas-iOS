@@ -1480,7 +1480,7 @@ struct CurrentConversationView: View {
             Task {
                 for item in newValue {
                     if let data = try? await item.loadTransferable(type: Data.self),
-                       UIImage(data: data) != nil {
+                       UploadedFile.isImageData(data) {
                         await MainActor.run {
                             withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
                                 uploadedFiles.append(
