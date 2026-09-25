@@ -341,3 +341,17 @@ nonisolated final class SerializedInquiryStore: @unchecked Sendable {
         return store
     }
 }
+
+// MARK: - Compatibility Alias
+
+/// Compatibility name retained while call sites move onto `InquiryPersistenceStore` directly.
+/// Both names now address the same canonical Application Support snapshot.
+enum CurrentConversationsStore {
+    static func load() -> InquiryPersistenceSnapshot? {
+        InquiryPersistenceStore.load()
+    }
+
+    static func save(_ snapshot: InquiryPersistenceSnapshot) {
+        InquiryPersistenceStore.save(snapshot)
+    }
+}
