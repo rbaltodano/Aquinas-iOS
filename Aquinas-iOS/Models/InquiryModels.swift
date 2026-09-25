@@ -9,7 +9,7 @@ import SwiftUI
 // MARK: - Inquiry Data
 
 /// One vertical conversation lane. Branches can begin from an insight chip or a copied model response.
-struct ChatBranch: Identifiable, Codable, Equatable {
+nonisolated struct ChatBranch: Identifiable, Codable, Equatable {
     let id: UUID
     let startingConcept: ConceptDefinition?
     let parentBranchID: UUID?
@@ -79,7 +79,7 @@ struct ChatBranch: Identifiable, Codable, Equatable {
     }
 }
 
-struct ResponsePresentationMetadata: Codable, Equatable {
+nonisolated struct ResponsePresentationMetadata: Codable, Equatable {
     let responseIndex: Int
     let showsThinking: Bool
     let thinkingSummary: [String]
@@ -94,7 +94,7 @@ struct ResponsePresentationMetadata: Codable, Equatable {
 }
 
 /// A saved top-level conversation canvas. This is in-memory prototype persistence.
-struct InquiryConversation: Identifiable, Codable, Equatable {
+nonisolated struct InquiryConversation: Identifiable, Codable, Equatable {
     let id: UUID
     var title: String = "New Conversation"
     /// `true` for conversations that act as study topic containers.
@@ -255,7 +255,7 @@ struct StudyTopicTreeSelectionRequest: Identifiable, Equatable {
     }
 }
 
-enum ChatBlock: Hashable, Codable {
+nonisolated enum ChatBlock: Hashable, Codable {
     /// A model-generated response card.
     case text(String)
 

@@ -27,7 +27,9 @@ Conversation branches and chat blocks are persisted as one Codable snapshot in
 atomically, keeps up to five rotating JSON backups, and migrates either prior conversation
 snapshot from `UserDefaults` on first successful load. `InquiryPersistenceStore` is the
 process-facing boundary; `CurrentConversationsStore` is its compatibility name at existing call
-sites. Saved Insights and identifiers-only coordination stores remain in `UserDefaults`, including
+sites. All snapshot I/O runs on one serial background queue (`SerializedInquiryStore`): saves
+return immediately, loads and imports wait behind queued writes, and the shell flushes the queue
+when the scene moves to the background. Saved Insights and identifiers-only coordination stores remain in `UserDefaults`, including
 conversation-to-global-Insight membership and pending tree-analysis IDs. See
 [`PERSISTENT_MEMORY_IMPLEMENTATION_PLAN.md`](../../Aquinas-Foundations/PERSISTENT_MEMORY_IMPLEMENTATION_PLAN.md)
 for the planned SwiftData migration.

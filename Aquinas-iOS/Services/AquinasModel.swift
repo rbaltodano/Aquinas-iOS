@@ -326,7 +326,7 @@ struct KeyTerm {
 
 /// One retrieved grounding passage, surfaced while generation is still running as a tappable
 /// "Source" row. `passage` is the retrieved text itself, never a generated summary of it.
-struct GroundingSourceSummary: Identifiable, Codable, Equatable {
+nonisolated struct GroundingSourceSummary: Identifiable, Codable, Equatable {
     let id: String
     let title: String
     let sourceName: String
@@ -354,7 +354,7 @@ enum ModelResponseUpdate {
 
 /// Explains the evidence basis for a response. `nil` is reserved for older saved answers and
 /// recovery paths that do not report a basis.
-enum ResponseEvidenceBasis: String, Codable, Equatable {
+nonisolated enum ResponseEvidenceBasis: String, Codable, Equatable {
     case corpusGrounded
     case generalKnowledge
     case sourceRequired

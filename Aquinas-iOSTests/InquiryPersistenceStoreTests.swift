@@ -19,6 +19,47 @@ struct InquiryPersistenceStoreTests {
         #expect(fixture.store.load() == snapshot)
     }
 
+    @Test("Queued saves are visible to the next load, in order")
+    func queuedSavesAreReadInOrder() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let serialized = SerializedInquiryStore(makeStore: { fixture.store })
+        let conversations = (0..<20).map { InquiryConversation(title: "Draft \($0)") }
+
+        for conversation in conversations {
+            serialized.save(
+                InquiryPersistenceSnapshot(
+                    conversations: [conversation],
+                    activeConversationID: conversation.id
+                )
+            )
+        }
+
+        #expect(serialized.load()?.conversations.map(\.title) == ["Draft 19"])
+    }
+
+    @Test("A queued completed response lands after the snapshot queued before it")
+    func queuedCompletedResponseFollowsSnapshot() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let serialized = SerializedInquiryStore(makeStore: { fixture.store })
+        var branch = ChatBranch(startingConcept: nil)
+        branch.activeChatBlocks = [.user("What is prudence?", nil, []), .text("")]
+        let conversation = InquiryConversation(branches: [branch])
+
+        serialized.save(
+            InquiryPersistenceSnapshot(
+                conversations: [conversation],
+                activeConversationID: conversation.id
+            )
+        )
+        branch.activeChatBlocks[1] = .text("Prudence is practical wisdom.")
+        serialized.saveCompletedBranch(branch, conversationID: conversation.id)
+        serialized.flush()
+
+        #expect(fixture.store.load()?.conversations.first?.branches.first == branch)
+    }
+
     @Test("A completed response replaces its persisted placeholder by stable IDs")
     func completedResponseReplacesPlaceholder() throws {
         let fixture = try Fixture()

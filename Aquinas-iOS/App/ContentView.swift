@@ -12,7 +12,7 @@ import PhotosUI
 // MARK: - Shared Models
 
 /// File/image selected before submitting a question.
-struct UploadedFile: Identifiable, Equatable, Hashable, Codable {
+nonisolated struct UploadedFile: Identifiable, Equatable, Hashable, Codable {
     let id: UUID
     let name: String
     let imageData: Data?
@@ -34,7 +34,7 @@ struct UploadedFile: Identifiable, Equatable, Hashable, Codable {
     }
 }
 
-struct InsightDefinition: Identifiable, Equatable, Hashable, Codable, Sendable {
+nonisolated struct InsightDefinition: Identifiable, Equatable, Hashable, Codable, Sendable {
     let id: UUID
     let context: String
     let meaning: String
@@ -54,7 +54,7 @@ struct InsightDefinition: Identifiable, Equatable, Hashable, Codable, Sendable {
     }
 }
 
-struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable, Sendable {
+nonisolated struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable, Sendable {
     let id: UUID
     let word: String
     let partOfSpeech: String
@@ -1500,6 +1500,9 @@ struct ContentView: View {
             gracePeriod: appLockGracePeriod.duration
         )
         modelTasks.setApplicationActive(phase == .active)
+        if phase == .background {
+            InquiryPersistenceStore.flush()
+        }
         scheduleDailyQuestionRefreshIfNeeded()
     }
 

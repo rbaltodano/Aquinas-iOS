@@ -8,12 +8,12 @@ import Foundation
 // MARK: - Inquiry Persistence
 
 /// The full piece of local state needed to restore the user's conversation canvases.
-struct InquiryPersistenceSnapshot: Codable, Equatable {
+nonisolated struct InquiryPersistenceSnapshot: Codable, Equatable, Sendable {
     var conversations: [InquiryConversation]
     var activeConversationID: UUID?
 }
 
-enum InquiryPersistenceError: LocalizedError {
+nonisolated enum InquiryPersistenceError: LocalizedError {
     case applicationSupportUnavailable
     case invalidImport
 
@@ -30,7 +30,7 @@ enum InquiryPersistenceError: LocalizedError {
 /// File-backed conversation storage with atomic replacement, rotating backups, and migration from
 /// both prototype `UserDefaults` keys. The snapshot shape deliberately remains Codable so stable
 /// conversation, branch, response, and Insight identifiers survive the storage migration.
-struct InquirySnapshotFileStore {
+nonisolated struct InquirySnapshotFileStore {
     static let currentLegacyKey = "aquinas.current.conversations.v1"
     static let originalLegacyKey = "aquinas.inquiry.persistence.snapshot.v1"
 
@@ -237,54 +237,38 @@ struct InquirySnapshotFileStore {
 /// concrete file store can later be replaced by normalized SwiftData records without another view
 /// rewrite.
 enum InquiryPersistenceStore {
+    nonisolated private static let shared = SerializedInquiryStore(makeStore: liveStore)
+
     static func load() -> InquiryPersistenceSnapshot? {
-        liveStore()?.load()
+        shared.load()
     }
 
     static func save(_ snapshot: InquiryPersistenceSnapshot) {
-        do {
-            guard let store = liveStore() else {
-                throw InquiryPersistenceError.applicationSupportUnavailable
-            }
-            try store.save(snapshot)
-        } catch {
-            assertionFailure("Unable to save inquiry snapshot: \(error)")
-        }
+        shared.save(snapshot)
     }
 
     static func saveCompletedBranch(
         _ completedBranch: ChatBranch,
         conversationID: UUID
     ) {
-        do {
-            guard let store = liveStore() else {
-                throw InquiryPersistenceError.applicationSupportUnavailable
-            }
-            try store.saveCompletedBranch(
-                completedBranch,
-                conversationID: conversationID
-            )
-        } catch {
-            assertionFailure("Unable to save completed response: \(error)")
-        }
+        shared.saveCompletedBranch(completedBranch, conversationID: conversationID)
     }
 
     static func exportData() throws -> Data {
-        guard let store = liveStore() else {
-            throw InquiryPersistenceError.applicationSupportUnavailable
-        }
-        return try store.exportData()
+        try shared.exportData()
     }
 
     @discardableResult
     static func importData(_ data: Data) throws -> InquiryPersistenceSnapshot {
-        guard let store = liveStore() else {
-            throw InquiryPersistenceError.applicationSupportUnavailable
-        }
-        return try store.importData(data)
+        try shared.importData(data)
     }
 
-    private static func liveStore() -> InquirySnapshotFileStore? {
+    /// Blocks until every queued write has reached disk. Call before the app is suspended.
+    static func flush() {
+        shared.flush()
+    }
+
+    nonisolated private static func liveStore() -> InquirySnapshotFileStore? {
         guard let applicationSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
@@ -297,5 +281,63 @@ enum InquiryPersistenceStore {
                 directoryHint: .isDirectory
             )
         )
+    }
+}
+
+/// Runs every snapshot operation on one serial background queue so JSON encoding and file I/O stay
+/// off the main thread. Writes are enqueued and return immediately; reads and imports wait behind
+/// queued writes, so a load never observes a stale file and writes never interleave.
+nonisolated final class SerializedInquiryStore: @unchecked Sendable {
+    private let makeStore: () -> InquirySnapshotFileStore?
+    private let queue = DispatchQueue(label: "com.aquinas.inquiry-persistence", qos: .utility)
+
+    init(makeStore: @escaping () -> InquirySnapshotFileStore?) {
+        self.makeStore = makeStore
+    }
+
+    func load() -> InquiryPersistenceSnapshot? {
+        queue.sync { makeStore()?.load() }
+    }
+
+    func save(_ snapshot: InquiryPersistenceSnapshot) {
+        enqueue("Unable to save inquiry snapshot") { try $0.save(snapshot) }
+    }
+
+    func saveCompletedBranch(_ completedBranch: ChatBranch, conversationID: UUID) {
+        enqueue("Unable to save completed response") {
+            try $0.saveCompletedBranch(completedBranch, conversationID: conversationID)
+        }
+    }
+
+    func exportData() throws -> Data {
+        try queue.sync { try requireStore().exportData() }
+    }
+
+    func importData(_ data: Data) throws -> InquiryPersistenceSnapshot {
+        try queue.sync { try requireStore().importData(data) }
+    }
+
+    func flush() {
+        queue.sync {}
+    }
+
+    private func enqueue(
+        _ failureMessage: String,
+        _ operation: @escaping (InquirySnapshotFileStore) throws -> Void
+    ) {
+        queue.async { [self] in
+            do {
+                try operation(requireStore())
+            } catch {
+                assertionFailure("\(failureMessage): \(error)")
+            }
+        }
+    }
+
+    private func requireStore() throws -> InquirySnapshotFileStore {
+        guard let store = makeStore() else {
+            throw InquiryPersistenceError.applicationSupportUnavailable
+        }
+        return store
     }
 }
