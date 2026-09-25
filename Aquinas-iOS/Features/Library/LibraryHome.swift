@@ -170,7 +170,15 @@ nonisolated struct LibraryFeaturedPassage: Equatable, Sendable {
             index += 1
         }
         let tail = current.trimmingCharacters(in: .whitespaces)
-        if !tail.isEmpty { sentences.append(tail) }
+        // A chunk bound often clips mid-sentence in lowercase ("…thereof. and so"), which the
+        // uppercase rule above won't split. Separate that fragment so the whole sentence before
+        // it is not discarded along with the clipped tail.
+        if let lastBreak = tail.range(of: #"[.?!] (?=\S)"#, options: [.regularExpression, .backwards]) {
+            sentences.append(String(tail[..<lastBreak.upperBound]).trimmingCharacters(in: .whitespaces))
+            sentences.append(String(tail[lastBreak.upperBound...]))
+        } else if !tail.isEmpty {
+            sentences.append(tail)
+        }
         return sentences
     }
 
