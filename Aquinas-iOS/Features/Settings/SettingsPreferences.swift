@@ -3,7 +3,7 @@
 //  Aquinas-iOS
 //
 
-import Foundation
+import SwiftUI
 import UserNotifications
 
 protocol SettingsChoice: CaseIterable, Hashable, Identifiable {
@@ -422,5 +422,134 @@ enum AquinasSystemNotifications {
             trigger: nil
         )
         UNUserNotificationCenter.current().add(request)
+    }
+}
+
+// MARK: - Display Options
+
+enum AppearanceOption: CaseIterable, Identifiable {
+    case system
+    case light
+    case dark
+
+    var id: Self { self }
+
+    var iconName: String {
+        switch self {
+        case .system: "iphone"
+        case .light: "sun.max"
+        case .dark: "moon"
+        }
+    }
+
+    var colorScheme: ColorScheme? {
+        switch self {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
+        }
+    }
+
+    var accessibilityLabel: LocalizedStringResource {
+        switch self {
+        case .system: "Use system appearance"
+        case .light: "Use light appearance"
+        case .dark: "Use dark appearance"
+        }
+    }
+}
+
+enum ConversationTextAlignmentOption: String, CaseIterable, Identifiable {
+    case center
+    case left
+
+    var id: Self { self }
+
+    var textAlignment: TextAlignment {
+        switch self {
+        case .center: .center
+        case .left: .leading
+        }
+    }
+
+    var frameAlignment: Alignment {
+        switch self {
+        case .center: .center
+        case .left: .leading
+        }
+    }
+
+    var horizontalAlignment: HorizontalAlignment {
+        switch self {
+        case .center: .center
+        case .left: .leading
+        }
+    }
+
+    var inputContainerPadding: EdgeInsets {
+        EdgeInsets(top: 16, leading: 16, bottom: 16, trailing: 16)
+    }
+
+    var inputContainerRadius: CGFloat { 24 }
+
+    var inputContainerBorderOpacity: CGFloat {
+        switch self {
+        case .center: 0
+        case .left: 0.15
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .center: "text.aligncenter"
+        case .left: "text.alignleft"
+        }
+    }
+
+    var accessibilityLabel: LocalizedStringResource {
+        switch self {
+        case .center: "Center all conversation text"
+        case .left: "Align all conversation text left"
+        }
+    }
+}
+
+typealias InputTextAlignmentOption = ConversationTextAlignmentOption
+
+typealias ResponseTextAlignmentOption = ConversationTextAlignmentOption
+
+enum ConversationFontOption: String, CaseIterable, Identifiable {
+    case sans = "Sans"
+    case serif = "Serif"
+
+    var id: Self { self }
+
+    var textFont: Font {
+        textFont(size: .large)
+    }
+
+    func textFont(size: ConversationFontSizeOption) -> Font {
+        switch self {
+        case .sans:
+            .custom("Figtree-Regular", size: size.pointSize)
+        case .serif:
+            .custom("LibreBaskerville-Regular", size: size.pointSize)
+        }
+    }
+}
+
+enum ConversationFontSizeOption: String, CaseIterable, Identifiable {
+    case large = "Large"
+    case medium = "Medium"
+    case small = "Small"
+
+    var id: Self { self }
+
+    var pointSize: CGFloat {
+        switch self {
+        case .small: 12
+        case .medium: 14
+        case .large: 16
+        }
     }
 }
