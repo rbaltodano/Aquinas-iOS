@@ -1597,9 +1597,7 @@ private extension LiteRTAquinasModel {
     static func explicitAuthorshipCorrection(
         in question: String
     ) -> AuthorshipCorrection? {
-        let pattern = #"(?i)([\p{L}\p{N}][\p{L}\p{N}'’\- ]{0,60}?)\s+(?:was|is)\s+not\s+(?:known\s+to\s+have\s+been\s+)?written\s+by\s+([\p{L}'’\-]+)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(
+        guard let match = LiteRTPatterns.authorshipCorrection.firstMatch(
                 in: question,
                 range: NSRange(question.startIndex..., in: question)
               ),
@@ -1641,13 +1639,7 @@ private extension LiteRTAquinasModel {
         }
         guard assertsAttribution else { return false }
 
-        let uncertaintyPattern = #"(?i)\b(?:authorship|author|who\s+wrote\s+it|who\s+wrote\s+the\s+work)\b(?:(?![.!?]).){0,35}\b(?:unknown|uncertain|not\s+known)\b|\b(?:unknown|uncertain|not\s+known)\b(?:(?![.!?]).){0,35}\b(?:author|authorship|who\s+wrote)\b"#
-        guard let uncertaintyRegex = try? NSRegularExpression(
-            pattern: uncertaintyPattern
-        ) else {
-            return false
-        }
-        return uncertaintyRegex.firstMatch(
+        return LiteRTPatterns.authorshipUncertainty.firstMatch(
             in: response,
             range: NSRange(response.startIndex..., in: response)
         ) != nil
@@ -1868,14 +1860,8 @@ private extension LiteRTAquinasModel {
         in transcript: [ChatBlock]
     ) -> String? {
         guard case .user(let raw, _, _) = transcript.last else { return nil }
-        let explicitPatterns = [
-            #"(?i)^\s*what\s+does\s+["“']?(.+?)["”']?\s+mean\??\s*$"#,
-            #"(?i)^\s*what\s+is\s+the\s+meaning\s+of\s+["“']?(.+?)["”']?\??\s*$"#,
-            #"(?i)^\s*(?:please\s+)?define\s+["“']?(.+?)["”']?[.!?]?\s*$"#
-        ]
-        for pattern in explicitPatterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern),
-                  let match = regex.firstMatch(
+        for regex in LiteRTPatterns.explicitDefinitionRequests {
+            guard let match = regex.firstMatch(
                     in: raw,
                     range: NSRange(raw.startIndex..., in: raw)
                   ),
@@ -1886,9 +1872,7 @@ private extension LiteRTAquinasModel {
             if !term.isEmpty { return term }
         }
 
-        let simplePattern = #"(?i)^\s*what\s+is\s+(?:an?\s+|the\s+)?["“']?(.+?)["”']?\??\s*$"#
-        guard let regex = try? NSRegularExpression(pattern: simplePattern),
-              let match = regex.firstMatch(
+        guard let match = LiteRTPatterns.simpleDefinitionRequest.firstMatch(
                 in: raw,
                 range: NSRange(raw.startIndex..., in: raw)
               ),
@@ -2088,35 +2072,15 @@ private extension LiteRTAquinasModel {
 
     static func sanitizedVisibleText(_ raw: String) -> String {
         var text = raw
-        if let controlTags = try? NSRegularExpression(
-            pattern: #"(?i)</?(?:TASK(?::[A-Z0-9_]+)?|thinking_summary|key_terms|response)\b[^>]*>"#
-        ) {
-            text = controlTags.stringByReplacingMatches(
+        for regex in [LiteRTPatterns.controlTags, LiteRTPatterns.answerWrapper] {
+            text = regex.stringByReplacingMatches(
                 in: text,
                 options: [],
                 range: NSRange(text.startIndex..., in: text),
                 withTemplate: ""
             )
         }
-        if let wrapper = try? NSRegularExpression(
-            pattern: #"(?is)\A\s*(?:#{1,6}\s*)?(?:\*\*|__)?(?:answer|response|aquinas)(?:\*\*|__)?\s*:\s*(?:\*\*|__)?\s*"#
-        ) {
-            text = wrapper.stringByReplacingMatches(
-                in: text,
-                options: [],
-                range: NSRange(text.startIndex..., in: text),
-                withTemplate: ""
-            )
-        }
-        let replacements: [(String, String)] = [
-            (#"\$\\text\{([^{}]+)\}\$"#, "$1"),
-            (#"\\text\{([^{}]+)\}"#, "$1"),
-            (#"\$([^$\n]+)\$"#, "$1")
-        ]
-        for (pattern, template) in replacements {
-            guard let regex = try? NSRegularExpression(pattern: pattern) else {
-                continue
-            }
+        for (regex, template) in LiteRTPatterns.mathMarkupReplacements {
             text = regex.stringByReplacingMatches(
                 in: text,
                 range: NSRange(text.startIndex..., in: text),
@@ -2324,4 +2288,40 @@ private extension String {
     var nilIfEmpty: String? {
         isEmpty ? nil : self
     }
+}
+
+/// Expressions used to interpret prompts and clean model output, compiled once instead of on
+/// every call. Output cleanup runs on every response, so rebuilding them each time was wasted work.
+private enum LiteRTPatterns {
+    static let authorshipCorrection = try! NSRegularExpression(
+        pattern: #"(?i)([\p{L}\p{N}][\p{L}\p{N}'’\- ]{0,60}?)\s+(?:was|is)\s+not\s+(?:known\s+to\s+have\s+been\s+)?written\s+by\s+([\p{L}'’\-]+)"#
+    )
+
+    static let authorshipUncertainty = try! NSRegularExpression(
+        pattern: #"(?i)\b(?:authorship|author|who\s+wrote\s+it|who\s+wrote\s+the\s+work)\b(?:(?![.!?]).){0,35}\b(?:unknown|uncertain|not\s+known)\b|\b(?:unknown|uncertain|not\s+known)\b(?:(?![.!?]).){0,35}\b(?:author|authorship|who\s+wrote)\b"#
+    )
+
+    static let explicitDefinitionRequests = [
+        #"(?i)^\s*what\s+does\s+["“']?(.+?)["”']?\s+mean\??\s*$"#,
+        #"(?i)^\s*what\s+is\s+the\s+meaning\s+of\s+["“']?(.+?)["”']?\??\s*$"#,
+        #"(?i)^\s*(?:please\s+)?define\s+["“']?(.+?)["”']?[.!?]?\s*$"#
+    ].map { try! NSRegularExpression(pattern: $0) }
+
+    static let simpleDefinitionRequest = try! NSRegularExpression(
+        pattern: #"(?i)^\s*what\s+is\s+(?:an?\s+|the\s+)?["“']?(.+?)["”']?\??\s*$"#
+    )
+
+    static let controlTags = try! NSRegularExpression(
+        pattern: #"(?i)</?(?:TASK(?::[A-Z0-9_]+)?|thinking_summary|key_terms|response)\b[^>]*>"#
+    )
+
+    static let answerWrapper = try! NSRegularExpression(
+        pattern: #"(?is)\A\s*(?:#{1,6}\s*)?(?:\*\*|__)?(?:answer|response|aquinas)(?:\*\*|__)?\s*:\s*(?:\*\*|__)?\s*"#
+    )
+
+    static let mathMarkupReplacements: [(NSRegularExpression, String)] = [
+        (#"\$\\text\{([^{}]+)\}\$"#, "$1"),
+        (#"\\text\{([^{}]+)\}"#, "$1"),
+        (#"\$([^$\n]+)\$"#, "$1")
+    ].map { (try! NSRegularExpression(pattern: $0.0), $0.1) }
 }

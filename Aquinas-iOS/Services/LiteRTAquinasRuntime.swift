@@ -586,6 +586,9 @@ nonisolated struct LiteRTSampling: Sendable {
 /// weights. It deliberately requires substantial consecutive repetition so normal rhetorical
 /// emphasis is not treated as a generation failure.
 nonisolated enum LiteRTGenerationGuard {
+    /// Runs against in-progress output while tokens stream, so it is compiled once.
+    private static let wordPattern = try! NSRegularExpression(pattern: #"[\p{L}\p{N}]+"#)
+
     static func hasDegenerateOutput(in text: String) -> Bool {
         hasDegenerateRepetition(in: text) || hasMixedScriptCorruption(in: text)
     }
@@ -611,11 +614,8 @@ nonisolated enum LiteRTGenerationGuard {
             }
         }
 
-        guard let regex = try? NSRegularExpression(pattern: #"[\p{L}\p{N}]+"#) else {
-            return nil
-        }
         let source = text as NSString
-        let matches = regex.matches(
+        let matches = wordPattern.matches(
             in: text,
             range: NSRange(location: 0, length: source.length)
         )

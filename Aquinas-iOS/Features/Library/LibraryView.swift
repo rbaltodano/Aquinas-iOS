@@ -618,13 +618,16 @@ private struct LibraryDocument {
         }
     }
 
+    /// Checked against every passage when a work's outline is built, so it is compiled once.
+    private static let subsectionHeadingPattern = try! NSRegularExpression(
+        pattern: "(?i)^(?:\\[[^\\]]+\\]\\s*)?((?:book|part|treatise|session|chapter|question|article|section|lesson)\\s*(?:[IVXLCDM]+|\\d+)(?:\\s*[:.\\-]\\s*[^.]{0,110})?)"
+    )
+
     private static func subsectionHeading(in text: String) -> (title: String, level: Int)? {
         let prefix = String(text.prefix(260))
             .replacingOccurrences(of: "\\r", with: " ")
             .replacingOccurrences(of: "\\n", with: " ")
-        let pattern = "(?i)^(?:\\[[^\\]]+\\]\\s*)?((?:book|part|treatise|session|chapter|question|article|section|lesson)\\s*(?:[IVXLCDM]+|\\d+)(?:\\s*[:.\\-]\\s*[^.]{0,110})?)"
-        guard let expression = try? NSRegularExpression(pattern: pattern),
-              let match = expression.firstMatch(in: prefix, range: NSRange(prefix.startIndex..., in: prefix)),
+        guard let match = subsectionHeadingPattern.firstMatch(in: prefix, range: NSRange(prefix.startIndex..., in: prefix)),
               let range = Range(match.range(at: 1), in: prefix)
         else { return nil }
 

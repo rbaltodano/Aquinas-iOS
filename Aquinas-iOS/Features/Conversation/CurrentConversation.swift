@@ -2721,14 +2721,14 @@ private struct BranchModeTopBar: View {
     }
 }
 
+private let aquinasInsightLinkPattern = try! NSRegularExpression(
+    pattern: #"\[([^\]]+)\]\(aq://[^)]+\)"#
+)
+
 private extension String {
     func removingAquinasInsightMarkup() -> String {
-        let pattern = #"\[([^\]]+)\]\(aq://[^)]+\)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
-            return self
-        }
         let range = NSRange(startIndex..., in: self)
-        let visibleText = regex.stringByReplacingMatches(
+        let visibleText = aquinasInsightLinkPattern.stringByReplacingMatches(
             in: self,
             options: [],
             range: range,
