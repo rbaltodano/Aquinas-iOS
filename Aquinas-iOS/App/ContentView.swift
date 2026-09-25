@@ -12,6 +12,8 @@ import UniformTypeIdentifiers
 // MARK: - App Shell
 
 struct ContentView: View {
+    // MARK: - State
+
     @Environment(\.aquinasModel) private var aquinasModel
     @Environment(\.embeddingProvider) private var embeddingProvider
     @Environment(\.scenePhase) private var scenePhase
@@ -149,6 +151,8 @@ struct ContentView: View {
     @AppStorage("aquinas.settings.responseFont") private var responseFont: ConversationFontOption = .sans
     @AppStorage("aquinas.settings.conversationPersonality") private var conversationPersonality: ConversationPersonality = .balanced
 
+    // MARK: - Constants
+
     let canvasColor = AquinasTheme.Colors.canvas
     private let pageFadeDuration: TimeInterval = 0.25
     private let pageFadePauseDuration: TimeInterval = 0.15
@@ -174,6 +178,8 @@ struct ContentView: View {
         defaults.set(legacyAlignment.rawValue, forKey: SettingsStorageKey.conversationTextAlignment)
     }
 
+    // MARK: - Derived State
+
     private var rootSafeAreaColor: Color {
         activePage == .conversation && isConversationCanvasMode
             ? AquinasTheme.Colors.canvas
@@ -197,6 +203,8 @@ struct ContentView: View {
     private var usesLandscapeInsightSplit: Bool {
         displayedPage == .insights && verticalSizeClass == .compact
     }
+
+    // MARK: - Navigation Actions
 
     private func presentGlobalSideMenu() {
         dismissKeyboard()
@@ -277,6 +285,8 @@ struct ContentView: View {
             activePage = .conversation
         }
     }
+
+    // MARK: - Page Views
 
     /// The single, persistent Model Controls bar shown across every non-conversation page.
     /// Anchored via `.safeAreaInset` outside the page-content fade/offset transition, so it stays
@@ -675,6 +685,8 @@ struct ContentView: View {
         )
         .equatable())
     }
+
+    // MARK: - Body
 
     var body: some View {
         shellObservers(shellBody)
@@ -1124,6 +1136,8 @@ struct ContentView: View {
         )
     }
 
+    // MARK: - Side Menu
+
     /// Closes the panel before changing the view behind it, so its contents
     /// remain visually stable for the full slide-out animation.
     private func dismissGlobalSideMenu(then action: @escaping () -> Void = {}) {
@@ -1141,6 +1155,8 @@ struct ContentView: View {
             action()
         }
     }
+
+    // MARK: - Daily Content
 
     private func markQuestionOfTheDayAnswered() {
         guard let questionOfTheDay else { return }
@@ -1278,6 +1294,8 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Page Transitions
+
     private func transitionDisplayedPage(to nextPage: AppPage) {
         guard displayedPage != nextPage else {
             withAnimation(.easeInOut(duration: pageFadeDuration)) {
@@ -1317,6 +1335,8 @@ struct ContentView: View {
         isKeyboardVisible = false
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
+
+    // MARK: - Lifecycle and Change Handlers
 
     private func handleScenePhaseChange(_ phase: ScenePhase) {
         appLockController.scenePhaseDidChange(
@@ -1377,6 +1397,8 @@ struct ContentView: View {
         guard activePage == .insights else { return }
         refreshGlobalInsightTreeUpdatePrompt()
     }
+
+    // MARK: - Loading
 
     private func loadShellConversationState() {
         guard let snapshot = CurrentConversationsStore.load(),
@@ -1454,6 +1476,8 @@ struct ContentView: View {
             homeYourQuote = resolvedYourQuote ?? nil
         }
     }
+
+    // MARK: - Global Insight Tree
 
     private func askGlobalInsightInNewConversation() {
         guard let insight = globalInsightQuoteTarget else { return }
@@ -1583,6 +1607,8 @@ struct ContentView: View {
             isGlobalTreeUpdatePromptVisible = false
         }
     }
+
+    // MARK: - Conversation Management
 
     private func deleteConversation(_ conversation: InquiryConversation) {
         // Remove from the side menu list immediately for snappy feedback.
