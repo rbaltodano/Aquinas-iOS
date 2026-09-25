@@ -36,15 +36,20 @@ struct StudyTopic: Identifiable, Codable, Equatable {
 enum StudyTopicStore {
     private static let key = "aquinas.study-topics.v1"
 
+    /// Decoded topics, kept in memory because many screens reload topics every time they appear.
+    /// `save` is the only writer of this key, so it keeps the cache current.
+    private static var cachedTopics: [StudyTopic]?
+
     static func load() -> [StudyTopic] {
-        guard let data = UserDefaults.standard.data(forKey: key),
-              let topics = try? JSONDecoder().decode([StudyTopic].self, from: data) else {
-            return []
-        }
+        if let cachedTopics { return cachedTopics }
+        let topics = UserDefaults.standard.data(forKey: key)
+            .flatMap { try? JSONDecoder().decode([StudyTopic].self, from: $0) } ?? []
+        cachedTopics = topics
         return topics
     }
 
     static func save(_ topics: [StudyTopic]) {
+        cachedTopics = topics
         guard let data = try? JSONEncoder().encode(topics) else { return }
         UserDefaults.standard.set(data, forKey: key)
     }
