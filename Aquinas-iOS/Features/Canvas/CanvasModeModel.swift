@@ -35,6 +35,9 @@ final class CanvasModeModel {
     /// Returns Study to its selected Insight without leaving the tree.
     var canvasStudyExitRequest: Int = 0
     var isCanvasStudyMode: Bool = false
+    /// The dock's Tools button toggles Study's tools; the tree reports whether they're open.
+    var canvasStudyToolsToggleRequest: Int = 0
+    var isCanvasStudyToolsActive: Bool = false
     var canvasStudyBranchCount: Int = 2
     var canvasInquireConnectionRequest: Int = 0
 

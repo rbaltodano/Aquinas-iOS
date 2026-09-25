@@ -27,7 +27,9 @@ Conversation branches and chat blocks are persisted as one Codable snapshot in
 atomically, keeps up to five rotating JSON backups, and migrates either prior conversation
 snapshot from `UserDefaults` on first successful load. `InquiryPersistenceStore` is the
 process-facing boundary; `CurrentConversationsStore` is its compatibility name at existing call
-sites. Saved Insights and identifiers-only coordination stores remain in `UserDefaults`, including
+sites. All snapshot I/O runs on one serial background queue (`SerializedInquiryStore`): saves
+return immediately, loads and imports wait behind queued writes, and the shell flushes the queue
+when the scene moves to the background. Saved Insights and identifiers-only coordination stores remain in `UserDefaults`, including
 conversation-to-global-Insight membership and pending tree-analysis IDs. See
 [`PERSISTENT_MEMORY_IMPLEMENTATION_PLAN.md`](../../Aquinas-Foundations/PERSISTENT_MEMORY_IMPLEMENTATION_PLAN.md)
 for the planned SwiftData migration.
@@ -43,7 +45,7 @@ SQLite. It is a development-time persistence boundary, not cloud sync.
 | Conversation orchestration | `Features/Conversation/CurrentConversation.swift` |
 | Transcript and response lifecycle | `Features/Conversation/ConversationComponents.swift` |
 | Visible model tasks | `Features/Conversation/ModelTaskQueue.swift` |
-| Model status and context controls | `Features/Conversation/InquiryControlDock.swift` |
+| Model status and context controls | `Features/Conversation/ModelControls/` (dock in `InquiryControlDock.swift`) |
 | Model boundary and local implementation | `Services/AquinasModel.swift`, `Services/LiteRTAquinasModel.swift` |
 | Runtime ownership | `Services/AquinasApplicationRuntime.swift`, `Services/LiteRTAquinasRuntime.swift` |
 | Backend tree boundary | `Services/InsightTreeService.swift` |

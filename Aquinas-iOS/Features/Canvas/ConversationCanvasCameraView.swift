@@ -496,7 +496,7 @@ private struct BranchMapPreviewView: View {
             if !attachments.isEmpty {
                 HStack(spacing: -8) {
                     ForEach(attachments.prefix(3)) { file in
-                        if let data = file.imageData, let img = UIImage(data: data) {
+                        if let img = file.image {
                             Image(uiImage: img).resizable().scaledToFill()
                                 .frame(width: 52, height: 52)
                                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))

@@ -3,8 +3,8 @@
 //  Aquinas-iOS
 //
 
-import CoreGraphics
 import Foundation
+import CoreGraphics
 
 // MARK: - Insight Tree Models
 
@@ -158,4 +158,13 @@ func insightOrbitRadius(longestTitleChars: Int, count: Int, isSuggested: Bool) -
     // Adjacent chips sit on a chord = 2·r·sin(π/n); require chord ≥ chipWidth + gap.
     let required = (chipWidth + 16) / (2 * sin(.pi / CGFloat(n)))
     return max(base, required)
+}
+
+enum CanvasSelectionTarget: Equatable {
+    case node(UUID)
+    case insight(UUID)
+}
+
+enum CanvasSelectionPolicy {
+    static let maximumCount = 8
 }

@@ -3,189 +3,17 @@
 //  Created by Ryan on 4/11/26.
 //
 
-import SwiftUI
 import Combine
-import UniformTypeIdentifiers
-import UIKit
 import PhotosUI
-
-// MARK: - Shared Models
-
-/// File/image selected before submitting a question.
-struct UploadedFile: Identifiable, Equatable, Hashable, Codable {
-    let id: UUID
-    let name: String
-    let imageData: Data?
-    let rotationDegrees: Double
-
-    init(id: UUID = UUID(), name: String, imageData: Data?, rotationDegrees: Double) {
-        self.id = id
-        self.name = name
-        self.imageData = imageData
-        self.rotationDegrees = rotationDegrees
-    }
-
-    static func == (lhs: UploadedFile, rhs: UploadedFile) -> Bool {
-        lhs.id == rhs.id
-    }
-
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-}
-
-struct InsightDefinition: Identifiable, Equatable, Hashable, Codable, Sendable {
-    let id: UUID
-    let context: String
-    let meaning: String
-
-    init(id: UUID? = nil, context: String, meaning: String) {
-        let cleanedContext = context.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanedMeaning = meaning.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.id = id ?? stableUUID(
-            from: "insight-definition:\(cleanedContext.lowercased()):\(cleanedMeaning.lowercased())"
-        )
-        self.context = cleanedContext
-        self.meaning = cleanedMeaning
-    }
-
-    fileprivate var deduplicationKey: String {
-        "\(context.lowercased())\u{1f}\(meaning.lowercased())"
-    }
-}
-
-struct ConceptDefinition: Identifiable, Equatable, Hashable, Codable, Sendable {
-    let id: UUID
-    let word: String
-    let partOfSpeech: String
-    let pronunciation: String
-    let meaning: String
-    let example: String
-    let definitions: [InsightDefinition]
-
-    init(
-        id: UUID = UUID(),
-        word: String,
-        partOfSpeech: String,
-        pronunciation: String,
-        meaning: String,
-        example: String,
-        context: String = "",
-        definitions: [InsightDefinition]? = nil
-    ) {
-        self.id = id
-        self.word = word
-        self.partOfSpeech = partOfSpeech
-        self.pronunciation = pronunciation
-        self.meaning = meaning
-        self.example = example
-        self.definitions = definitions ?? (
-            meaning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? []
-                : [InsightDefinition(context: context, meaning: meaning)]
-        )
-    }
-
-    var contextualDefinitions: [InsightDefinition] {
-        definitions.isEmpty && !meaning.isEmpty
-            ? [InsightDefinition(context: "", meaning: meaning)]
-            : definitions
-    }
-
-    var semanticDefinition: String {
-        contextualDefinitions.map { definition in
-            definition.context.isEmpty
-                ? definition.meaning
-                : "\(definition.context): \(definition.meaning)"
-        }
-        .joined(separator: "\n")
-    }
-
-    func containsDefinitions(from other: ConceptDefinition) -> Bool {
-        let savedKeys = Set(contextualDefinitions.map(\.deduplicationKey))
-        let incoming = other.contextualDefinitions
-        return !incoming.isEmpty
-            && incoming.allSatisfy { savedKeys.contains($0.deduplicationKey) }
-    }
-
-    func mergingDefinitions(from other: ConceptDefinition) -> ConceptDefinition {
-        var merged = contextualDefinitions
-        var seen = Set(merged.map(\.deduplicationKey))
-        for definition in other.contextualDefinitions
-        where seen.insert(definition.deduplicationKey).inserted {
-            merged.append(definition)
-        }
-        return ConceptDefinition(
-            id: id,
-            word: word,
-            partOfSpeech: "",
-            pronunciation: "",
-            meaning: merged.first?.meaning ?? meaning,
-            example: "",
-            definitions: merged
-        )
-    }
-
-    /// A stable id derived from the term's canonical text, so re-defining/re-saving the same term
-    /// (tapping it again in a different message, or after removing and re-saving it) always
-    /// resolves to the same Insight instead of a duplicate with a fresh random id. Use this rather
-    /// than the default random `id` whenever a concept originates from a highlighted term.
-    static func stableID(forTerm term: String) -> UUID {
-        stableUUID(from: "term:\(term.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())")
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case id
-        case word
-        case partOfSpeech
-        case pronunciation
-        case meaning
-        case example
-        case definitions
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(UUID.self, forKey: .id)
-        word = try container.decode(String.self, forKey: .word)
-        partOfSpeech = try container.decodeIfPresent(String.self, forKey: .partOfSpeech) ?? ""
-        pronunciation = try container.decodeIfPresent(String.self, forKey: .pronunciation) ?? ""
-        meaning = try container.decodeIfPresent(String.self, forKey: .meaning) ?? ""
-        example = try container.decodeIfPresent(String.self, forKey: .example) ?? ""
-        definitions = try container.decodeIfPresent(
-            [InsightDefinition].self,
-            forKey: .definitions
-        ) ?? (
-            meaning.isEmpty ? [] : [InsightDefinition(context: "", meaning: meaning)]
-        )
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(id, forKey: .id)
-        try container.encode(word, forKey: .word)
-        try container.encode(partOfSpeech, forKey: .partOfSpeech)
-        try container.encode(pronunciation, forKey: .pronunciation)
-        try container.encode(meaning, forKey: .meaning)
-        try container.encode(example, forKey: .example)
-        try container.encode(definitions, forKey: .definitions)
-    }
-}
-
-enum AppPage: Equatable {
-    case home
-    case library
-    case conversation
-    case openConversations
-    case settings
-    case insights
-    case studyTopics
-}
+import SwiftUI
+import UIKit
+import UniformTypeIdentifiers
 
 // MARK: - App Shell
 
-
 struct ContentView: View {
+    // MARK: - State
+
     @Environment(\.aquinasModel) private var aquinasModel
     @Environment(\.embeddingProvider) private var embeddingProvider
     @Environment(\.scenePhase) private var scenePhase
@@ -220,6 +48,7 @@ struct ContentView: View {
     // Set while a Study Topic's detail view is open, so the global edge-swipe
     // gesture below yields to that screen's own swipe-to-go-back gesture.
     @State private var isStudyTopicDetailVisible: Bool = false
+    @State private var isInsightLibraryVisible: Bool = false
     @State private var isSettingsDetailVisible: Bool = false
     @State private var isConversationCanvasMode: Bool = false
     @State private var globalInsightsContextCardState = ContextCardState()
@@ -271,6 +100,8 @@ struct ContentView: View {
     @State private var globalInsightStudyRequest: Int = 0
     @State private var globalInsightStudyExitRequest: Int = 0
     @State private var globalInsightIsStudyMode: Bool = false
+    @State private var globalInsightStudyToolsToggleRequest: Int = 0
+    @State private var globalInsightStudyToolsActive: Bool = false
     @State private var globalInsightStudyBranchCount: Int = 2
     @State private var globalInsightPromotedIDs: [UUID] =
         GlobalInsightPromotedIDsStore.load()
@@ -320,6 +151,7 @@ struct ContentView: View {
     @AppStorage("aquinas.settings.responseFont") private var responseFont: ConversationFontOption = .sans
     @AppStorage("aquinas.settings.conversationPersonality") private var conversationPersonality: ConversationPersonality = .balanced
 
+    // MARK: - Constants
 
     let canvasColor = AquinasTheme.Colors.canvas
     private let pageFadeDuration: TimeInterval = 0.25
@@ -346,6 +178,8 @@ struct ContentView: View {
         defaults.set(legacyAlignment.rawValue, forKey: SettingsStorageKey.conversationTextAlignment)
     }
 
+    // MARK: - Derived State
+
     private var rootSafeAreaColor: Color {
         activePage == .conversation && isConversationCanvasMode
             ? AquinasTheme.Colors.canvas
@@ -369,6 +203,8 @@ struct ContentView: View {
     private var usesLandscapeInsightSplit: Bool {
         displayedPage == .insights && verticalSizeClass == .compact
     }
+
+    // MARK: - Navigation Actions
 
     private func presentGlobalSideMenu() {
         dismissKeyboard()
@@ -450,6 +286,8 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Page Views
+
     /// The single, persistent Model Controls bar shown across every non-conversation page.
     /// Anchored via `.safeAreaInset` outside the page-content fade/offset transition, so it stays
     /// in place while page content animates behind it — its own content simply swaps (with an
@@ -521,6 +359,8 @@ struct ContentView: View {
                 selectedCanvasItemCount: globalInsightSelectedItemCount,
                 isMidpointMode: globalInsightIsMidpointMode,
                 isStudyMode: globalInsightIsStudyMode,
+                isStudyToolsActive: globalInsightStudyToolsActive,
+                onToggleStudyTools: { globalInsightStudyToolsToggleRequest += 1 },
                 studyBranchCount: globalInsightStudyBranchCount,
                 onStudyBranchCountChange: { globalInsightStudyBranchCount = $0 },
                 isCanvasInsightLoading: globalInsightIsGenerating,
@@ -631,8 +471,10 @@ struct ContentView: View {
             createConceptRequest: globalInsightCreateConceptRequest,
             studyRequest: globalInsightStudyRequest,
             studyExitRequest: globalInsightStudyExitRequest,
+            studyToolsToggleRequest: globalInsightStudyToolsToggleRequest,
             studyBranchCount: globalInsightStudyBranchCount,
             onStudyModeChange: { globalInsightIsStudyMode = $0 },
+            onStudyToolsActiveChange: { globalInsightStudyToolsActive = $0 },
             onStudyBranchCountChange: { globalInsightStudyBranchCount = $0 },
             restoreSelectedInsightID: globalInsightRestoreSelectionID,
             restoreSelectedNodeID: globalInsightHighlightedNodeID,
@@ -766,6 +608,7 @@ struct ContentView: View {
         CurrentConversationView(
             onOpenMenu: presentGlobalSideMenu,
             onCanvasModeChange: { isConversationCanvasMode = $0 },
+            onInsightLibraryVisibilityChange: { isInsightLibraryVisible = $0 },
             onRequestConversationPage: {
                 activePage = .conversation
             },
@@ -842,6 +685,8 @@ struct ContentView: View {
         )
         .equatable())
     }
+
+    // MARK: - Body
 
     var body: some View {
         shellObservers(shellBody)
@@ -1008,7 +853,8 @@ struct ContentView: View {
                                     responseFont: $responseFont,
                                     conversationPersonality: $conversationPersonality,
                                     onOpenMenu: presentGlobalSideMenu,
-                                    onDetailVisibilityChange: { isSettingsDetailVisible = $0 }
+                                    onDetailVisibilityChange: { isSettingsDetailVisible = $0 },
+                                    onClearInsightTree: clearInsightTree
                                 )
                             case .insights:
                                 insightTreePage
@@ -1088,7 +934,9 @@ struct ContentView: View {
                         .opacity(isPageContentVisible ? 1 : 0)
                         .offset(y: pageContentOffsetY)
                     }
-                    .background(AquinasTheme.Colors.activeInquiryChrome)
+                    // Matches the pages' canvas so the slide offset during page transitions
+                    // doesn't reveal a differently tinted strip behind the page.
+                    .background(canvasColor)
                     // Rendered here — outside the fade/offset applied to the two branches above —
                     // so the Model Controls bar stays put and simply swaps its own content while
                     // page transitions play, instead of animating (and briefly disappearing) with
@@ -1105,6 +953,7 @@ struct ContentView: View {
                     activePage: activePage,
                     isStudyTopicDetailVisible: isStudyTopicDetailVisible,
                     isSettingsDetailVisible: isSettingsDetailVisible,
+                    isBlocked: isInsightLibraryVisible,
                     onBeginDrag: dismissKeyboard,
                     onDismiss: { dismissGlobalSideMenu() },
                     menu: globalSideMenu
@@ -1128,7 +977,7 @@ struct ContentView: View {
                                 }
 
                                 let data = try? Data(contentsOf: url)
-                                let imageData = data.flatMap { UIImage(data: $0) == nil ? nil : $0 }
+                                let imageData = data.flatMap { UploadedFile.isImageData($0) ? $0 : nil }
 
                                 uploadedFiles.append(
                                     UploadedFile(
@@ -1156,7 +1005,7 @@ struct ContentView: View {
                     Task {
                         for item in newValue {
                             if let data = try? await item.loadTransferable(type: Data.self),
-                               UIImage(data: data) != nil {
+                               UploadedFile.isImageData(data) {
                                 await MainActor.run {
                                     withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
                                         uploadedFiles.append(
@@ -1287,6 +1136,8 @@ struct ContentView: View {
         )
     }
 
+    // MARK: - Side Menu
+
     /// Closes the panel before changing the view behind it, so its contents
     /// remain visually stable for the full slide-out animation.
     private func dismissGlobalSideMenu(then action: @escaping () -> Void = {}) {
@@ -1304,6 +1155,8 @@ struct ContentView: View {
             action()
         }
     }
+
+    // MARK: - Daily Content
 
     private func markQuestionOfTheDayAnswered() {
         guard let questionOfTheDay else { return }
@@ -1441,6 +1294,8 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Page Transitions
+
     private func transitionDisplayedPage(to nextPage: AppPage) {
         guard displayedPage != nextPage else {
             withAnimation(.easeInOut(duration: pageFadeDuration)) {
@@ -1481,6 +1336,8 @@ struct ContentView: View {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 
+    // MARK: - Lifecycle and Change Handlers
+
     private func handleScenePhaseChange(_ phase: ScenePhase) {
         appLockController.scenePhaseDidChange(
             phase,
@@ -1488,6 +1345,9 @@ struct ContentView: View {
             gracePeriod: appLockGracePeriod.duration
         )
         modelTasks.setApplicationActive(phase == .active)
+        if phase == .background {
+            InquiryPersistenceStore.flush()
+        }
         scheduleDailyQuestionRefreshIfNeeded()
     }
 
@@ -1505,6 +1365,16 @@ struct ContentView: View {
         }
         transitionDisplayedPage(to: newValue)
         scheduleDailyQuestionRefreshIfNeeded()
+    }
+
+    /// Clears in-memory state first so the change observers persist empty values, then wipes
+    /// every stored Insight Tree artifact.
+    private func clearInsightTree() {
+        isGlobalTreeUpdatePromptVisible = false
+        globalInsightPromotedIDs = []
+        globalTreeInsights = []
+        collectedDefinitions = []
+        InsightTreeReset.clearPersistedData()
     }
 
     private func handleCollectedDefinitionsChange(_ definitions: [ConceptDefinition]) {
@@ -1527,6 +1397,8 @@ struct ContentView: View {
         guard activePage == .insights else { return }
         refreshGlobalInsightTreeUpdatePrompt()
     }
+
+    // MARK: - Loading
 
     private func loadShellConversationState() {
         guard let snapshot = CurrentConversationsStore.load(),
@@ -1604,6 +1476,8 @@ struct ContentView: View {
             homeYourQuote = resolvedYourQuote ?? nil
         }
     }
+
+    // MARK: - Global Insight Tree
 
     private func askGlobalInsightInNewConversation() {
         guard let insight = globalInsightQuoteTarget else { return }
@@ -1734,6 +1608,8 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Conversation Management
+
     private func deleteConversation(_ conversation: InquiryConversation) {
         // Remove from the side menu list immediately for snappy feedback.
         sideMenuConversations.removeAll { $0.id == conversation.id }
@@ -1845,228 +1721,6 @@ private extension ProcessInfo.ThermalState {
     }
 }
 
-private struct GlobalInsightsModelControls: View {
-    @Binding var showFilePicker: Bool
-    @Binding var showPhotoPicker: Bool
-    @Binding var showCamera: Bool
-    @Binding var selectedPersonality: String
-    @Binding var isPersonalityMenuOpen: Bool
-    let hasCanvasHover: Bool
-    let hasCanvasInsightHover: Bool
-    let hasSelectedCanvasItems: Bool
-    let selectedCanvasItemCount: Int
-    let isMidpointMode: Bool
-    var isStudyMode: Bool = false
-    var studyBranchCount: Int = 2
-    var onStudyBranchCountChange: (Int) -> Void = { _ in }
-    let isCanvasInsightLoading: Bool
-    let modelStatusOverride: String?
-    let contextWordCount: Int
-    let modelTasks: ModelTaskQueue
-    let modelTasksPopupState: ModelTasksPopupState
-    @Binding var searchText: String
-    @Binding var isSearchActive: Bool
-    let searchResultIndex: Int
-    let searchResultCount: Int
-    var onSelectCanvasItem: () -> Void
-    var onCreateCanvasConcept: () -> Void
-    var onStudyCanvasInsight: () -> Void
-    var onInquireConnection: () -> Void
-    var onQuoteCanvasItem: () -> Void
-    let usesCanvasAskFlow: Bool
-    let isCanvasAskMode: Bool
-    var onAskInNewConversation: () -> Void
-    var onAskInExistingConversation: () -> Void
-    var onCancelCanvasAsk: () -> Void
-    var onMidpointConcepts: () -> Void
-    var onMidpointCenter: () -> Void
-    var onMidpointPlace: () -> Void
-    var onSearchPrevious: () -> Void
-    var onSearchNext: () -> Void
-    var onSearchActivated: () -> Void
-    var onClearCanvasSelection: () -> Void
-    var onContextWillOpen: () -> Void
-    let confirmationTitle: String?
-    var onConfirmUpdate: () -> Void
-    var onDeclineUpdate: () -> Void
-    let contextCard: ContextCardState
-
-    var body: some View {
-        InquiryControlDock(
-            isCanvasMode: true,
-            showFilePicker: $showFilePicker,
-            showPhotoPicker: $showPhotoPicker,
-            showCamera: $showCamera,
-            selectedPersonality: $selectedPersonality,
-            isPersonalityMenuOpen: $isPersonalityMenuOpen,
-            isAtBottom: true,
-            hasCanvasHover: hasCanvasHover,
-            hasCanvasInsightHover: hasCanvasInsightHover,
-            hasSelectedCanvasItems: hasSelectedCanvasItems,
-            selectedCanvasItemCount: selectedCanvasItemCount,
-            onScrollToBottom: {},
-            onViewEntireCanvas: {},
-            onOpenInsights: {},
-            onSelectCanvasItem: onSelectCanvasItem,
-            onCreateCanvasConcept: onCreateCanvasConcept,
-            onStudyCanvasInsight: onStudyCanvasInsight,
-            onInquireConnection: onInquireConnection,
-            onQuoteCanvasItem: onQuoteCanvasItem,
-            usesCanvasAskFlow: usesCanvasAskFlow,
-            isCanvasAskMode: isCanvasAskMode,
-            onAskInNewConversation: onAskInNewConversation,
-            onAskInExistingConversation: onAskInExistingConversation,
-            onCancelCanvasAsk: onCancelCanvasAsk,
-            onMidpointConcepts: onMidpointConcepts,
-            isMidpointMode: isMidpointMode,
-            isStudyMode: isStudyMode,
-            studyBranchCount: studyBranchCount,
-            onStudyBranchCountChange: onStudyBranchCountChange,
-            isCanvasInsightLoading: isCanvasInsightLoading,
-            modelStatusOverride: modelStatusOverride,
-            modelTasks: modelTasks,
-            modelTasksPopupState: modelTasksPopupState,
-            canvasSearchText: $searchText,
-            isCanvasSearchActive: $isSearchActive,
-            canvasSearchResultIndex: searchResultIndex,
-            canvasSearchResultCount: searchResultCount,
-            onCanvasSearchPrevious: onSearchPrevious,
-            onCanvasSearchNext: onSearchNext,
-            onCanvasSearchActivated: onSearchActivated,
-            confirmationTitle: confirmationTitle,
-            onConfirm: onConfirmUpdate,
-            onDecline: onDeclineUpdate,
-            onMidpointCenter: onMidpointCenter,
-            onMidpointPlace: onMidpointPlace,
-            onClearCanvasSelection: onClearCanvasSelection,
-            contextWordCount: contextWordCount,
-            showsContextWheel: false,
-            onClearConversation: {},
-            onContextWillOpen: onContextWillOpen,
-            contextCard: contextCard
-        )
-    }
-}
-
-// MARK: - Camera Capture
-
-struct CameraCaptureView: UIViewControllerRepresentable {
-    var onCapture: (UIImage) -> Void
-    @Environment(\.dismiss) private var dismiss
-
-    func makeUIViewController(context: Context) -> UIImagePickerController {
-        let picker = UIImagePickerController()
-        picker.delegate = context.coordinator
-        picker.sourceType = UIImagePickerController.isSourceTypeAvailable(.camera) ? .camera : .photoLibrary
-        return picker
-    }
-
-    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onCapture: onCapture, dismiss: dismiss)
-    }
-
-    final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
-        let onCapture: (UIImage) -> Void
-        let dismiss: DismissAction
-
-        init(onCapture: @escaping (UIImage) -> Void, dismiss: DismissAction) {
-            self.onCapture = onCapture
-            self.dismiss = dismiss
-        }
-
-        func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
-            if let image = info[.originalImage] as? UIImage {
-                onCapture(image)
-            }
-            dismiss()
-        }
-
-        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
-            dismiss()
-        }
-    }
-}
-
-private struct SideMenuDragPresentation: ViewModifier {
-    @Binding var isPresented: Bool
-    let activePage: AppPage
-    let isStudyTopicDetailVisible: Bool
-    let isSettingsDetailVisible: Bool
-    let onBeginDrag: () -> Void
-    let onDismiss: () -> Void
-    let menu: AnyView
-
-    @State private var dragOffset: CGFloat = 0
-    @State private var isDragging = false
-    @State private var hasFiredOpenHaptic = false
-
-    func body(content: Content) -> some View {
-        ZStack(alignment: .top) {
-            content.simultaneousGesture(dragGesture)
-
-            let progress = isPresented ? 1.0 : min(1.0, Double(dragOffset / 345))
-            Color.black.opacity(0.16 * progress)
-                .ignoresSafeArea()
-                .allowsHitTesting(progress > 0.02)
-                .onTapGesture(perform: onDismiss)
-                .animation(.easeInOut(duration: 0.22), value: isPresented)
-                .zIndex(3)
-
-            menu
-                .frame(width: 325)
-                .offset(x: isPresented ? 0 : -345 + dragOffset)
-                .opacity(isPresented || isDragging ? 1 : 0.96)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                .allowsHitTesting(isPresented || isDragging)
-                .zIndex(1000)
-                .animation(.spring(response: 0.42, dampingFraction: 0.84), value: isPresented)
-        }
-    }
-
-    private var dragGesture: some Gesture {
-        DragGesture(minimumDistance: 10, coordinateSpace: .local)
-            .onChanged { value in
-                guard !isPresented,
-                      !(activePage == .studyTopics && isStudyTopicDetailVisible),
-                      !(activePage == .settings && isSettingsDetailVisible),
-                      abs(value.translation.width) > abs(value.translation.height) else { return }
-                guard value.translation.width > 0 else { return }
-                let requiresLeadingEdge = activePage == .insights || activePage == .conversation
-                guard !requiresLeadingEdge || value.startLocation.x < 30 else { return }
-
-                if !isDragging {
-                    isDragging = true
-                    onBeginDrag()
-                }
-                dragOffset = min(345, value.translation.width)
-                if dragOffset >= 175, !hasFiredOpenHaptic {
-                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                    hasFiredOpenHaptic = true
-                } else if dragOffset < 175 {
-                    hasFiredOpenHaptic = false
-                }
-            }
-            .onEnded { value in
-                guard isDragging else { return }
-                hasFiredOpenHaptic = false
-                let shouldOpen = value.translation.width > 175
-                    || value.predictedEndTranslation.width > 250
-                if shouldOpen {
-                    isDragging = false
-                    dragOffset = 0
-                    isPresented = true
-                } else {
-                    withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                        isDragging = false
-                        dragOffset = 0
-                    }
-                }
-            }
-    }
-}
-
 private extension View {
     func eraseToAnyView() -> AnyView {
         AnyView(self)
@@ -2079,26 +1733,6 @@ private extension View {
         modifier(DailyQuestionGenerationAlert(
             isPresented: isPresented,
             retry: retry
-        ))
-    }
-
-    func sideMenuDragPresentation(
-        isPresented: Binding<Bool>,
-        activePage: AppPage,
-        isStudyTopicDetailVisible: Bool,
-        isSettingsDetailVisible: Bool,
-        onBeginDrag: @escaping () -> Void,
-        onDismiss: @escaping () -> Void,
-        menu: AnyView
-    ) -> some View {
-        modifier(SideMenuDragPresentation(
-            isPresented: isPresented,
-            activePage: activePage,
-            isStudyTopicDetailVisible: isStudyTopicDetailVisible,
-            isSettingsDetailVisible: isSettingsDetailVisible,
-            onBeginDrag: onBeginDrag,
-            onDismiss: onDismiss,
-            menu: menu
         ))
     }
 }
@@ -2114,69 +1748,6 @@ private struct DailyQuestionGenerationAlert: ViewModifier {
         } message: {
             Text("No placeholder question was created. Check that the Aquinas backend is available and try again.")
         }
-    }
-}
-
-// MARK: - Legacy Floating Model Controls
-
-/// Older standalone toolbar kept for reference. The active dock now lives in ActiveInquiry.swift.
-struct ModelControlsToolbar: View {
-    @Binding var showFilePicker: Bool
-    @Binding var personality: String
-
-    // Controls the visibility of the jump-to-bottom button.
-    @Binding var isAtBottom: Bool
-    var onScrollToBottom: () -> Void
-
-    let brandGreen = AquinasTheme.Colors.secondaryMuted
-
-    var body: some View {
-        HStack(spacing: 12) {
-
-            // Attachment button.
-            Button(action: { showFilePicker = true }) {
-                Image(systemName: "plus")
-                    .font(.system(size: 16, weight: .medium))
-                    .sfSymbolDrawOn()
-                    .aquinasIconControl()
-            }
-
-            // Personality toggle.
-            Button(action: {
-                personality = personality == "Friendly" ? "Scholarly" : "Friendly"
-            }) {
-                HStack(spacing: 8) {
-                    Image(systemName: personality == "Friendly" ? "brain.head.profile.fill" : "book.pages.fill")
-                        .sfSymbolDrawOn()
-                    Text(personality)
-                        .font(.system(size: 15, weight: .medium))
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 10, weight: .bold))
-                        .sfSymbolDrawOn()
-                }
-                .padding(.horizontal, 16)
-                .aquinasCapsuleControl()
-            }
-
-            Spacer()
-
-            // Scroll-to-bottom appears only when needed.
-            if !isAtBottom {
-                Button(action: {
-                    onScrollToBottom()
-                }) {
-                    Image(systemName: "arrow.down")
-                        .font(.system(size: 16, weight: .bold))
-                        .sfSymbolDrawOn()
-                        .aquinasIconControl(isPrimary: true)
-                        .shadow(color: AquinasTheme.Colors.floatingShadow, radius: 4, y: 2)
-                }
-                .transition(.scale.combined(with: .opacity))
-            }
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isAtBottom)
     }
 }
 

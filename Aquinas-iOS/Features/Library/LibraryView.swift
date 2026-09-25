@@ -4,7 +4,7 @@ extension Notification.Name {
     static let openGroundingSourceInLibrary = Notification.Name("openGroundingSourceInLibrary")
 }
 
-struct LibraryPassage: Decodable, Identifiable {
+nonisolated struct LibraryPassage: Decodable, Identifiable, Sendable {
     let text: String
     let title: String
     let sourceId: String
@@ -12,7 +12,7 @@ struct LibraryPassage: Decodable, Identifiable {
     var id: String { "\(sourceId)-\(chunkIndex)" }
 }
 
-struct LibraryWork: Identifiable, Equatable {
+nonisolated struct LibraryWork: Identifiable, Equatable, Sendable {
     let id: String
     let title: String
     let passageCount: Int
@@ -39,6 +39,12 @@ private extension Array where Element == LibrarySection {
             if let match = node.children.node(withID: id) { return match }
         }
         return nil
+    }
+
+    /// The outline path to the most specific section whose range covers `chunkIndex`.
+    func path(containingChunk chunkIndex: Int) -> [LibrarySection]? {
+        guard let node = first(where: { $0.chunks.contains(chunkIndex) }) else { return nil }
+        return [node] + (node.children.path(containingChunk: chunkIndex) ?? [])
     }
 
     func path(to id: String) -> [LibrarySection]? {
@@ -612,13 +618,16 @@ private struct LibraryDocument {
         }
     }
 
+    /// Checked against every passage when a work's outline is built, so it is compiled once.
+    private static let subsectionHeadingPattern = try! NSRegularExpression(
+        pattern: "(?i)^(?:\\[[^\\]]+\\]\\s*)?((?:book|part|treatise|session|chapter|question|article|section|lesson)\\s*(?:[IVXLCDM]+|\\d+)(?:\\s*[:.\\-]\\s*[^.]{0,110})?)"
+    )
+
     private static func subsectionHeading(in text: String) -> (title: String, level: Int)? {
         let prefix = String(text.prefix(260))
             .replacingOccurrences(of: "\\r", with: " ")
             .replacingOccurrences(of: "\\n", with: " ")
-        let pattern = "(?i)^(?:\\[[^\\]]+\\]\\s*)?((?:book|part|treatise|session|chapter|question|article|section|lesson)\\s*(?:[IVXLCDM]+|\\d+)(?:\\s*[:.\\-]\\s*[^.]{0,110})?)"
-        guard let expression = try? NSRegularExpression(pattern: pattern),
-              let match = expression.firstMatch(in: prefix, range: NSRange(prefix.startIndex..., in: prefix)),
+        guard let match = subsectionHeadingPattern.firstMatch(in: prefix, range: NSRange(prefix.startIndex..., in: prefix)),
               let range = Range(match.range(at: 1), in: prefix)
         else { return nil }
 
@@ -673,134 +682,42 @@ private struct LibraryDocument {
     ]
 }
 
-private enum LibraryFilter: String, CaseIterable, Identifiable {
-    case smartSort
-    case alphabet
-    case subject
-
-    var id: Self { self }
-
-    var title: String {
-        switch self {
-        case .smartSort: "Smart Sort"
-        case .alphabet: "Alphabet"
-        case .subject: "Subject"
-        }
-    }
-}
-
-private struct LibraryWorkCollection: Identifiable {
-    let id: String
-    let title: String
-    let works: [LibraryWork]
-
-    static func alphabetized(from works: [LibraryWork]) -> [LibraryWorkCollection] {
-        let grouped = Dictionary(grouping: works) { work in
-            work.title.first.map { String($0).uppercased() } ?? "#"
-        }
-        return grouped.map { letter, works in
-            LibraryWorkCollection(
-                id: "alphabet-\(letter)",
-                title: letter,
-                works: works.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-            )
-        }
-        .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-    }
-
-    static func bySubject(from works: [LibraryWork]) -> [LibraryWorkCollection] {
-        let subjectOrder = [
-            "Sacred Scripture",
-            "Thomistic Theology",
-            "Early & Medieval Christianity",
-            "Councils & Creeds",
-            "Catechisms & Confessions",
-            "Philosophy",
-            "History",
-            "Political & Economic Thought",
-        ]
-        let grouped = Dictionary(grouping: works) { subject(for: $0) }
-        return subjectOrder.compactMap { subject in
-            guard let subjectWorks = grouped[subject], !subjectWorks.isEmpty else { return nil }
-            return LibraryWorkCollection(
-                id: "subject-\(subject)",
-                title: subject,
-                works: subjectWorks.sorted {
-                    $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
-                }
-            )
-        }
-    }
-
-    private static func subject(for work: LibraryWork) -> String {
-        switch work.id {
-        case "web-bible":
-            "Sacred Scripture"
-        case "summa-theologica":
-            "Thomistic Theology"
-        case "council-of-trent", "ecumenical-creeds-schaff", "seven-ecumenical-councils":
-            "Councils & Creeds"
-        case "baltimore-catechism-3", "roman-catechism-donovan", "augsburg-confession",
-             "belgic-confession", "heidelberg-catechism", "thirty-nine-articles",
-             "westminster-confession":
-            "Catechisms & Confessions"
-        case "aristotle-categories", "aristotle-metaphysics", "aristotle-nicomachean-ethics",
-             "boethius-consolation":
-            "Philosophy"
-        case "bede-ecclesiastical-history", "eusebius-ecclesiastical-history",
-             "gibbon-decline-and-fall", "herodotus-histories", "josephus-antiquities",
-             "livy-history-of-rome", "plutarch-parallel-lives", "tacitus-annals-histories",
-             "thucydides-peloponnesian-war":
-            "History"
-        case "adam-smith-wealth-of-nations", "machiavelli-the-prince", "magna-carta",
-             "us-constitution", "us-declaration-of-independence":
-            "Political & Economic Thought"
-        default:
-            "Early & Medieval Christianity"
-        }
-    }
-}
-
-/// Mirrors `StudyTopicsView`: a list remains mounted below an opaque detail layer, while the
-/// shared navigation button morphs in place as the detail transitions from the trailing edge.
+/// Mirrors `StudyTopicsView`: the homepage remains mounted below an opaque detail layer, while
+/// the shared navigation button morphs in place as the detail transitions from the trailing edge.
 struct LibraryView: View {
     let onOpenMenu: () -> Void
     let modelTasks: ModelTaskQueue
     let modelTasksPopupState: ModelTasksPopupState
     let onReaderVisibilityChange: (Bool) -> Void
     let navigationRequest: LibraryNavigationRequest?
-    @State private var works: [LibraryWork] = []
+    @State private var catalog: LibraryCatalog?
     @State private var searchText = ""
     @State private var selectedWorkID: String?
-    @State private var activeFilter: LibraryFilter = .smartSort
+    @State private var targetChunkIndex: Int?
+    @State private var pendingNavigationRequest: LibraryNavigationRequest?
+    @AppStorage(LibraryRecents.storageKey) private var recentWorkIDsRaw = ""
+
+    private var works: [LibraryWork] { catalog?.works ?? [] }
 
     private var selectedWork: LibraryWork? {
         works.first { $0.id == selectedWorkID }
     }
 
-    private var visibleWorks: [LibraryWork] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let filtered = query.isEmpty
-            ? works
-            : works.filter { $0.title.localizedCaseInsensitiveContains(query) }
-        switch activeFilter {
-        case .smartSort:
-            return filtered
-        case .alphabet:
-            return filtered.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-        case .subject:
-            return filtered.sorted { $0.id.localizedCaseInsensitiveCompare($1.id) == .orderedAscending }
-        }
-    }
-
     var body: some View {
         ZStack {
-            libraryList
+            LibraryHomeView(
+                catalog: catalog,
+                recentWorkIDs: LibraryRecents.decode(recentWorkIDsRaw),
+                searchText: $searchText,
+                onOpenWork: { openWork(id: $0.id) },
+                onOpenPassage: { openWork(id: $0.workID, atChunk: $0.chunkIndex) }
+            )
 
             if let selectedWork {
                 LibraryDocumentDetail(
                     work: selectedWork,
                     targetTitle: navigationRequest?.sourceTitle,
+                    targetChunkIndex: targetChunkIndex,
                     modelTasks: modelTasks,
                     modelTasksPopupState: modelTasksPopupState
                 )
@@ -809,15 +726,15 @@ struct LibraryView: View {
             }
 
             VStack {
-                HStack {
-                    AquinasNavButton(
-                        isDetailVisible: selectedWorkID != nil,
-                        backLabel: "Library",
-                        onMenuTap: onOpenMenu,
-                        onBackTap: closeDocument
-                    )
+                HStack(spacing: 8) {
+                    AquinasNavButton(onMenuTap: onOpenMenu)
+                    if selectedWorkID != nil {
+                        NavBackCapsuleButton(title: "Library", action: closeDocument)
+                            .transition(.studyExitGrow)
+                    }
                     Spacer()
                 }
+                .animation(.spring(response: 0.42, dampingFraction: 0.84), value: selectedWorkID)
                 .padding(.horizontal, 24)
                 .padding(.top, 24)
                 Spacer()
@@ -829,233 +746,63 @@ struct LibraryView: View {
         .onChange(of: selectedWorkID) { _, id in
             modelTasksPopupState.reset()
             onReaderVisibilityChange(id != nil)
+            if let id {
+                recentWorkIDsRaw = LibraryRecents.encode(
+                    LibraryRecents.opening(id, in: LibraryRecents.decode(recentWorkIDsRaw))
+                )
+            }
         }
         .onDisappear { onReaderVisibilityChange(false) }
-        .task { works = Self.loadWorks() }
+        .task {
+            // The bundled corpus is tens of megabytes; decode it off the main actor so the
+            // homepage chrome appears immediately.
+            let loaded = await Task.detached(priority: .userInitiated) {
+                LibraryCatalog.loadBundled()
+            }.value
+            withAnimation(.easeOut(duration: 0.25)) { catalog = loaded }
+            if let pendingNavigationRequest {
+                self.pendingNavigationRequest = nil
+                applyNavigationRequest(pendingNavigationRequest)
+            }
+        }
         .onChange(of: navigationRequest) { _, request in
-            guard let request,
-                  let work = works.first(where: {
-                      $0.title.caseInsensitiveCompare(request.sourceTitle) == .orderedSame
-                      || $0.title.caseInsensitiveCompare(request.sourceName) == .orderedSame
-                  }) else { return }
-            selectedWorkID = work.id
+            guard let request else { return }
+            if catalog == nil {
+                pendingNavigationRequest = request
+            } else {
+                applyNavigationRequest(request)
+            }
         }
     }
 
-    private var libraryList: some View {
-        ZStack {
-            AquinasTheme.Colors.canvas.ignoresSafeArea()
-            ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 0) {
-                    Color.clear.frame(height: 72)
-                    VStack(spacing: 8) {
-                        Text("Library")
-                            .font(.custom("LibreBaskerville-Regular", size: 30))
-                            .foregroundStyle(AquinasTheme.Colors.primaryReadable)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 28)
+    private func applyNavigationRequest(_ request: LibraryNavigationRequest) {
+        guard let work = works.first(where: {
+            $0.title.caseInsensitiveCompare(request.sourceTitle) == .orderedSame
+                || $0.title.caseInsensitiveCompare(request.sourceName) == .orderedSame
+        }) else { return }
+        targetChunkIndex = nil
+        selectedWorkID = work.id
+    }
 
-                    StudyTopicsSearchField(searchText: $searchText, prompt: Text("Search Library"))
-                        .padding(.top, 28)
-
-                    HStack(spacing: 24) {
-                        ForEach(LibraryFilter.allCases) { filter in
-                            Button {
-                                withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
-                                    activeFilter = filter
-                                }
-                            } label: {
-                                Text(filter.title)
-                                    .font(AquinasTheme.Typography.uiSubheading)
-                                    .foregroundStyle(
-                                        activeFilter == filter
-                                            ? AquinasTheme.Colors.lightGreen
-                                            : AquinasTheme.Colors.placeholderText
-                                    )
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        Spacer(minLength: 8)
-                    }
-                    .padding(.top, 16)
-
-                    LibraryCatalogResults(
-                        activeFilter: activeFilter,
-                        works: visibleWorks,
-                        onOpenWork: { work in
-                            withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
-                                selectedWorkID = work.id
-                            }
-                        }
-                    )
-                    .padding(.top, 32)
-                    .padding(.bottom, 120)
-                }
-                .padding(.horizontal, 24)
-            }
+    private func openWork(id: String, atChunk chunkIndex: Int? = nil) {
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
+            targetChunkIndex = chunkIndex
+            selectedWorkID = id
         }
     }
 
     private func closeDocument() {
         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
             selectedWorkID = nil
+            targetChunkIndex = nil
         }
-    }
-
-    private static func loadWorks() -> [LibraryWork] {
-        guard let url = Bundle.main.url(forResource: "passages", withExtension: "json"),
-              let data = try? Data(contentsOf: url),
-              let passages = try? JSONDecoder().decode([LibraryPassage].self, from: data)
-        else { return [] }
-        return Dictionary(grouping: passages, by: \.sourceId).compactMap { sourceID, entries in
-            entries.first.map { LibraryWork(id: sourceID, title: $0.title, passageCount: entries.count) }
-        }.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-    }
-}
-
-private struct LibraryCatalogResults: View {
-    let activeFilter: LibraryFilter
-    let works: [LibraryWork]
-    let onOpenWork: (LibraryWork) -> Void
-
-    var body: some View {
-        LazyVStack(spacing: 16) {
-            switch activeFilter {
-            case .smartSort:
-                ForEach(works) { work in
-                    LibraryDocumentCard(work: work) {
-                        onOpenWork(work)
-                    }
-                }
-            case .alphabet:
-                ForEach(LibraryWorkCollection.alphabetized(from: works)) { collection in
-                    LibraryCollectionCard(collection: collection, onOpenWork: onOpenWork)
-                }
-            case .subject:
-                ForEach(LibraryWorkCollection.bySubject(from: works)) { collection in
-                    LibraryCollectionCard(collection: collection, onOpenWork: onOpenWork)
-                }
-            }
-        }
-    }
-}
-
-private struct LibraryDocumentCard: View {
-    let work: LibraryWork
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Image(systemName: "book.closed")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(AquinasTheme.Colors.lightGreen)
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(AquinasTheme.Colors.placeholderText)
-                }
-                Text(work.title)
-                    .font(.custom("LibreBaskerville-Regular", size: 20))
-                    .foregroundStyle(AquinasTheme.Colors.headingText)
-                    .multilineTextAlignment(.leading)
-                Text("\(work.passageCount) passages")
-                    .font(.figtreeParagraph)
-                    .foregroundStyle(AquinasTheme.Colors.paragraphText)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(20)
-            .background(AquinasTheme.Colors.canvasSecondary)
-            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1))
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-private struct LibraryCollectionCard: View {
-    let collection: LibraryWorkCollection
-    let onOpenWork: (LibraryWork) -> Void
-
-    var body: some View {
-        VStack(spacing: 16) {
-            Text(collection.title)
-                .font(.custom("LibreBaskerville-Regular", size: 20))
-                .foregroundStyle(AquinasTheme.Colors.headingText)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: .infinity)
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(alignment: .center, spacing: -28) {
-                    ForEach(Array(collection.works.enumerated()), id: \.element.id) { index, work in
-                        LibraryCollectionTitleCard(
-                            work: work,
-                            rotation: titleRotation(for: index),
-                            action: { onOpenWork(work) }
-                        )
-                        .zIndex(Double(collection.works.count - index))
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 12)
-            }
-            .frame(height: 144)
-        }
-        .padding(20)
-        .background(AquinasTheme.Colors.canvasSecondary)
-        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
-        )
-        .accessibilityElement(children: .contain)
-    }
-
-    private func titleRotation(for index: Int) -> Angle {
-        let degrees = [-4.0, 2.5, -1.5, 4.0, -3.0, 1.5]
-        return .degrees(degrees[index % degrees.count])
-    }
-}
-
-private struct LibraryCollectionTitleCard: View {
-    let work: LibraryWork
-    let rotation: Angle
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 10) {
-                Image(systemName: "book.closed")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(AquinasTheme.Colors.lightGreen)
-                Text(work.title)
-                    .font(.custom("Figtree-SemiBold", size: 14))
-                    .foregroundStyle(AquinasTheme.Colors.headingText)
-                    .lineLimit(3)
-                    .multilineTextAlignment(.leading)
-                Spacer(minLength: 0)
-            }
-            .padding(14)
-            .frame(width: 148, height: 106, alignment: .topLeading)
-            .background(AquinasTheme.Colors.canvas)
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .stroke(AquinasTheme.Colors.controlBorder, lineWidth: 1)
-            )
-        }
-        .buttonStyle(.plain)
-        .rotationEffect(rotation)
-        .accessibilityLabel(work.title)
-        .accessibilityHint("Open work")
     }
 }
 
 private struct LibraryDocumentDetail: View {
     let work: LibraryWork
     let targetTitle: String?
+    var targetChunkIndex: Int?
     let modelTasks: ModelTaskQueue
     let modelTasksPopupState: ModelTasksPopupState
     @State private var document: LibraryDocument?
@@ -1148,6 +895,12 @@ private struct LibraryDocumentDetail: View {
                let match = document?.sections.first(where: { $0.title.caseInsensitiveCompare(targetTitle) == .orderedSame }) {
                 selectedSectionID = match.id
                 selectedOutlineID = match.firstReadableDescendant.id
+            }
+            if let targetChunkIndex,
+               let path = document?.sections.path(containingChunk: targetChunkIndex),
+               let section = path.first, let outline = path.last {
+                selectedSectionID = section.id
+                selectedOutlineID = outline.id
             }
             await Task.yield()
             withAnimation(.easeIn(duration: 0.25)) {

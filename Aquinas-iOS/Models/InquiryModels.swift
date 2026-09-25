@@ -9,7 +9,7 @@ import SwiftUI
 // MARK: - Inquiry Data
 
 /// One vertical conversation lane. Branches can begin from an insight chip or a copied model response.
-struct ChatBranch: Identifiable, Codable, Equatable {
+nonisolated struct ChatBranch: Identifiable, Codable, Equatable {
     let id: UUID
     let startingConcept: ConceptDefinition?
     let parentBranchID: UUID?
@@ -79,7 +79,7 @@ struct ChatBranch: Identifiable, Codable, Equatable {
     }
 }
 
-struct ResponsePresentationMetadata: Codable, Equatable {
+nonisolated struct ResponsePresentationMetadata: Codable, Equatable {
     let responseIndex: Int
     let showsThinking: Bool
     let thinkingSummary: [String]
@@ -94,7 +94,7 @@ struct ResponsePresentationMetadata: Codable, Equatable {
 }
 
 /// A saved top-level conversation canvas. This is in-memory prototype persistence.
-struct InquiryConversation: Identifiable, Codable, Equatable {
+nonisolated struct InquiryConversation: Identifiable, Codable, Equatable {
     let id: UUID
     var title: String = "New Conversation"
     /// `true` for conversations that act as study topic containers.
@@ -139,12 +139,41 @@ struct InquiryConversation: Identifiable, Codable, Equatable {
 /// Empty drafts are intentionally ephemeral, but text, uploads, Insight context, and explicit
 /// organization choices all make a conversation meaningful.
 enum ConversationDraftRetention {
+    /// A conversation started from a pinned prompt (Question of the Day, Today in History) that
+    /// the user left before typing anything. The card that started it stays on Home, so the draft
+    /// is recreated on demand rather than restored as a special empty-prompt conversation.
+    static func isUntouchedPromptDraft(_ conversation: InquiryConversation) -> Bool {
+        guard !conversation.isStudyTopic,
+              conversation.studyTopicID == nil,
+              !conversation.isPinned,
+              conversation.promotedInsightIDs.isEmpty,
+              conversation.branches.count == 1,
+              let branch = conversation.branches.first,
+              let pinned = branch.pinnedHeaderQuestion?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !pinned.isEmpty,
+              conversation.title == pinned || conversation.title == "New Conversation" else {
+            return false
+        }
+        return branch.parentBranchID == nil
+            && branch.startingConcept == nil
+            && branch.duplicatedResponse == nil
+            && !branch.topQuestionSubmitted
+            && branch.activeChatBlocks.isEmpty
+            && branch.topQuestionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && branch.topQuestionUploads.isEmpty
+            && branch.bottomQuestionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && branch.attachedConcept == nil
+            && branch.branchContextConcept == nil
+            && branch.compactedContext == nil
+    }
+
     static func shouldKeep(
         _ conversation: InquiryConversation,
         transientAttachedConcept: ConceptDefinition? = nil,
         hasSavedInsights: Bool = false
     ) -> Bool {
         guard transientAttachedConcept == nil else { return true }
+        if !hasSavedInsights, isUntouchedPromptDraft(conversation) { return false }
         guard !conversation.isStudyTopic,
               conversation.studyTopicID == nil,
               !conversation.isPinned,
@@ -169,7 +198,7 @@ enum ConversationDraftRetention {
         }
     }
 
-    private static func hasMeaningfulContent(_ block: ChatBlock) -> Bool {
+    nonisolated private static func hasMeaningfulContent(_ block: ChatBlock) -> Bool {
         switch block {
         case .text(let text):
             !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -226,7 +255,7 @@ struct StudyTopicTreeSelectionRequest: Identifiable, Equatable {
     }
 }
 
-enum ChatBlock: Hashable, Codable {
+nonisolated enum ChatBlock: Hashable, Codable {
     /// A model-generated response card.
     case text(String)
 

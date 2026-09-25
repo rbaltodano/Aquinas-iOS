@@ -202,8 +202,7 @@ struct UploadedFileThumbnail: View {
         // Thumbnail size, border thickness, and shadow are tuned here.
         ZStack(alignment: .topTrailing) {
             ZStack {
-                if let imageData = file.imageData,
-                   let uiImage = UIImage(data: imageData) {
+                if let uiImage = file.image {
                     Image(uiImage: uiImage)
                         .resizable()
                         .scaledToFill()
