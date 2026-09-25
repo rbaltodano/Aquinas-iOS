@@ -128,11 +128,12 @@ matrix for an Insight subject).
 | `Aquinas-iOS/Features/InsightTree/StudyModeView.swift` | Study slot, tool card, and the retained dot matrix. |
 | `Aquinas-iOS/Features/InsightTree/InsightTreeView.swift` | Enters and exits Study, the tool card, and hover hand-off. |
 | `Aquinas-iOS/Features/InsightTree/InsightTreeCanvasView.swift` | The Study camera move, 3D positions, fades, gestures, hover, and momentum. |
+| `Aquinas-iOS/Features/InsightTree/InsightTreeCamera.swift` | The canvas camera projection and focus snapshot. |
 | `Aquinas-iOS/Features/InsightTree/StudyNodeScene.swift` | `StudyFraming` (camera framing, ring, floor), the ring, and the dot floor. |
 | `Aquinas-iOS/Features/InsightTree/StudyNodeLayout.swift` | The sphere spread and spherical interpolation. |
 | `Aquinas-iOS/Features/InsightTree/InsightClusterSpatialLayout.swift` | The tree's ±45° Insight elevations. |
 | `Aquinas-iOS/DesignSystem/OrbitCamera.swift`, `PerspectivePlaneProjection.swift` | The 3D camera and the tree's overhead projection. |
-| `Aquinas-iOS/Navigation/SideMenu.swift` | `StudyExitButton`. |
+| `Aquinas-iOS/Navigation/NavigationButtons.swift` | `StudyExitButton`. |
 | `Aquinas-iOS/Features/Conversation/StudyBranchDockControls.swift` | Branch count and Place controls in the persistent dock. |
 | `Aquinas-iOS/Features/Canvas/CanvasModeModel.swift` | Shared Study mode and Branch-count state. |
 

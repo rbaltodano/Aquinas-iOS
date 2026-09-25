@@ -45,7 +45,7 @@ SQLite. It is a development-time persistence boundary, not cloud sync.
 | Conversation orchestration | `Features/Conversation/CurrentConversation.swift` |
 | Transcript and response lifecycle | `Features/Conversation/ConversationComponents.swift` |
 | Visible model tasks | `Features/Conversation/ModelTaskQueue.swift` |
-| Model status and context controls | `Features/Conversation/InquiryControlDock.swift` |
+| Model status and context controls | `Features/Conversation/ModelControls/` (dock in `InquiryControlDock.swift`) |
 | Model boundary and local implementation | `Services/AquinasModel.swift`, `Services/LiteRTAquinasModel.swift` |
 | Runtime ownership | `Services/AquinasApplicationRuntime.swift`, `Services/LiteRTAquinasRuntime.swift` |
 | Backend tree boundary | `Services/InsightTreeService.swift` |
